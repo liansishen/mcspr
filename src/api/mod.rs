@@ -107,7 +107,25 @@ pub fn router(state: AppState) -> Router {
             post(backup::restore),
         )
         .route("/java", get(java_version))
+        .route("/audit", get(audit_query))
+        .route(
+            "/instances/{id}/metrics",
+            get(resources::metrics),
+        )
+        .route(
+            "/instances/{id}/crashes",
+            get(resources::crashes_list),
+        )
+        .route(
+            "/instances/{id}/crashes/file",
+            get(resources::crashes_file),
+        )
+        .route(
+            "/instances/{id}/playtime",
+            get(resources::playtime),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_mw))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state);
 
@@ -294,4 +312,27 @@ async fn static_handler(uri: Uri) -> Response {
             .unwrap(),
         None => (StatusCode::NOT_FOUND, "index.html missing").into_response(),
     }
+}
+
+/// 操作审计：记录写操作与失败请求（敏感参数脱敏）
+async fn audit_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+    let status = resp.status().as_u16();
+    let mutating = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    if mutating || status >= 400 {
+        crate::audit::record(&state, &method, &path, status).await;
+    }
+    resp
+}
+
+/// 审计日志查询
+async fn audit_query(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let q = q.get("q").map(|s| s.as_str()).unwrap_or("");
+    Json(json!({ "entries": crate::audit::query(&state, limit, q).await }))
 }

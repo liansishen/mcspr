@@ -1,9 +1,10 @@
+use crate::audit::AuditEntry;
 use crate::config::PanelConfig;
 use crate::instance::InstanceRuntime;
 use crate::jobs::Job;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub struct AppStateInner {
     pub config: RwLock<PanelConfig>,
@@ -13,6 +14,9 @@ pub struct AppStateInner {
     pub http: reqwest::Client,
     pub mc_versions: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>,
     pub forge_builds: std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    pub audit: Mutex<VecDeque<AuditEntry>>,
+    /// 实例目录大小缓存 (计算时间, 总字节)
+    pub size_cache: std::sync::Mutex<HashMap<String, (std::time::Instant, u64)>>,
 }
 
 #[derive(Clone)]
@@ -41,6 +45,8 @@ impl AppState {
             http,
             mc_versions: std::sync::Mutex::new(None),
             forge_builds: std::sync::Mutex::new(None),
+            audit: Mutex::new(VecDeque::new()),
+            size_cache: std::sync::Mutex::new(HashMap::new()),
         })))
     }
 }

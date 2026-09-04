@@ -129,6 +129,7 @@ pub struct InstanceSummary {
     pub auto_restart: bool,
     pub auto_start_on_boot: bool,
     pub restart_storm: bool,
+    pub tps: Option<serde_json::Value>,
     pub mc_version: Option<String>,
     pub mod_loader: Option<String>,
     pub eula_accepted: bool,
@@ -148,6 +149,12 @@ impl InstanceRuntime {
             });
         }
         let next_seq = buf.back().map(|l| l.seq).unwrap_or(0);
+        // 恢复玩家在线时长统计
+        let playtime: std::collections::BTreeMap<String, (u64, u32)> =
+            std::fs::read_to_string(dir.join("player-stats.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
         Arc::new(Self {
             meta: RwLock::new(meta),
             dir,
@@ -160,7 +167,7 @@ impl InstanceRuntime {
             players: Mutex::new(Vec::new()),
             crash_times: Mutex::new(VecDeque::new()),
             restart_storm: AtomicBool::new(false),
-            playtime: Mutex::new(std::collections::BTreeMap::new()),
+            playtime: Mutex::new(playtime),
             open_sessions: Mutex::new(std::collections::HashMap::new()),
             metrics: Mutex::new(VecDeque::new()),
             tps: Mutex::new(None),
@@ -205,6 +212,7 @@ impl InstanceRuntime {
             auto_restart: meta.auto_restart,
             auto_start_on_boot: meta.auto_start_on_boot,
             restart_storm: self.restart_storm.load(Ordering::SeqCst),
+            tps: self.tps.lock().await.clone(),
             mc_version: meta.mc_version,
             mod_loader: meta.mod_loader,
             eula_accepted: eula_accepted(&self.dir),

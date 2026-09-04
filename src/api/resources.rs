@@ -504,3 +504,77 @@ pub async fn props_put(
     properties::write(&rt.dir, &req.entries).await?;
     Ok(Json(json!({ "ok": true })))
 }
+
+// ---------- 可观测性 ----------
+
+/// CPU/内存历史（最多 2880 点，降采样到约 300 点）
+pub async fn metrics(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let m = rt.metrics.lock().await;
+    let step = (m.len() / 300).max(1);
+    let points: Vec<(i64, f32, f64)> = m.iter().step_by(step).cloned().collect();
+    Ok(Json(json!({ "points": points })))
+}
+
+/// 崩溃归档文件列表
+pub async fn crashes_list(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let dir = rt.dir.join("crash-archive");
+    let mut out = Vec::new();
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Json(json!({ "files": [] }))),
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name().to_string_lossy().to_string();
+        let size = e.metadata().await.map(|m| m.len()).unwrap_or(0);
+        out.push(json!({ "name": name, "size": size }));
+    }
+    out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
+    Ok(Json(json!({ "files": out })))
+}
+
+/// 崩溃归档文件内容
+pub async fn crashes_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let name = q.get("name").ok_or_else(|| ApiError::bad_request("缺少 name 参数"))?;
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err(ApiError::bad_request("文件名不合法"));
+    }
+    let content = tokio::fs::read_to_string(rt.dir.join("crash-archive").join(name))
+        .await
+        .map_err(|e| ApiError::not_found(format!("读取失败: {e}")))?;
+    Ok(Json(json!({ "name": name, "content": content })))
+}
+
+/// 玩家在线时长排行
+pub async fn playtime(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let pt = rt.playtime.lock().await;
+    let mut list: Vec<(String, u64, u32)> = pt
+        .iter()
+        .map(|(n, (s, c))| (n.clone(), *s, *c))
+        .collect();
+    drop(pt);
+    list.sort_by(|a, b| b.1.cmp(&a.1));
+    let items: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|(name, secs, sessions)| {
+            json!({ "name": name, "total_secs": secs, "sessions": sessions })
+        })
+        .collect();
+    Ok(Json(json!({ "players": items })))
+}

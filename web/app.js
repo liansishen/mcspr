@@ -150,11 +150,24 @@ async function renderDashboard() {
       const cpu = (s.cpu_usage || 0);
       const memPct = s.mem_total ? (s.mem_used / s.mem_total * 100) : 0;
       const running = s.instances.filter(i => i.status === 'running').length;
+      // 磁盘用量 + 实例空间排行
+      const diskFree = s.disk ? s.disk.free : 0, diskTotal = s.disk ? s.disk.total : 0;
+      const diskPct = diskTotal ? ((diskTotal - diskFree) / diskTotal * 100) : 0;
+      const nameOf = Object.fromEntries(s.instances.map(i => [i.id, i.name]));
+      const topSizes = Object.entries(s.sizes || {}).map(([id, bytes]) => ({ name: nameOf[id] || id, bytes }))
+        .sort((a, b) => b.bytes - a.bytes).slice(0, 5);
+      const sizeList = topSizes.length
+        ? topSizes.map(t => `<div class="row between" style="padding:3px 0"><span class="muted small">${esc(t.name)}</span><span class="small">${fmtSize(t.bytes)}</span></div>`).join('')
+        : '<div class="muted small">暂无实例</div>';
       $('#dash').innerHTML = `
         <div class="grid stats-grid">
           <div class="card"><h3>CPU 使用率</h3><div class="big">${cpu.toFixed(1)}%</div><div class="bar"><i style="width:${Math.min(cpu, 100)}%"></i></div></div>
           <div class="card"><h3>系统内存</h3><div class="big">${fmtSize(s.mem_used)} <span class="muted small">/ ${fmtSize(s.mem_total)}</span></div><div class="bar"><i style="width:${memPct.toFixed(1)}%"></i></div></div>
           <div class="card"><h3>实例</h3><div class="big">${running} <span class="muted small">/ ${s.instances.length} 运行中</span></div></div>
+          <div class="card"><h3>磁盘可用</h3><div class="big">${fmtSize(diskFree)}</div><div class="bar"><i style="width:${diskPct.toFixed(1)}%;background:linear-gradient(90deg,var(--warn),var(--danger))"></i></div><div class="muted small">共 ${fmtSize(diskTotal)} · 已用 ${diskPct.toFixed(0)}%</div></div>
+        </div>
+        <div class="grid stats-grid">
+          <div class="card" style="grid-column:1/-1"><h3>实例空间排行（目录 + 备份，5 分钟缓存）</h3>${sizeList}</div>
         </div>
         <h2>实例概览</h2>
         <div class="grid cards-grid">${s.instances.map(i => {
@@ -508,7 +521,7 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const INST_TABS = [['console', '控制台'], ['mods', '模组'], ['backups', '备份'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
 
 async function renderInstance(id, tab) {
   const t = ++routeToken;
@@ -527,6 +540,7 @@ async function renderInstance(id, tab) {
     <div id="tab-body"></div>`;
   const body = $('#tab-body');
   if (tab === 'console') renderTabConsole(id, body, t);
+  else if (tab === 'monitor') renderTabMonitor(id, body, t);
   else if (tab === 'mods') renderTabMods(id, body, t);
   else if (tab === 'backups') renderTabBackups(id, body, t);
   else if (tab === 'files') renderTabFiles(id, body, t);
@@ -720,6 +734,84 @@ async function userAction(id, action, target, reason) {
 }
 
 /* ---------------- 模组 ---------------- */
+
+/* ---------------- 监控（TPS / CPU 内存历史 / 在线时长 / 崩溃归档） ---------------- */
+function renderChart(el, points) {
+  if (!points.length) { el.innerHTML = '<div class="empty">暂无数据（实例运行后每 30 秒采样一次）</div>'; return; }
+  const w = 800, h = 220, pad = 36;
+  const n = points.length;
+  const x = i => pad + (w - 2 * pad) * (i / Math.max(n - 1, 1));
+  const cpuMax = Math.max(10, ...points.map(p => p[1]));
+  const memMax = Math.max(1, ...points.map(p => p[2]));
+  const cpuPts = points.map((p, i) => `${x(i)},${h - pad - (h - 2 * pad) * (p[1] / cpuMax)}`).join(' ');
+  const memPts = points.map((p, i) => `${x(i)},${h - pad - (h - 2 * pad) * (p[2] / memMax)}`).join(' ');
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" style="width:100%;background:var(--console-bg);border-radius:8px">
+    <polyline fill="none" stroke="var(--accent)" stroke-width="1.5" points="${cpuPts}"/>
+    <polyline fill="none" stroke="var(--blue)" stroke-width="1.5" points="${memPts}"/>
+    <text x="${pad}" y="18" fill="var(--accent)" font-size="12">CPU%（峰 ${cpuMax.toFixed(1)}）</text>
+    <text x="${pad + 240}" y="18" fill="var(--blue)" font-size="12">内存 MB（峰 ${memMax.toFixed(0)}）</text>
+    <text x="${pad}" y="${h - 8}" fill="var(--muted)" font-size="11">${new Date(points[0][0] * 1000).toLocaleTimeString()}</text>
+    <text x="${w - pad - 110}" y="${h - 8}" fill="var(--muted)" font-size="11">${new Date(points[n - 1][0] * 1000).toLocaleTimeString()}</text>
+  </svg>`;
+}
+async function renderTabMonitor(id, el, t) {
+  el.innerHTML = `<h2>监控</h2>
+    <div class="grid stats-grid">
+      <div class="card"><h3>TPS / MSPT</h3><div class="big" id="mon-tps">-</div><div class="muted small" id="mon-tps-hint"></div></div>
+      <div class="card"><h3>运行状态</h3><div class="muted small" id="mon-live">-</div></div>
+    </div>
+    <h3>CPU / 内存历史（每 30 秒采样，最多 24 小时）</h3>
+    <div id="mon-chart"><div class="empty">加载中…</div></div>
+    <h3>玩家在线时长</h3>
+    <div id="mon-playtime"><div class="empty">加载中…</div></div>
+    <h3>崩溃归档</h3>
+    <div id="mon-crashes"><div class="empty">加载中…</div></div>`;
+  const load = async () => {
+    if (t !== routeToken) return;
+    try {
+      const [s, m, pt, cr] = await Promise.all([
+        api(`/instances/${id}/status`), api(`/instances/${id}/metrics`),
+        api(`/instances/${id}/playtime`), api(`/instances/${id}/crashes`),
+      ]);
+      if (t !== routeToken) return;
+      const tps = s.tps;
+      const tEl = document.getElementById('mon-tps'), hEl = document.getElementById('mon-tps-hint');
+      if (tps && tps.tps !== undefined) { tEl.textContent = tps.tps.toFixed(1); hEl.textContent = tps.mspt !== undefined ? `MSPT ${tps.mspt}ms` : ''; }
+      else if (tps && tps.needs_rcon) { tEl.textContent = '需要 RCON'; hEl.textContent = '在服务器设置中开启 enable-rcon 并设置 rcon.password 后，面板每 10 秒采样 TPS。'; }
+      else { tEl.textContent = '采样中…'; hEl.textContent = ''; }
+      document.getElementById('mon-live').innerHTML = s.status === 'running'
+        ? `运行 ${fmtUptime(s.uptime_secs)} · PID ${s.pid || '-'}`
+        : '未运行';
+      renderChart(document.getElementById('mon-chart'), m.points || []);
+      const pl = pt.players || [];
+      document.getElementById('mon-playtime').innerHTML = pl.length
+        ? '<table class="table"><thead><tr><th>玩家</th><th>总时长</th><th>会话数</th></tr></thead><tbody>' +
+          pl.map(x => `<tr><td><b>${esc(x.name)}</b></td><td>${fmtUptime(x.total_secs)}</td><td>${x.sessions}</td></tr>`).join('') +
+          '</tbody></table>'
+        : '<div class="empty" style="padding:14px">暂无数据（玩家进出服务器时统计）</div>';
+      const files = cr.files || [];
+      document.getElementById('mon-crashes').innerHTML = files.length
+        ? '<table class="table"><tbody>' +
+          files.map(f => `<tr><td class="mono small">${esc(f.name)}</td><td>${fmtSize(f.size)}</td>` +
+            `<td><button class="btn small" onclick="viewCrash('${id}','${esc(f.name)}')">查看</button></td></tr>`).join('') +
+          '</tbody></table>'
+        : '<div class="empty" style="padding:14px">无崩溃记录（异常退出时会自动归档控制台末尾与 crash-report）</div>';
+    } catch (e) {
+      const el = document.getElementById('mon-chart');
+      if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
+  };
+  await load();
+  every(10000, load);
+}
+async function viewCrash(id, name) {
+  try {
+    const d = await api(`/instances/${id}/crashes/file?name=${encodeURIComponent(name)}`);
+    showModal(`<h2>${esc(name)}</h2><pre class="job-log" style="max-height:440px">${esc(d.content)}</pre>
+      <div class="row right" style="margin-top:10px"><button class="btn" onclick="closeModal()">关闭</button></div>`, 'wide');
+  } catch (e) { toast(e.message, false); }
+}
+
 async function renderTabMods(id, el, t) {
   const isPlugin = ['paper', 'purpur', 'folia', 'velocity', 'waterfall', 'bungeecord'].includes(currentInstanceInfo?.mod_loader);
   const noun = isPlugin ? '插件' : '模组';
@@ -1593,7 +1685,34 @@ async function renderPanelSettings() {
       <label class="full">数据目录<input id="ps-dir" value="${esc(c.data_dir)}">
         <div class="muted small">实例存放的根目录（相对路径基于面板工作目录），重启面板后生效。</div></label>
       <div class="row right"><button class="btn primary" onclick="savePanelSettings()">保存</button></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="row between"><h2 style="margin:0">审计日志</h2>
+        <div class="row">
+          <input id="audit-q" placeholder="筛选路径 / 方法 / 状态码" style="width:230px" onkeydown="if(event.key==='Enter')loadAudit()">
+          <button class="btn small" onclick="loadAudit()">刷新</button>
+        </div></div>
+      <div id="audit-body" style="margin-top:12px"><div class="empty">加载中…</div></div>
+      <p class="muted small">记录所有写操作与失败请求（≥400），token / password / key 参数自动脱敏；内存保留最近 5000 条，全量写入 data/audit.log。</p>
     </div>`;
+  await loadAudit();
+}
+async function loadAudit() {
+  const el = $('#audit-body');
+  if (!el) return;
+  try {
+    const q = $('#audit-q')?.value.trim() || '';
+    const d = await api(`/audit?limit=200&q=${encodeURIComponent(q)}`);
+    const list = d.entries || [];
+    el.innerHTML = list.length ? `<table class="table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态码</th></tr></thead><tbody>` +
+      list.map(e => `<tr>
+        <td class="muted mono small">${esc(e.ts)}</td>
+        <td class="mono small">${esc(e.method)}</td>
+        <td class="mono small">${esc(e.path)}</td>
+        <td>${e.status < 400 ? '<span class="pill st-running">OK</span>' : `<span class="pill st-stopped">${e.status}</span>`}</td>
+      </tr>`).join('') + '</tbody></table>'
+      : '<div class="empty" style="padding:14px">暂无记录</div>';
+  } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 async function savePanelSettings() {
   try {

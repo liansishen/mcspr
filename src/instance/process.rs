@@ -1,6 +1,7 @@
 use super::{InstanceRuntime, LogLine, Status};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,6 +164,14 @@ async fn on_exit(
     rt.pid.store(0, Ordering::SeqCst);
     *rt.started_at.lock().await = None;
     *rt.status.lock().await = Status::Stopped;
+
+    // 结算未闭合的玩家在线会话（可观测性）
+    settle_all_sessions(&rt).await;
+
+    // 崩溃归档（异常退出时保存控制台末尾 + crash-report）
+    if !stopping {
+        archive_crash(&rt).await;
+    }
 
     let code = res.ok().and_then(|s| s.code());
     if stopping {
@@ -332,23 +341,130 @@ async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
     {
         let mut buf = rt.log_buf.lock().await;
         buf.push_back(ll.clone());
-        while buf.len() > 1000 {
+        while buf.len() > 5000 {
             buf.pop_front();
         }
     }
+    // 面板控制台日志落盘（超 16MB 轮转），面板自身的 [面板] 行也在其中
+    write_panel_log(rt, &ll).await;
     let _ = rt.log_tx.send(ll);
 
     if let Some(p) = parse_join(&line) {
         let mut players = rt.players.lock().await;
         if !players.contains(&p) {
-            players.push(p);
+            players.push(p.clone());
         }
+        drop(players);
+        // 开始在线时长会话
+        rt.open_sessions
+            .lock()
+            .await
+            .insert(p, chrono::Utc::now());
     }
     if let Some(p) = parse_leave(&line) {
         rt.players.lock().await.retain(|x| *x != p);
+        // 结算该玩家的本次在线时长
+        if let Some(start) = rt.open_sessions.lock().await.remove(&p) {
+            settle_playtime(rt, &p, start).await;
+        }
     }
     if line.contains("Done (") {
         rt.ready.store(true, Ordering::SeqCst);
+        if rt.ready.load(Ordering::SeqCst) {
+            *rt.status.lock().await = Status::Running;
+        }
+    }
+}
+
+/// 累计在线时长并落盘 player-stats.json
+async fn settle_playtime(rt: &Arc<InstanceRuntime>, name: &str, start: chrono::DateTime<chrono::Utc>) {
+    let secs = (chrono::Utc::now() - start).num_seconds().max(0) as u64;
+    {
+        let mut pt = rt.playtime.lock().await;
+        let e = pt.entry(name.to_string()).or_insert((0, 0));
+        e.0 += secs;
+        e.1 += 1;
+    }
+    persist_playtime(rt).await;
+}
+
+/// 退出时结算所有未闭合的会话（按退出时间计）
+pub async fn settle_all_sessions(rt: &Arc<InstanceRuntime>) {
+    let now = chrono::Utc::now();
+    let mut pt = rt.playtime.lock().await;
+    let open = rt.open_sessions.lock().await;
+    for (name, start) in open.iter() {
+        let secs = (now - *start).num_seconds().max(0) as u64;
+        let e = pt.entry(name.clone()).or_insert((0, 0));
+        e.0 += secs;
+        e.1 += 1;
+    }
+    drop(open);
+    drop(pt);
+    persist_playtime(rt).await;
+}
+
+async fn persist_playtime(rt: &Arc<InstanceRuntime>) {
+    let map = rt.playtime.lock().await.clone();
+    let path = rt.dir.join("player-stats.json");
+    let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default()).await;
+}
+
+/// 崩溃归档：控制台末尾 200 行 + 最新的 crash-report
+pub async fn archive_crash(rt: &Arc<InstanceRuntime>) {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let dir = rt.dir.join("crash-archive");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let lines: Vec<String> = rt
+        .log_buf
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .take(200)
+        .rev()
+        .map(|l| format!("{} {}", l.ts, l.line))
+        .collect();
+    let _ = tokio::fs::write(
+        dir.join(format!("crash-{ts}.log")),
+        lines.join("\n"),
+    )
+    .await;
+    // 复制最新的 crash-report（启动阶段崩溃不会有这份）
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(rt.dir.join("crash-reports")) {
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                if let Ok(modified) = md.modified() {
+                    if latest.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+                        latest = Some((modified, e.path()));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, p)) = latest {
+        let _ = std::fs::copy(&p, dir.join(format!("crash-report-{ts}.txt")));
+    }
+}
+
+/// 面板控制台日志落盘（logs/panel-console.log，超 16MB 轮转）
+async fn write_panel_log(rt: &Arc<InstanceRuntime>, ll: &LogLine) {
+    let dir = rt.dir.join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let p = dir.join("panel-console.log");
+    if let Ok(md) = std::fs::metadata(&p) {
+        if md.len() > 16 * 1024 * 1024 {
+            let _ = std::fs::rename(&p, dir.join("panel-console.log.1"));
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {}", ll.ts, ll.line);
     }
 }
 

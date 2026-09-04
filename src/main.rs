@@ -1,9 +1,11 @@
 mod api;
+mod audit;
 mod config;
 mod error;
 mod instance;
 mod java_scan;
 mod jobs;
+mod rcon;
 mod state;
 mod util;
 
@@ -57,6 +59,95 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 面板退出时优雅停止所有运行中的实例（世界落盘），避免孤儿进程与文件锁
+    // 可观测性：TPS 采样（10s，走 RCON）与 CPU/内存历史采样（30s）
+    {
+        let st = app_state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let map = st.instances.read().await.clone();
+                for (id, rt) in map {
+                    if *rt.status.lock().await == instance::Status::Stopped {
+                        continue;
+                    }
+                    let dir = rt.dir.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let Some((addr, pass, _)) = rcon::rcon_config(&dir) else {
+                            return Some(serde_json::json!({ "needs_rcon": true }));
+                        };
+                        let mut c = rcon::RconClient::connect(&addr, &pass).ok()?;
+                        let out = c.command("tps").ok()?;
+                        rcon::parse_tps(&out)
+                            .map(|(tps, mspt)| serde_json::json!({ "tps": tps, "mspt": mspt }))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(v) = res {
+                        *rt.tps.lock().await = Some(v);
+                    }
+                }
+            }
+        });
+    }
+    {
+        let st = app_state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let map = st.instances.read().await.clone();
+                let mut running: Vec<(String, std::sync::Arc<instance::InstanceRuntime>)> =
+                    Vec::new();
+                for (id, rt) in map {
+                    if *rt.status.lock().await != instance::Status::Stopped {
+                        running.push((id, rt));
+                    }
+                }
+                if running.is_empty() {
+                    continue;
+                }
+                let pids: Vec<sysinfo::Pid> = running
+                    .iter()
+                    .filter_map(|(_, rt)| {
+                        let p = rt.pid.load(std::sync::atomic::Ordering::SeqCst);
+                        (p != 0).then(|| sysinfo::Pid::from_u32(p))
+                    })
+                    .collect();
+                if pids.is_empty() {
+                    continue;
+                }
+                {
+                    // metrics 写入（rt.metrics 锁）在 sys 锁的作用域外逐个进行
+                    let samples: Vec<(u32, f32, f64)> = {
+                        let mut sys = st.sys.lock().unwrap();
+                        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+                        running
+                            .iter()
+                            .map(|(_, rt)| {
+                                let pid = rt.pid.load(std::sync::atomic::Ordering::SeqCst);
+                                let (cpu, mem) = match sys.process(sysinfo::Pid::from_u32(pid)) {
+                                    Some(p) => (p.cpu_usage(), p.memory() as f64 / 1048576.0),
+                                    None => (0.0, 0.0),
+                                };
+                                (pid, cpu, mem)
+                            })
+                            .collect()
+                    };
+                    for ((_, rt), (pid, cpu, mem)) in running.iter().zip(samples.iter()) {
+                        let _ = pid;
+                        let ts = chrono::Utc::now().timestamp();
+                        let mut m = rt.metrics.lock().await;
+                        m.push_back((ts, *cpu, *mem));
+                        while m.len() > 2880 {
+                            m.pop_front();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 可观测性：TPS 采样（10s，走 RCON）与 CPU/内存历史采样（30s）占位结束
     tracing::info!("按 Ctrl+C 停止面板时会自动保存并停止所有运行中的服务器");
     let shutdown = instance::process::shutdown_all(&app_state);
     tokio::select! {

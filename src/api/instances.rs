@@ -334,9 +334,20 @@ pub async fn open_folder(
 
 // ---------- 全局统计 ----------
 
+fn dir_size(dir: &std::path::Path) -> u64 {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
 pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut pid_map: Vec<(String, u32)> = Vec::new();
     let mut items = Vec::new();
+    let instance_ids: Vec<String> = state.instances.read().await.keys().cloned().collect();
     {
         let map = state.instances.read().await;
         for rt in map.values() {
@@ -374,12 +385,42 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
         (sys.global_cpu_usage(), sys.total_memory(), sys.used_memory())
     };
 
+    // 磁盘用量与实例空间排行（可观测性）
+    let data_dir = state.config.read().await.data_dir.clone();
+    let (disk_total, disk_free) = {
+        let dd = data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let total = fs4::total_space(&dd).unwrap_or(0);
+            let free = fs4::available_space(&dd).unwrap_or(0);
+            (total, free)
+        })
+        .await
+        .unwrap_or((0, 0))
+    };
+    let mut sizes = serde_json::Map::new();
+    for id in &instance_ids {
+        let cached = state.size_cache.lock().unwrap().get(id).cloned();
+        let bytes = match cached {
+            Some((at, bytes)) if at.elapsed().as_secs() < 300 => bytes,
+            _ => {
+                let dir = std::path::Path::new(&data_dir).join("instances").join(id);
+                let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
+                    .await
+                    .unwrap_or(0);
+                state.size_cache.lock().unwrap().insert(id.clone(), (std::time::Instant::now(), bytes));
+                bytes
+            }
+        };
+        sizes.insert(id.clone(), json!(bytes));
+    }
     Json(json!({
         "cpu_usage": cpu,
         "mem_total": mem_total,
         "mem_used": mem_used,
         "instances": items,
         "per_instance": per_instance,
+        "disk": { "total": disk_total, "free": disk_free },
+        "sizes": sizes,
     }))
 }
 
