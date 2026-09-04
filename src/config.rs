@@ -49,8 +49,18 @@ pub struct PanelConfig {
     pub backup_keep_days: u64,
     #[serde(default)]
     pub thresholds: Thresholds,
+    /// 告警推送：none / generic / discord / telegram
+    #[serde(default = "d_alert_type")]
+    pub alert_type: String,
+    #[serde(default)]
+    pub alert_webhook_url: String,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    #[serde(default)]
+    pub telegram_chat_id: String,
 }
 fn d_backup_keep() -> u32 { 10 }
+fn d_alert_type() -> String { "none".into() }
 
 impl Default for PanelConfig {
     fn default() -> Self {
@@ -62,6 +72,10 @@ impl Default for PanelConfig {
             backup_keep: d_backup_keep(),
             backup_keep_days: d_backup_days(),
             thresholds: Thresholds::default(),
+            alert_type: d_alert_type(),
+            alert_webhook_url: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
         }
     }
 }

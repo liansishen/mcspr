@@ -17,6 +17,8 @@ pub struct AppStateInner {
     pub audit: Mutex<VecDeque<AuditEntry>>,
     /// 实例目录大小缓存 (计算时间, 总字节)
     pub size_cache: std::sync::Mutex<HashMap<String, (std::time::Instant, u64)>>,
+    /// 告警去重 (key, 上次发送时间)
+    pub alert_dedup: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ impl AppState {
             forge_builds: std::sync::Mutex::new(None),
             audit: Mutex::new(VecDeque::new()),
             size_cache: std::sync::Mutex::new(HashMap::new()),
+            alert_dedup: std::sync::Mutex::new(HashMap::new()),
         })))
     }
 }

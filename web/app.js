@@ -169,11 +169,12 @@ async function renderDashboard() {
         <div class="grid stats-grid">
           <div class="card" style="grid-column:1/-1"><h3>实例空间排行（目录 + 备份，5 分钟缓存）</h3>${sizeList}</div>
         </div>
+        <div class="row right" style="margin-bottom:8px"><button class="btn small primary" onclick="batchStart()">▶ 启动选中</button><button class="btn small warn" onclick="batchStop()">■ 停止选中</button></div>
         <h2>实例概览</h2>
         <div class="grid cards-grid">${s.instances.map(i => {
           const p = (s.per_instance && s.per_instance[i.id]) || {};
           return `<div class="card inst-card">
-            <div class="inst-head"><a href="#/instance/${i.id}/console">${esc(i.name)}</a>${statusPill(i.status)}</div>
+            <div class="inst-head"><label class="check" style="margin:0"><input type="checkbox" class="dash-check" data-id="${i.id}"> <a href="#/instance/${i.id}/console">${esc(i.name)}</a></label>${statusPill(i.status)}</div>
             <div class="muted">${i.player_names.length ? '在线: ' + esc(i.player_names.join(', ')) : '无玩家在线'}</div>
             <div class="muted">${i.status === 'running'
               ? `运行 ${fmtUptime(i.uptime_secs)} · CPU ${(p.cpu || 0).toFixed(1)}% · 内存 ${fmtSize((p.mem_mb || 0) * 1048576)}`
@@ -222,6 +223,7 @@ async function renderInstances() {
               : `<button class="btn small warn" onclick="instStop('${i.id}')">停止</button>
                  <button class="btn small" onclick="instRestart('${i.id}')">重启</button>`}
             <button class="btn small ghost" onclick="openFolder('${i.id}')">目录</button>
+            <button class="btn small" onclick="cloneInstance('${i.id}','${esc(i.name)}')">克隆</button>
             <button class="btn small danger" onclick="delInstance('${i.id}','${esc(i.name)}')">删除</button>
           </td></tr>`).join('')}</tbody></table>`
         : '<div class="empty">暂无实例。点击右上角「导入整合包」或「新建空白实例」开始。</div>';
@@ -291,26 +293,54 @@ function switchCreateTab(m) {
   $('#create-modded').style.display = m === 'modded' ? '' : 'none';
 }
 async function loadLoaderVersions() {
-  const loader = $('#ci-loader')?.value;
-  const gameSel = $('#ci-loader-game');
-  if (!loader || !gameSel) return;
-  const gameRow = $('#ci-loader-game-row');
-  const isProxy = loader === 'velocity' || loader === 'bungeecord';
-  if (gameRow) gameRow.style.display = isProxy ? 'none' : '';
-  const verSel = $('#ci-loader-ver');
+  var loader = document.getElementById('ci-loader') ? document.getElementById('ci-loader').value : '';
+  var gameRow = document.getElementById('ci-loader-game-row');
+  if (!loader || !gameRow) return;
+  var verSel = document.getElementById('ci-loader-ver');
   if (verSel) verSel.innerHTML = '<option value="">加载中…</option>';
-  if (isProxy) {
-    await loadLoaderVerList();
-    return;
-  }
-  gameSel.innerHTML = '<option value="">加载中…</option>';
+  // 代理端无 MC 版本维度
+  var isProxy = loader === 'velocity' || loader === 'bungeecord';
+  var gameLbl = gameRow.querySelector('label:first-child');
+  if (gameLbl) gameLbl.style.display = isProxy ? 'none' : '';
+  var minorLbl = gameRow.querySelector('label:nth-child(2)');
+  if (minorLbl) minorLbl.style.display = isProxy ? 'none' : '';
   try {
-    const g = await api(`/loaders/${loader}/game-versions`);
-    gameSel.innerHTML = g.versions.map(v => `<option value="${esc(v.id)}">${esc(v.id)}${v.stable ? '' : '（快照）'}</option>`).join('');
-    await loadLoaderVerList();
+    var g = await api('/loaders/' + loader + '/game-versions');
+    var ids = g.versions.map(function(v) { return v.id; });
+    var gv = groupVersions(ids);
+    var majorSel = document.getElementById('ci-loader-game');
+    var minorSel = document.getElementById('ci-loader-minor');
+    if (isProxy) {
+      // 代理端：直接加载版本列表
+      await loadLoaderVerList();
+      return;
+    }
+    majorSel.innerHTML = gv.order.map(function(gp) {
+      return '<option value="' + esc(gp) + '">' + esc(gp) + '</option>';
+    }).join('');
+    window._loaderGroups = gv.groups;
+    updateLoaderMinor(loader);
   } catch (e) {
-    gameSel.innerHTML = `<option value="">加载失败：${esc(e.message)}</option>`;
+    if (majorSel) majorSel.innerHTML = '<option value="">加载失败：' + esc(e.message) + '</option>';
   }
+}
+function updateLoaderMinor(loader) {
+  var g = document.getElementById('ci-loader-game') ? document.getElementById('ci-loader-game').value : '';
+  var minorSel = document.getElementById('ci-loader-minor');
+  if (!minorSel) return;
+  var list = (window._loaderGroups && window._loaderGroups[g]) || [];
+  minorSel.innerHTML = list.map(function(v) {
+    return '<option value="' + esc(v) + '">' + esc(v) + '</option>';
+  }).join('');
+  loadLoaderVerList();
+}
+function syncLoaderGame() {
+  var minor = document.getElementById('ci-loader-minor');
+  if (minor && minor.value) {
+    var gameSel = document.getElementById('ci-loader-game');
+    if (gameSel) gameSel.value = minor.value;
+  }
+  loadLoaderVerList();
 }
 async function loadLoaderVerList() {
   const loader = $('#ci-loader')?.value;
@@ -325,24 +355,78 @@ async function loadLoaderVerList() {
     verSel.innerHTML = `<option value="">加载失败：${esc(e.message)}</option>`;
   }
 }
+// 按大版本分组（取前两段点分数字作为组名）
+function groupVersions(ids) {
+  var groups = {};
+  var order = [];
+  for (var i = 0; i < ids.length; i++) {
+    var parts = ids[i].split(/[.\-]/);
+    var g = parts.length >= 2 ? parts[0] + '.' + parts[1] : ids[i];
+    if (!groups[g]) { groups[g] = []; order.push(g); }
+    groups[g].push(ids[i]);
+  }
+  return { groups: groups, order: order };
+}
+
+// 填充两层版本下拉框
+function fillVersionTwoLevel(majorSel, minorSel, allIds, selectedId) {
+  var gv = groupVersions(allIds);
+  majorSel.innerHTML = gv.order.map(function(g) {
+    return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
+  }).join('');
+  function updateMinor() {
+    var g = majorSel.value;
+    var list = gv.groups[g] || [];
+    minorSel.innerHTML = list.map(function(v) {
+      return '<option value="' + esc(v) + '">' + esc(v) + '</option>';
+    }).join('');
+    if (selectedId && list.includes(selectedId)) minorSel.value = selectedId;
+  }
+  majorSel.onchange = updateMinor;
+  updateMinor();
+}
+
 async function loadVersionOptions() {
   try {
-    const d = await api('/versions');
-    const sel = $('#ci-version');
+    var d = await api('/versions');
+    var sel = document.getElementById('ci-version');
     if (!sel) return;
-    const groups = { release: ['正式版', []], snapshot: ['快照', []], old_beta: ['旧版 Beta', []], old_alpha: ['旧版 Alpha', []] };
-    for (const v of d.versions) if (groups[v.type]) groups[v.type][1].push(v);
-    let html = '<option value="">不下载，稍后手动导入或配置</option>';
-    const rel = groups.release[1];
-    if (rel.length) html += `<optgroup label="正式版（最新 ${esc(rel[0].id)}）">${rel.slice(0, 120).map((v, i) => `<option value="${esc(v.id)}">${i === 0 ? '⭐ 最新正式版 · ' : ''}${esc(v.id)}</option>`).join('')}</optgroup>`;
-    for (const k of ['snapshot', 'old_beta', 'old_alpha']) {
-      if (groups[k][1].length) html += `<optgroup label="${groups[k][0]}">${groups[k][1].slice(0, 40).map(v => `<option value="${esc(v.id)}">${esc(v.id)}</option>`).join('')}</optgroup>`;
-    }
-    sel.innerHTML = html;
+    // 分离正式版与快照
+    var releases = d.versions.filter(function(v) { return v.type === 'release'; }).map(function(v) { return v.id; });
+    var snaps = d.versions.filter(function(v) { return v.type === 'snapshot'; }).map(function(v) { return v.id; });
+    var all = releases.concat(snaps);
+    // 大版本下拉（正式版分组）
+    var gv = groupVersions(releases);
+    var majorSel = document.getElementById('ci-ver-major');
+    majorSel.innerHTML = gv.order.map(function(g) {
+      return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
+    }).join('');
+    // 具体版本下拉（随大版本联动：正式版 + 同期快照）
+    window._vanillaAll = all;
+    window._vanillaGroups = gv.groups;
+    updateVanillaMinor();
   } catch (e) {
-    const sel = $('#ci-version');
-    if (sel) sel.innerHTML = `<option value="">不下载（版本清单获取失败：${esc(e.message)}）</option>`;
+    var sel = document.getElementById('ci-version');
+    if (sel) sel.innerHTML = '<option value="">版本清单获取失败：' + esc(e.message) + '</option>';
   }
+}
+function updateVanillaMinor() {
+  var majorSel = document.getElementById('ci-ver-major');
+  var minorSel = document.getElementById('ci-version');
+  if (!majorSel || !minorSel) return;
+  var g = majorSel.value;
+  var inGroup = window._vanillaGroups ? (window._vanillaGroups[g] || []) : [];
+  // 也包含同期的快照版本
+  var snapInGroup = [];
+  if (window._vanillaAll) {
+    for (var i = 0; i < window._vanillaAll.length; i++) {
+      var v = window._vanillaAll[i];
+      if (v.indexOf(g) === 0 && inGroup.indexOf(v) < 0) snapInGroup.push(v);
+    }
+  }
+  var all = inGroup.concat(snapInGroup);
+  minorSel.innerHTML = '<option value="">不下载，稍后手动导入或配置</option>' +
+    all.map(function(v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('');
 }
 function pollJob(jobId, onUpdate) {
   return new Promise((resolve, reject) => {
@@ -521,7 +605,7 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
 
 async function renderInstance(id, tab) {
   const t = ++routeToken;
@@ -543,6 +627,8 @@ async function renderInstance(id, tab) {
   else if (tab === 'monitor') renderTabMonitor(id, body, t);
   else if (tab === 'mods') renderTabMods(id, body, t);
   else if (tab === 'backups') renderTabBackups(id, body, t);
+  else if (tab === 'worlds') renderTabWorlds(id, body, t);
+  else if (tab === 'tasks') renderTabTasks(id, body, t);
   else if (tab === 'files') renderTabFiles(id, body, t);
   else if (tab === 'props') renderTabProps(id, body, t);
   else renderTabSettings(id, body);
@@ -577,13 +663,79 @@ function actionButtons(id, status) {
 }
 
 /* ---------------- 控制台 + 用户管理 ---------------- */
+
+/* ---------------- Commit3 前端补充 ---------------- */
+// 控制台增强：命令历史 / Tab 补全 / 搜索过滤 / 日志下载
+let consoleLines = [];
+let cmdHistory = [];
+let cmdHistIdx = -1;
+let consoleFilter = '';
+
+function applyConsoleFilter() {
+  const logEl = document.getElementById('console-log');
+  if (!logEl) return;
+  const q = (document.getElementById('console-search')?.value || '').toLowerCase();
+  const lvl = document.getElementById('console-level')?.value || '';
+  for (const div of logEl.children) {
+    const text = div.textContent.toLowerCase();
+    let show = true;
+    if (q && !text.includes(q)) show = false;
+    if (lvl === 'err' && !div.classList.contains('err')) show = false;
+    if (lvl === 'warn' && !div.classList.contains('warn')) show = false;
+    div.style.display = show ? '' : 'none';
+  }
+}
+async function downloadConsole(id) {
+  try {
+    const r = await fetch(`/api/instances/${id}/console/download`, { headers: headers() });
+    if (!r.ok) throw new Error(r.statusText);
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `console-${id}.log`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast(e.message, false); }
+}
+const TAB_COMMANDS = ['list', 'say ', 'op ', 'deop ', 'kick ', 'ban ', 'ban-ip ', 'pardon ', 'pardon-ip ', 'whitelist add ', 'whitelist remove ', 'whitelist list', 'stop', 'save-all', 'save-on', 'save-off', 'tps', 'restart ', 'difficulty ', 'gamemode ', 'time set ', 'weather ', 'give ', 'tp ', 'fill ', 'setworldspawn ', 'defaultgamemode '];
+function consoleTabComplete(id) {
+  const input = document.getElementById('cmd-input');
+  if (!input) return;
+  const text = input.value;
+  const parts = text.split(' ');
+  const last = parts[parts.length - 1].toLowerCase();
+  // 第一个词：补全命令；之后：补全在线玩家名
+  let pool = null, prefix = '';
+  if (parts.length === 1) {
+    pool = TAB_COMMANDS.filter(c => !c.endsWith(' ')).concat(['help']);
+    prefix = last;
+  } else if (parts.length >= 2 && ['op', 'deop', 'kick', 'ban', 'pardon', 'whitelist'].includes(parts[0])) {
+    pool = (modDL ? [] : []).concat((usersData?.online || []), (playersData?.players || []));
+    prefix = last;
+  }
+  if (!pool) return;
+  const hit = pool.find(c => c.toLowerCase().startsWith(prefix) && prefix);
+  if (hit !== undefined && prefix) {
+    parts[parts.length - 1] = hit;
+    input.value = parts.join(' ');
+  }
+}
+
 function renderTabConsole(id, el, t) {
   el.innerHTML = `
     <div class="console-wrap">
       <div id="console-log" class="console"></div>
       <div class="row console-input">
-        <input id="cmd-input" placeholder="输入命令（如 list、say hello）后回车发送…" autocomplete="off">
+        <input id="cmd-input" placeholder="输入命令（↑↓ 历史，Tab 补全）" autocomplete="off"
+          onkeydown="consoleKeydown(event, '${id}')">
         <button class="btn" id="cmd-send">发送</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="console-search" placeholder="搜索日志…" style="width:200px" oninput="applyConsoleFilter()">
+        <select id="console-level" style="width:auto" onchange="applyConsoleFilter()">
+          <option value="">全部级别</option><option value="warn">仅警告+</option><option value="err">仅错误</option>
+        </select>
+        <button class="btn small ghost" onclick="downloadConsole('${id}')">⬇ 下载日志</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -629,6 +781,8 @@ function renderTabConsole(id, el, t) {
   const send = async () => {
     const v = $('#cmd-input').value.trim();
     if (!v) return;
+    cmdHistory.push(v);
+    cmdHistIdx = cmdHistory.length;
     try {
       await api(`/instances/${id}/command`, { method: 'POST', body: { command: v } });
       $('#cmd-input').value = '';
@@ -1281,6 +1435,7 @@ async function loadFiles(id, t, path) {
         <td class="muted">${f.dir ? '-' : fmtSize(f.size)}</td>
         <td class="muted">${esc(f.modified)}</td>
         <td>
+          <button class="btn small" onclick="${f.dir ? `downloadArchive('${id}','${esc(full(f))}')` : `downloadFile('${id}','${esc(full(f))}')`}">下载</button>
           <button class="btn small" onclick="renameFile('${id}','${esc(full(f))}','${esc(f.name)}')">重命名</button>
           <button class="btn small danger" onclick="deleteFile('${id}','${esc(full(f))}')">删除</button>
         </td></tr>`).join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>'}</tbody></table>`;
@@ -1561,11 +1716,14 @@ async function renderTabSettings(id, el) {
         <div class="muted small">JVM 最大堆大小（-Xmx）：原版服 2048~4096，模组服建议 6144 以上</div></label>
       <label class="full">JVM / 启动参数（空格分隔，支持 @argfile）<input id="f-jvm" value="${esc(s.jvm_args || '')}" placeholder="-XX:+UseG1GC -XX:ParallelGCThreads=4 -Dfile.encoding=UTF-8">
         <div class="muted small">追加在 -Xms/-Xmx 之后的 JVM 参数；主程序 JAR 为空时，这里就是完整的启动参数（支持 @user_jvm_args.txt 等 argfile 写法）。</div></label>
+      <label>JVM 参数模板<div class="row"><button class="btn ghost small" onclick="fillAikar()">填入 Aikar's Flags</button></div></label>
       <label class="check"><input type="checkbox" id="f-auto" ${s.auto_restart ? 'checked' : ''}> 进程异常退出时自动重启（5 秒后）</label>
+      <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例</label>
       <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例（多个实例将间隔 5 秒依次拉起）</label>
       <div class="row right"><button class="btn primary" onclick="saveInstance('${id}')">保存设置</button></div>
     </div>`;
   loadCachedJavas();
+  loadConfigsList(id);
 }
 async function loadCachedJavas() {
   const sel = $('#java-picker');
@@ -1731,3 +1889,344 @@ async function savePanelSettings() {
 
 /* ---------------- 启动 ---------------- */
 route();
+
+function consoleKeydown(e, id) {
+  const input = document.getElementById('cmd-input');
+  if (!input) return;
+  if (e.key === 'Enter') { e.preventDefault(); const b = document.getElementById('cmd-send'); b && b.click(); return; }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (cmdHistIdx > 0) { cmdHistIdx--; input.value = cmdHistory[cmdHistIdx] || ''; }
+    return;
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (cmdHistIdx < cmdHistory.length - 1) { cmdHistIdx++; input.value = cmdHistory[cmdHistIdx] || ''; }
+    else { cmdHistIdx = cmdHistory.length; input.value = ''; }
+    return;
+  }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const text = input.value;
+    const parts = text.split(' ');
+    const last = parts[parts.length - 1].toLowerCase();
+    if (parts.length === 1) {
+      const cmds = ['list', 'say ', 'op ', 'deop ', 'kick ', 'ban ', 'ban-ip ', 'pardon ', 'pardon-ip ', 'whitelist ', 'stop', 'save-all', 'tps', 'difficulty ', 'gamemode ', 'time set ', 'weather '];
+      const hit = cmds.find(c => c.startsWith(last) && last);
+      if (hit !== undefined) input.value = hit;
+      return;
+    }
+    // 玩家名补全（在线玩家）
+    fetch('/api/instances/' + id + '/users', { headers: headers() })
+      .then(r => r.json())
+      .then(d => {
+        const pool = (d.online || []).map(p => p).filter(n => n.toLowerCase().startsWith(last));
+        if (pool.length) { parts[parts.length - 1] = pool[0]; input.value = parts.join(' '); }
+      }).catch(() => {});
+  }
+}
+
+/* ---------------- 世界管理 ---------------- */
+async function renderTabWorlds(id, el, t) {
+  el.innerHTML = `<div class="row between"><h2>世界管理</h2>
+    <div class="row"><button class="btn" onclick="createWorld('${id}')">新建世界</button></div></div>
+    <p class="muted small">列出实例目录中所有包含 level.dat 的存档。切换/创建/删除需要服务器停止。</p>
+    <div id="worlds-body"><div class="empty">加载中…</div></div>`;
+  await loadWorlds(id, t);
+}
+async function loadWorlds(id, t) {
+  try {
+    const d = await api(`/instances/${id}/worlds`);
+    if (t !== routeToken) return;
+    $('#worlds-body').innerHTML = d.worlds.length ? `<table class="table">
+      <thead><tr><th>世界</th><th>大小</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${d.worlds.map(w => `<tr>
+        <td><b>${esc(w.name)}</b></td><td>${fmtSize(w.size)}</td>
+        <td>${w.current ? '<span class="pill st-running">当前</span>' : '<span class="muted">-</span>'}</td>
+        <td>${w.current ? '<span class="muted small">使用中</span>' :
+          `<button class="btn small" onclick="switchWorld('${id}','${esc(w.name)}')">切换</button>
+           <button class="btn small danger" onclick="deleteWorld('${id}','${esc(w.name)}')">删除</button>`}</td>
+      </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无世界存档</div>';
+  } catch (e) { $('#worlds-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+async function switchWorld(id, name) {
+  try { await api(`/instances/${id}/worlds/switch`, { method: 'POST', body: { path: name } }); toast(`已切换到 ${name}`); loadWorlds(id); } catch (e) { toast(e.message, false); }
+}
+async function deleteWorld(id, name) {
+  if (!confirm(`确定删除世界「${name}」？不可恢复！`)) return;
+  try { await api(`/instances/${id}/worlds/delete`, { method: 'POST', body: { path: name } }); toast('已删除'); loadWorlds(id); } catch (e) { toast(e.message, false); }
+}
+async function createWorld(id) {
+  const name = prompt('新世界名称（不含空格）:');
+  if (!name) return;
+  const seed = prompt('世界种子（留空随机）:');
+  try { await api(`/instances/${id}/worlds/create`, { method: 'POST', body: { name, seed: seed || undefined } }); toast(`世界 ${name} 已创建（设为当前）`); loadWorlds(id); } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 计划任务 ---------------- */
+async function renderTabTasks(id, el, t) {
+  el.innerHTML = `
+    <div class="row between"><h2>计划任务</h2>
+      <button class="btn" onclick="createTask('${id}')">＋ 新建任务</button></div>
+    <p class="muted small">支持三种类型：执行命令 / 备份 / 重启。到期自动执行并记录结果；连续失败 3 次推送告警。</p>
+    <div id="tasks-body"><div class="empty">加载中…</div></div>`;
+  await loadTasks(id, t);
+}
+async function loadTasks(id, t) {
+  try {
+    const d = await api(`/instances/${id}/tasks`);
+    if (t !== routeToken) return;
+    const tasks = d.tasks || [];
+    $('#tasks-body').innerHTML = tasks.length ? `<table class="table">
+      <thead><tr><th>任务</th><th>类型</th><th>间隔</th><th>状态</th><th>上次结果</th><th>操作</th></tr></thead>
+      <tbody>${tasks.map(x => `<tr>
+        <td><b>${esc(x.name)}</b>${x.value ? `<div class="muted small mono">${esc(x.value)}</div>` : ''}</td>
+        <td>${x.kind === 'command' ? '命令' : x.kind === 'backup' ? '备份' : '重启'}</td>
+        <td>${x.interval_mins} 分钟</td>
+        <td>${x.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">停用</span>'}
+            ${x.consecutive_failures >= 3 ? '<span class="pill st-warn">连败</span>' : ''}</td>
+        <td class="muted small">${esc(x.last_result || '-')}</td>
+        <td>
+          <button class="btn small" onclick="taskOp('${id}','${x.id}','run')">立即运行</button>
+          <button class="btn small ${x.enabled ? 'warn' : 'primary'}" onclick="taskOp('${id}','${x.id}','${x.enabled ? 'disable' : 'enable'}')">${x.enabled ? '停用' : '启用'}</button>
+          <button class="btn small danger" onclick="taskOp('${id}','${x.id}','delete')">删除</button>
+        </td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">暂无计划任务，点右上角「新建任务」创建</div>';
+  } catch (e) { $('#tasks-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+async function createTask(id) {
+  showModal(`<h2>新建计划任务</h2>
+    <label>任务名称<input id="tk-name" placeholder="例如：定时备份"></label>
+    <label>类型<select id="tk-kind"><option value="command">执行命令</option><option value="backup">备份</option><option value="restart">重启服务器</option></select></label>
+    <label>命令内容<input id="tk-value" placeholder="例如 say hello（仅命令类型需要）"></label>
+    <label>间隔（分钟）<input id="tk-interval" type="number" value="60" min="1"></label>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" onclick="doCreateTask('${id}')">创建</button></div>`);
+}
+async function doCreateTask(id) {
+  const name = $('#tk-name')?.value.trim();
+  const kind = $('#tk-kind')?.value;
+  const value = $('#tk-value')?.value.trim() || '';
+  const interval = +($('#tk-interval')?.value) || 0;
+  if (!name) return toast('请输入名称', false);
+  if (interval <= 0) return toast('间隔必须大于 0', false);
+  try {
+    await api(`/instances/${id}/tasks`, { method: 'POST', body: { name, kind, value, interval_mins: interval } });
+    closeModal(); toast('任务已创建'); route();
+  } catch (e) { toast(e.message, false); }
+}
+async function taskOp(id, taskId, op) {
+  if (op === 'delete' && !confirm('确定删除此任务？')) return;
+  try { await api(`/instances/${id}/tasks/update`, { method: 'POST', body: { id: taskId, op } }); toast('已操作'); route(); } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 文件下载 / 打包 / 图标 / 克隆 / Aikar / 告警 / 导入导出 ---------------- */
+async function batchStart() {
+  const ids = $$('.dash-check:checked').map(c => c.dataset.id);
+  if (!ids.length) return toast('请先勾选实例', false);
+  for (const x of ids) { try { await api(`/instances/${x}/start`, { method: 'POST' }); } catch {} }
+  toast(`已启动 ${ids.length} 个实例`); refresh();
+}
+async function batchStop() {
+  const ids = $$('.dash-check:checked').map(c => c.dataset.id);
+  if (!ids.length) return toast('请先勾选实例', false);
+  for (const x of ids) { try { await api(`/instances/${x}/stop`, { method: 'POST' }); } catch {} }
+  toast(`已停止 ${ids.length} 个实例`); refresh();
+}
+async function cloneInstance(id, name) {
+  const nn = prompt('克隆实例名称:', name + ' 副本');
+  if (!nn) return;
+  try {
+    const r = await api(`/instances/${id}/clone`, { method: 'POST', body: { name: nn } });
+    toast(`克隆完成，新端口 ${r.port}`); refresh();
+  } catch (e) { toast(e.message, false); }
+}
+function fillAikar() {
+  const el = $('#f-jvm');
+  if (el) el.value = '-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCTargetRatio=4 -XX:G1OldCSetRegionThresholdPercent=5';
+}
+async function uploadIcon(id) {
+  const f = $('#icon-file')?.files[0];
+  if (!f) return toast('请选择 PNG 文件', false);
+  const fd = new FormData(); fd.append('file', f);
+  try { await api(`/instances/${id}/icon`, { method: 'POST', body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
+}
+async function downloadFile(id, path) {
+  const a = document.createElement('a');
+  a.href = `/api/instances/${id}/files/download?path=${encodeURIComponent(path)}${TOKEN ? '&token=' + encodeURIComponent(TOKEN) : ''}`;
+  a.download = path.split('/').pop(); a.click();
+}
+async function downloadArchive(id, path) {
+  const name = (path.split('/').pop() || 'archive') + '.tar.gz';
+  try {
+    await api(`/instances/${id}/files/archive`, { method: 'POST', body: { paths: [path], name } });
+    const a = document.createElement('a');
+    a.href = `/api/instances/${id}/files/archive-download?name=${encodeURIComponent(name)}`;
+    a.download = name; a.click();
+  } catch (e) { toast(e.message, false); }
+}
+async function saveAlerts(id) {
+  var at = document.getElementById('al-type'), au = document.getElementById('al-url'),
+      atk = document.getElementById('al-tgt'), ach = document.getElementById('al-tgc');
+  try { await api('/settings', { method: 'PUT', body: {
+    alert_type: at ? at.value : 'none',
+    alert_webhook_url: au ? au.value : '',
+    telegram_bot_token: atk ? atk.value : '',
+    telegram_chat_id: ach ? ach.value : '',
+  }}); toast('告警设置已保存'); } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 世界管理 ---------------- */
+async function renderTabWorlds(id, el, t) {
+  el.innerHTML = '<div class="row between"><h2>世界管理</h2><button class="btn" onclick="createWorld(\'' + id + '\')">新建世界</button></div><p class="muted small">列出实例目录中所有包含 level.dat 的存档。切换/创建/删除需要服务器停止。</p><div id="worlds-body"><div class="empty">加载中…</div></div>';
+  await loadWorlds(id, t);
+}
+async function loadWorlds(id, t) {
+  try {
+    const d = await api('/instances/' + id + '/worlds');
+    if (t !== routeToken) return;
+    var el = document.getElementById('worlds-body');
+    var ws = d.worlds || [];
+    el.innerHTML = ws.length ? '<table class="table"><thead><tr><th>世界</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+      ws.map(function(w) { return '<tr><td><b>' + esc(w.name) + '</b></td><td>' + fmtSize(w.size) + '</td><td>' +
+        (w.current ? '<span class="pill st-running">当前</span>' : '<span class="muted">-</span>') + '</td><td>' +
+        (w.current ? '<span class="muted small">使用中</span>' :
+          '<button class="btn small" onclick="switchWorld(\'' + id + '\',\'' + esc(w.name) + '\')">切换</button>' +
+          '<button class="btn small danger" onclick="deleteWorld(\'' + id + '\',\'' + esc(w.name) + '\')">删除</button>') + '</td></tr>'; }).join('') +
+      '</tbody></table>' : '<div class="empty">暂无世界存档</div>';
+  } catch (e) { var el2 = document.getElementById('worlds-body'); if (el2) el2.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+async function switchWorld(id, name) {
+  try { await api('/instances/' + id + '/worlds/switch', { method: 'POST', body: { path: name } }); toast('已切换到 ' + name); route(); } catch (e) { toast(e.message, false); }
+}
+async function deleteWorld(id, name) {
+  if (!confirm('确定删除世界「' + name + '」？不可恢复！')) return;
+  try { await api('/instances/' + id + '/worlds/delete', { method: 'POST', body: { path: name } }); toast('已删除'); route(); } catch (e) { toast(e.message, false); }
+}
+async function createWorld(id) {
+  var name = prompt('新世界名称（不含空格）:');
+  if (!name) return;
+  var seed = prompt('世界种子（留空随机）:');
+  try { await api('/instances/' + id + '/worlds/create', { method: 'POST', body: { name: name, seed: seed || undefined } }); toast('世界 ' + name + ' 已创建'); route(); } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 计划任务 ---------------- */
+async function renderTabTasks(id, el, t) {
+  el.innerHTML = '<div class="row between"><h2>计划任务</h2><button class="btn" onclick="createTask(\'' + id + '\')">＋ 新建任务</button></div><p class="muted small">定时执行命令 / 备份 / 重启。到期自动执行并记录结果；连续失败 3 次推送告警。</p><div id="tasks-body"><div class="empty">加载中…</div></div>';
+  await loadTasks(id, t);
+}
+async function loadTasks(id, t) {
+  try {
+    var d = await api('/instances/' + id + '/tasks');
+    if (t !== routeToken) return;
+    var tasks = d.tasks || [];
+    var el = document.getElementById('tasks-body');
+    el.innerHTML = tasks.length ? '<table class="table"><thead><tr><th>任务</th><th>类型</th><th>间隔</th><th>状态</th><th>上次结果</th><th>操作</th></tr></thead><tbody>' +
+      tasks.map(function(x) { return '<tr><td><b>' + esc(x.name) + '</b>' + (x.value ? '<div class="muted small mono">' + esc(x.value) + '</div>' : '') + '</td><td>' +
+        (x.kind === 'command' ? '命令' : x.kind === 'backup' ? '备份' : '重启') + '</td><td>' + x.interval_mins + ' 分钟</td><td>' +
+        (x.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">停用</span>') + '</td><td class="muted small">' + esc(x.last_result || '-') + '</td><td>' +
+        '<button class="btn small" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'run\')">立即运行</button>' +
+        '<button class="btn small ' + (x.enabled ? 'warn' : 'primary') + '" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'' + (x.enabled ? 'disable' : 'enable') + '\')">' + (x.enabled ? '停用' : '启用') + '</button>' +
+        '<button class="btn small danger" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'delete\')">删除</button></td></tr>'; }).join('') + '</tbody></table>'
+      : '<div class="empty">暂无计划任务</div>';
+  } catch (e) { var el2 = document.getElementById('tasks-body'); if (el2) el2.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+async function createTask(id) {
+  showModal('<h2>新建计划任务</h2><label>任务名称<input id="tk-name"></label><label>类型<select id="tk-kind"><option value="command">执行命令</option><option value="backup">备份</option><option value="restart">重启</option></select></label><label>命令内容<input id="tk-value" placeholder="仅命令类型需要"></label><label>间隔（分钟）<input id="tk-interval" type="number" value="60" min="1"></label><div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" onclick="doCreateTask(\'' + id + '\')">创建</button></div>');
+}
+async function doCreateTask(id) {
+  var name = $('#tk-name') ? $('#tk-name').value.trim() : '';
+  var kind = $('#tk-kind') ? $('#tk-kind').value : 'command';
+  var value = $('#tk-value') ? $('#tk-value').value.trim() : '';
+  var interval = +($('#tk-interval') ? $('#tk-interval').value : 0) || 0;
+  if (!name) return toast('请输入名称', false);
+  try { await api('/instances/' + id + '/tasks', { method: 'POST', body: { name: name, kind: kind, value: value, interval_mins: interval } }); closeModal(); toast('已创建'); route(); } catch (e) { toast(e.message, false); }
+}
+async function taskOp(id, taskId, op) {
+  if (op === 'delete' && !confirm('确定删除？')) return;
+  try { await api('/instances/' + id + '/tasks/update', { method: 'POST', body: { id: taskId, op: op } }); toast('已操作'); route(); } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 批量启停 / 克隆 / Aikar / 图标 / 文件下载 / 告警 / 导入导出 ---------------- */
+async function batchStart() {
+  var ids = [];
+  document.querySelectorAll('.dash-check:checked').forEach(function(c) { ids.push(c.getAttribute('data-id')); });
+  if (!ids.length) return toast('请先勾选实例', false);
+  for (var i = 0; i < ids.length; i++) { try { await api('/instances/' + ids[i] + '/start', { method: 'POST' }); } catch(e) {} }
+  toast('已启动 ' + ids.length + ' 个实例'); refresh();
+}
+async function batchStop() {
+  var ids = [];
+  document.querySelectorAll('.dash-check:checked').forEach(function(c) { ids.push(c.getAttribute('data-id')); });
+  if (!ids.length) return toast('请先勾选实例', false);
+  for (var i = 0; i < ids.length; i++) { try { await api('/instances/' + ids[i] + '/stop', { method: 'POST' }); } catch(e) {} }
+  toast('已停止 ' + ids.length + ' 个实例'); refresh();
+}
+async function cloneInstance(id, name) {
+  var nn = prompt('克隆实例名称:', name + ' 副本');
+  if (!nn) return;
+  try { var r = await api('/instances/' + id + '/clone', { method: 'POST', body: { name: nn } }); toast('克隆完成，端口 ' + r.port); refresh(); } catch (e) { toast(e.message, false); }
+}
+function fillAikar() {
+  var el = document.getElementById('f-jvm');
+  if (el) el.value = '-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCTargetRatio=4 -XX:G1OldCSetRegionThresholdPercent=5';
+}
+async function uploadIcon(id) {
+  var inp = document.getElementById('icon-file');
+  if (!inp || !inp.files[0]) return toast('请选择 PNG 文件', false);
+  var fd = new FormData(); fd.append('file', inp.files[0]);
+  try { await api('/instances/' + id + '/icon', { method: 'POST', body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
+}
+async function downloadFile(id, path) {
+  var a = document.createElement('a');
+  a.href = '/api/instances/' + id + '/files/download?path=' + encodeURIComponent(path) + (TOKEN ? '&token=' + encodeURIComponent(TOKEN) : '');
+  a.download = path.split('/').pop(); a.click();
+}
+async function downloadArchive(id, path) {
+  var name = (path.split('/').pop() || 'archive') + '.tar.gz';
+  try { await api('/instances/' + id + '/files/archive', { method: 'POST', body: { paths: [path], name: name } });
+    var a = document.createElement('a'); a.href = '/api/instances/' + id + '/files/archive-download?name=' + encodeURIComponent(name); a.download = name; a.click();
+  } catch (e) { toast(e.message, false); }
+}
+async function saveAlerts(id) {
+  try { await api('/settings', { method: 'PUT', body: {
+    alert_type: document.getElementById('al-type') ? document.getElementById('al-type').value : 'none',
+    alert_webhook_url: document.getElementById('al-url') ? document.getElementById('al-url').value : '',
+    telegram_bot_token: document.getElementById('al-tgt') ? document.getElementById('al-tgt').value : '',
+    telegram_chat_id: document.getElementById('al-tgc') ? document.getElementById('al-tgc').value : '',
+  }}); toast('告警设置已保存'); } catch (e) { toast(e.message, false); }
+}
+async function exportConfig() {
+  try {
+    var d = await api('/config/export');
+    var blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'mcsp-config.json'; a.click(); URL.revokeObjectURL(a.href);
+  } catch (e) { toast(e.message, false); }
+}
+async function importConfig() {
+  var inp = document.getElementById('cfg-file');
+  if (!inp || !inp.files[0]) return toast('请选择 JSON 文件', false);
+  try {
+    var text = await inp.files[0].text();
+    var data = JSON.parse(text);
+    var r = await api('/config/import', { method: 'POST', body: data });
+    toast(r.note || ('已导入 ' + r.instances + ' 个实例配置')); refresh();
+  } catch (e) { toast(e.message, false); }
+}
+async function reinstallServer(id) {
+  var t = document.getElementById('ri-type'); var g = document.getElementById('ri-game');
+  var l = document.getElementById('ri-lver'); var bk = document.getElementById('ri-backup');
+  if (!t || !g || !g.value.trim()) return toast('请填写 MC 版本', false);
+  if (!confirm('确定重装？世界和配置保留，服务端 jar 会被替换。')) return;
+  try { await api('/instances/' + id + '/reinstall', { method: 'POST', body: {
+    server_type: t.value, mc_version: g.value.trim(), loader_version: l ? l.value.trim() : undefined, backup_first: bk ? bk.checked : true
+  }}); toast('重装任务已启动'); } catch (e) { toast(e.message, false); }
+}
+async function loadConfigsList(id) {
+  try {
+    var d = await api('/instances/' + id + '/configs');
+    var el = document.getElementById('configs-list');
+    if (el) el.innerHTML = d.configs.length
+      ? d.configs.map(function(c) { return '<button class="btn small ghost" style="margin:2px" onclick="editFile(\'' + id + '\',\'' + esc(c) + '\')">' + esc(c) + '</button>'; }).join('')
+      : '<span class="muted small">暂无已知配置文件</span>';
+  } catch {}
+}

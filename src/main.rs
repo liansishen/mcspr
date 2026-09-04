@@ -1,3 +1,4 @@
+mod alerts;
 mod api;
 mod audit;
 mod config;
@@ -10,6 +11,10 @@ mod state;
 mod util;
 
 use anyhow::Context;
+
+fn humansize(bytes: u64) -> String {
+    if bytes >= 1073741824 { format!("{:.2} GB", bytes as f64 / 1073741824.0) } else { format!("{:.0} MB", bytes as f64 / 1048576.0) }
+}
 use std::time::Duration;
 
 #[tokio::main]
@@ -65,6 +70,22 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
+                // 磁盘告警检查
+                {
+                    let dd = {
+                        let c = st.config.read().await;
+                        c.data_dir.clone()
+                    };
+                    let warn = { st.config.read().await.thresholds.disk_warn_percent };
+                    if let (Ok(total), Ok(free)) = (fs4::total_space(&dd), fs4::available_space(&dd)) {
+                        if total > 0 {
+                            let used_pct = ((total - free) * 100 / total) as u32;
+                            if used_pct >= warn {
+                                alerts::send(&st, "disk", format!("磁盘已用 {used_pct}%（告警线 {warn}%），可用空间 {}", humansize(free))).await;
+                            }
+                        }
+                    }
+                }
                 let map = st.instances.read().await.clone();
                 for (id, rt) in map {
                     if *rt.status.lock().await == instance::Status::Stopped {
@@ -142,6 +163,28 @@ async fn main() -> anyhow::Result<()> {
                             m.pop_front();
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // 计划任务调度器（每 30 秒检查一次到期任务）
+    {
+        let st = app_state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let map = st.instances.read().await.clone();
+                for (id, rt) in map {
+                    if *rt.status.lock().await == instance::Status::Stopped
+                        && !std::path::Path::new(&rt.dir).join("tasks.json").exists()
+                    {
+                        continue;
+                    }
+                    let st2 = st.clone();
+                    tokio::spawn(async move {
+                        instance::tasks::run_due(&st2, &rt).await;
+                    });
                 }
             }
         });

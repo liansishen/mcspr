@@ -87,3 +87,25 @@ pub async fn write(dir: &Path, entries: &[PropEntry]) -> ApiResult<()> {
     tokio::fs::write(dir.join("server.properties"), out).await?;
     Ok(())
 }
+
+/// 批量设置指定键的值（不存在则追加）
+pub async fn set_values(dir: &Path, kv: &[(String, String)]) -> crate::error::ApiResult<()> {
+    let mut pf = read(dir);
+    for (k, v) in kv {
+        let mut found = false;
+        for e in pf.entries.iter_mut() {
+            if e.key.as_deref() == Some(k.as_str()) {
+                e.value = v.clone();
+                found = true;
+            }
+        }
+        if !found {
+            pf.entries.push(PropEntry {
+                comment: String::new(),
+                key: Some(k.clone()),
+                value: v.clone(),
+            });
+        }
+    }
+    write(dir, &pf.entries).await
+}

@@ -22,9 +22,14 @@ pub async fn create(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    let name = backup::create(&state, &rt)
-        .await
-        .map_err(ApiError::bad_request)?;
+    let iname = rt.meta.read().await.name.clone();
+    let name = match backup::create(&state, &rt).await {
+        Ok(n) => n,
+        Err(e) => {
+            crate::alerts::send(&state, &format!("backup-{id}"), format!("实例「{iname}」备份失败: {e}")).await;
+            return Err(ApiError::bad_request(e));
+        }
+    };
     Ok(Json(json!({ "ok": true, "name": name })))
 }
 

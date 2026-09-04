@@ -7,6 +7,7 @@ pub mod modpack;
 pub mod mods;
 pub mod process;
 pub mod properties;
+pub mod tasks;
 pub mod users;
 pub mod vanilla;
 

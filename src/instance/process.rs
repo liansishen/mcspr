@@ -34,8 +34,10 @@ async fn spawn_server(rt: &Arc<InstanceRuntime>) -> ApiResult<tokio::process::Ch
         cmd.arg(a);
     }
     if !jar.is_empty() {
-        cmd.arg("-jar").arg(&jar).arg("nogui");
+        cmd.arg("-jar").arg(&jar);
     }
+    // nogui 防止弹出 GUI 窗口（Velocity/BungeeCord 等代理端会忽略此参数）
+    cmd.arg("nogui");
     cmd.current_dir(&rt.dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -181,6 +183,11 @@ async fn on_exit(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "未知".into());
         push_log(&rt, format!("[面板] 进程已退出 (code: {code_str})")).await;
+        if code.map(|c| c != 0).unwrap_or(true) {
+            let name = rt.meta.read().await.name.clone();
+            let name = rt.meta.read().await.name.clone();
+            crate::alerts::send(&state, &format!("crash-{}", rt.meta.read().await.id), format!("实例「{name}」异常退出 (code: {code_str})")).await;
+        }
 
         // 重启风暴熔断：窗口内连崩达到阈值则停止自动重启
         let (window, max, delay) = {
@@ -303,6 +310,7 @@ pub async fn send_command(rt: &Arc<InstanceRuntime>, cmd: &str) -> ApiResult<()>
 pub async fn push_log(rt: &Arc<InstanceRuntime>, line: String) {
     let eula_hint = line.contains("you need to agree to the EULA");
     let java_hint = java_version_hint(&line);
+    let port_hint = port_bind_hint(&line);
     push_raw(rt, line).await;
     if eula_hint {
         push_raw(rt, "[面板] 检测到需要同意 EULA：请在实例页点击「同意 EULA」后重新启动".into()).await;
@@ -310,6 +318,25 @@ pub async fn push_log(rt: &Arc<InstanceRuntime>, line: String) {
     if let Some(hint) = java_hint {
         push_raw(rt, hint).await;
     }
+    if let Some(hint) = port_hint {
+        push_raw(rt, hint).await;
+    }
+}
+
+/// 检测端口绑定失败，给出中文提示
+fn port_bind_hint(line: &str) -> Option<String> {
+    if line.contains("FAILED TO BIND TO PORT") || line.contains("BindException") {
+        let port = regex::Regex::new(r#"(?:on \*:|port )"?(\d{4,5})"?)
+            .ok()?
+            .captures(line)?
+            .get(1)?
+            .as_str()
+            .to_string();
+        return Some(format!(
+            "[面板] 端口 {port} 已被占用！可能原因：① 另一个服务器实例正在使用同一端口；② 之前的服务器进程未完全退出。请修改 server.properties 中的 server-port，或关闭占用端口的进程。"
+        ));
+    }
+    None
 }
 
 /// 检测 Java 版本不匹配（如 UnsupportedClassVersionError），给出中文提示

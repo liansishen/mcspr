@@ -73,18 +73,31 @@ pub async fn game_versions(state: &AppState, loader: &str) -> Result<Vec<Value>,
             out.dedup();
         }
         "forge" => {
-            // promotions_slim：每个 MC 版本有 latest/recommended 构建
+            // 用完整 maven-metadata（覆盖所有旧版本），promotions 仅用于标记 recommended
+            let builds = forge_builds(state).await?;
             let v = get_json(
                 state,
                 "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
             )
-            .await?;
-            if let Some(promos) = v.get("promos").and_then(|x| x.as_object()) {
-                for k in promos.keys() {
-                    if let Some(mc) = k.strip_suffix("-latest").or_else(|| k.strip_suffix("-recommended")) {
-                        if !out.iter().any(|(v, _)| v.as_str() == mc) {
-                            out.push((mc.to_string(), true));
-                        }
+            .await
+            .unwrap_or(json!({}));
+            let recommended: std::collections::HashSet<String> = v
+                .get("promos")
+                .and_then(|x| x.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter(|(k, _)| k.as_str().ends_with("-recommended"))
+                        .filter_map(|(k, _)| k.strip_suffix("-recommended"))
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut seen = std::collections::HashSet::new();
+            for b in &builds {
+                if let Some(mc) = b.split('-').next() {
+                    if seen.insert(mc.to_string()) {
+                        let is_rec = recommended.contains(mc);
+                        out.push((mc.to_string(), is_rec));
                     }
                 }
             }

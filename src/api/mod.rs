@@ -1,4 +1,5 @@
 mod backup;
+mod extras;
 mod console;
 mod instances;
 mod resources;
@@ -108,6 +109,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/java", get(java_version))
         .route("/audit", get(audit_query))
+        .route("/instances/{id}/console/download", get(extras::console_download))
+        .route("/instances/{id}/clone", post(extras::clone_instance))
+        .route("/instances/{id}/reinstall", post(extras::reinstall))
+        .route("/instances/{id}/icon", get(extras::icon_get).post(extras::icon_upload))
+        .route("/instances/{id}/files/download", get(extras::files_download))
+        .route("/instances/{id}/files/archive", post(extras::files_archive))
+        .route("/instances/{id}/files/archive-download", get(extras::files_archive_download))
+        .route("/instances/{id}/files/extract", post(extras::files_extract))
+        .route("/instances/{id}/worlds", get(extras::worlds_list))
+        .route("/instances/{id}/worlds/switch", post(extras::worlds_switch))
+        .route("/instances/{id}/worlds/create", post(extras::worlds_create))
+        .route("/instances/{id}/worlds/delete", post(extras::worlds_delete))
+        .route("/instances/{id}/tasks", get(extras::tasks_list).post(extras::tasks_create))
+        .route("/instances/{id}/tasks/update", post(extras::tasks_update))
+        .route("/instances/{id}/configs", get(extras::configs_list))
+        .route("/config/export", get(config_export))
+        .route("/config/import", post(config_import))
         .route(
             "/instances/{id}/metrics",
             get(resources::metrics),
@@ -335,4 +353,64 @@ async fn audit_query(
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
     let q = q.get("q").map(|s| s.as_str()).unwrap_or("");
     Json(json!({ "entries": crate::audit::query(&state, limit, q).await }))
+}
+
+async fn config_export(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = state.config.read().await.clone();
+    let map = state.instances.read().await;
+    let mut metas = Vec::new();
+    for rt in map.values() {
+        metas.push(rt.meta.read().await.clone());
+    }
+    drop(map);
+    Json(json!({ "version": env!("CARGO_PKG_VERSION"), "settings": cfg, "instances": metas }))
+}
+
+#[derive(Deserialize)]
+struct ConfigImport {
+    settings: Option<crate::config::PanelConfig>,
+    #[serde(default)]
+    instances: Vec<crate::instance::InstanceMeta>,
+}
+
+async fn config_import(
+    State(state): State<AppState>,
+    Json(data): Json<ConfigImport>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(cfg) = &data.settings {
+        if cfg.listen.trim().is_empty() {
+            return Err(ApiError::bad_request("导入的 settings 缺少 listen"));
+        }
+    }
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut imported = 0u32;
+    for meta in &data.instances {
+        if meta.id.is_empty() {
+            continue;
+        }
+        let dir = state.config.read().await.instances_dir().join(&meta.id);
+        std::fs::create_dir_all(&dir).ok();
+        let json_path = dir.join("instance.json");
+        if json_path.exists() {
+            let _ = std::fs::rename(&json_path, dir.join(format!("instance.json.bak-{ts}")));
+        }
+        std::fs::write(&json_path, serde_json::to_string_pretty(meta)?).ok();
+        imported += 1;
+    }
+    let mut note = String::new();
+    if let Some(cfg) = data.settings {
+        let cfg_path = std::path::Path::new("config.toml");
+        if cfg_path.exists() {
+            let _ = std::fs::copy(cfg_path, std::path::Path::new(&format!("config.toml.bak-{ts}")));
+        }
+        crate::config::save(&cfg)?;
+        *state.config.write().await = cfg;
+        note.push_str("设置已写入（listen/data_dir 需重启面板生效）；");
+    }
+    {
+        let dir = state.config.read().await.instances_dir();
+        let instances = crate::instance::scan_instances(&dir);
+        *state.instances.write().await = instances;
+    }
+    Ok(Json(json!({ "ok": true, "instances": imported, "note": note })))
 }
