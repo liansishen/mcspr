@@ -22,6 +22,15 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load_or_create()?;
     let app_state = state::AppState::new(cfg.clone()).await?;
 
+    let addr = cfg.listen.clone();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("无法监听 {addr}（端口可能被占用）"))?;
+    tracing::info!("MCS Panel 启动成功: http://{}", listener.local_addr()?);
+    tracing::info!("实例数据目录: {}", cfg.instances_dir().display());
+
+    let app = api::router(app_state.clone());
+
     // 自动拉起开启了「面板启动时自动运行」的实例（间隔 5 秒逐个启动，避免端口冲突）
     {
         let instances = app_state.instances.read().await.clone();
@@ -47,14 +56,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let addr = cfg.listen.clone();
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("无法监听 {addr}（端口可能被占用）"))?;
-    tracing::info!("MCS Panel 启动成功: http://{}", listener.local_addr()?);
-    tracing::info!("实例数据目录: {}", cfg.instances_dir().display());
-
-    let app = api::router(app_state);
-    axum::serve(listener, app).await?;
+    // 面板退出时优雅停止所有运行中的实例（世界落盘），避免孤儿进程与文件锁
+    tracing::info!("按 Ctrl+C 停止面板时会自动保存并停止所有运行中的服务器");
+    let shutdown = instance::process::shutdown_all(&app_state);
+    tokio::select! {
+        r = axum::serve(listener, app) => {
+            r.context("HTTP 服务异常退出")?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("收到退出信号，正在停止所有运行中的实例…");
+            shutdown.await;
+            tracing::info!("全部实例已停止，面板退出");
+        }
+    }
     Ok(())
 }

@@ -245,12 +245,18 @@ function showCreateModal() {
           <option value="quilt">Quilt</option>
           <option value="forge">Forge</option>
           <option value="neoforge">NeoForge</option>
+          <option value="paper">Paper（插件服）</option>
+          <option value="purpur">Purpur（插件服）</option>
+          <option value="folia">Folia（插件服 · 多线程）</option>
+          <option value="velocity">Velocity（代理端）</option>
+          <option value="waterfall">Waterfall（代理端）</option>
+          <option value="bungeecord">BungeeCord（代理端）</option>
         </select>
-        <div class="muted small">Fabric / Quilt：下载官方一键启动器，首次启动自动补全依赖。Forge / NeoForge：运行官方安装器完整安装（需要几分钟，使用实例设置中的 Java）。安装完成后建议检查实例设置的 Java 是否满足该版本要求。</div>
+        <div class="muted small">Fabric / Quilt：官方一键启动器。Forge / NeoForge：运行官方安装器（需要几分钟）。Paper / Purpur / Folia：插件服，装 Bukkit 系插件到 plugins/。Velocity / BungeeCord：代理端，用于群组服。安装完成后建议检查实例设置的 Java 是否满足要求。</div>
       </label>
-      <div class="row">
+      <div class="row" id="ci-loader-game-row">
         <label style="flex:1">MC 版本<select id="ci-loader-game" onchange="loadLoaderVerList()"><option value="">加载中…</option></select></label>
-        <label style="flex:1">加载器版本<select id="ci-loader-ver"><option value="">加载中…</option></select></label>
+        <label style="flex:1">服务端版本<select id="ci-loader-ver"><option value="">加载中…</option></select></label>
       </div>
     </div>
     <div id="ci-progress" style="display:none">
@@ -275,9 +281,16 @@ async function loadLoaderVersions() {
   const loader = $('#ci-loader')?.value;
   const gameSel = $('#ci-loader-game');
   if (!loader || !gameSel) return;
-  gameSel.innerHTML = '<option value="">加载中…</option>';
+  const gameRow = $('#ci-loader-game-row');
+  const isProxy = loader === 'velocity' || loader === 'bungeecord';
+  if (gameRow) gameRow.style.display = isProxy ? 'none' : '';
   const verSel = $('#ci-loader-ver');
-  if (verSel) verSel.innerHTML = '<option value="">—</option>';
+  if (verSel) verSel.innerHTML = '<option value="">加载中…</option>';
+  if (isProxy) {
+    await loadLoaderVerList();
+    return;
+  }
+  gameSel.innerHTML = '<option value="">加载中…</option>';
   try {
     const g = await api(`/loaders/${loader}/game-versions`);
     gameSel.innerHTML = g.versions.map(v => `<option value="${esc(v.id)}">${esc(v.id)}${v.stable ? '' : '（快照）'}</option>`).join('');
@@ -495,7 +508,7 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const INST_TABS = [['console', '控制台'], ['mods', '模组'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const INST_TABS = [['console', '控制台'], ['mods', '模组'], ['backups', '备份'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
 
 async function renderInstance(id, tab) {
   const t = ++routeToken;
@@ -515,6 +528,7 @@ async function renderInstance(id, tab) {
   const body = $('#tab-body');
   if (tab === 'console') renderTabConsole(id, body, t);
   else if (tab === 'mods') renderTabMods(id, body, t);
+  else if (tab === 'backups') renderTabBackups(id, body, t);
   else if (tab === 'files') renderTabFiles(id, body, t);
   else if (tab === 'props') renderTabProps(id, body, t);
   else renderTabSettings(id, body);
@@ -707,9 +721,11 @@ async function userAction(id, action, target, reason) {
 
 /* ---------------- 模组 ---------------- */
 async function renderTabMods(id, el, t) {
+  const isPlugin = ['paper', 'purpur', 'folia', 'velocity', 'waterfall', 'bungeecord'].includes(currentInstanceInfo?.mod_loader);
+  const noun = isPlugin ? '插件' : '模组';
   el.innerHTML = `
-    <div class="row between"><h2>模组</h2>
-      <div class="row"><button class="btn primary" onclick="showModDownload('${id}')">⬇ 下载模组</button><button class="btn" onclick="uploadMod('${id}')">上传模组</button></div></div>
+    <div class="row between"><h2>${noun}</h2>
+      <div class="row"><button class="btn primary" onclick="showModDownload('${id}')">⬇ 下载${noun}</button><button class="btn" onclick="uploadMod('${id}')">上传${noun}</button></div></div>
     <div id="mods-body"><div class="empty">加载中…</div></div>`;
   const load = async () => {
     try {
@@ -1046,6 +1062,88 @@ async function downloadQueue() {
     }
   } catch {}
 }
+/* ---------------- 备份 ---------------- */
+async function renderTabBackups(id, el, t) {
+  el.innerHTML = `
+    <div class="row between"><h2>备份</h2>
+      <button class="btn primary" id="bk-go" onclick="createBackup('${id}')">⬆ 立即备份</button></div>
+    <p class="muted small">全量 tar.gz 备份（运行中会先自动 save-all 落盘）；保留策略：最多 10 份 / 30 天，超出自动清理。恢复前请先停止实例，恢复会覆盖实例目录中的现有文件。</p>
+    <div id="bk-body"><div class="empty">加载中…</div></div>`;
+  await loadBackups(id, t);
+}
+async function loadBackups(id, t) {
+  if (t !== undefined && t !== routeToken) return;
+  try {
+    const d = await api(`/instances/${id}/backups`);
+    if (t !== undefined && t !== routeToken) return;
+    $('#bk-body').innerHTML = d.backups.length ? `<table class="table">
+      <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody>${d.backups.map(b => `<tr>
+        <td class="mono">${esc(b.name)}</td>
+        <td class="muted">${fmtSize(b.size)}</td>
+        <td class="muted">${esc(b.created)}</td>
+        <td>
+          <button class="btn small" onclick="downloadBackup('${id}','${esc(b.name)}')">下载</button>
+          <button class="btn small warn" onclick="restoreBackup('${id}','${esc(b.name)}')">恢复</button>
+          <button class="btn small danger" onclick="deleteBackup('${id}','${esc(b.name)}')">删除</button>
+        </td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">暂无备份，点右上角「立即备份」创建</div>';
+  } catch (e) {
+    $('#bk-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+async function createBackup(id) {
+  const btn = $('#bk-go');
+  if (btn) { btn.disabled = true; btn.textContent = '备份中…'; }
+  try {
+    const r = await api(`/instances/${id}/backups`, { method: 'POST' });
+    toast(`备份完成：${r.name}`);
+    await loadBackups(id);
+  } catch (e) { toast(e.message, false); }
+  if (btn) { btn.disabled = false; btn.textContent = '⬆ 立即备份'; }
+}
+async function downloadBackup(id, name) {
+  try {
+    const r = await fetch(`/api/instances/${id}/backups/${encodeURIComponent(name)}/download`, { headers: headers() });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast(e.message, false); }
+}
+async function restoreBackup(id, name) {
+  try {
+    const p = await api(`/instances/${id}/backups/${encodeURIComponent(name)}/preview`);
+    const pv = p.preview;
+    const html = `
+      <p class="small">备份共 <b>${pv.files}</b> 个文件（${fmtSize(pv.total_size)}），包含：<b>${esc(pv.top_entries.join('、'))}</b></p>
+      ${pv.overwrite.length ? `<p class="small" style="color:var(--warn)">将覆盖 ${pv.overwrite.length}+ 个现有文件，包括：${esc(pv.overwrite.slice(0, 8).join('、'))}${pv.overwrite.length > 8 ? ' 等' : ''}</p>` : '<p class="small muted">不会覆盖任何现有文件（实例目录为空或无重合）。</p>'}
+      <p class="muted small">恢复要求实例处于停止状态；恢复是覆盖式且不可撤销，请确认。</p>`;
+    showModal(`<h2>恢复备份</h2><div style="margin:10px 0">${html}</div>
+      <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button>
+      <button class="btn warn" onclick="doRestore('${id}','${esc(name)}')">确认恢复</button></div>`);
+  } catch (e) { toast(e.message, false); }
+}
+async function doRestore(id, name) {
+  try {
+    await api(`/instances/${id}/backups/${encodeURIComponent(name)}/restore`, { method: 'POST' });
+    closeModal();
+    toast('恢复完成');
+    refresh();
+  } catch (e) { toast(e.message, false); }
+}
+async function deleteBackup(id, name) {
+  if (!confirm(`确定删除备份 ${name}？`)) return;
+  try {
+    await api(`/instances/${id}/backups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast('已删除');
+    loadBackups(id);
+  } catch (e) { toast(e.message, false); }
+}
+
 async function doUploadMod(id) {
   const files = $('#mod-file').files;
   if (!files.length) return toast('请选择文件', false);
@@ -1353,7 +1451,16 @@ async function renderTabSettings(id, el) {
         <select id="java-picker" style="margin-top:6px" onchange="if(this.value){document.getElementById('f-java').value=this.value;detectJava();}">
           <option value="">加载缓存…</option>
         </select>
-        <div class="muted small">Java 17+ 运行 1.18~1.20.4，Java 21+ 运行 1.20.5+，更新版本需要更高 Java；扫描会遍历 Program Files、Prism Launcher、.jdks 等位置并持久化结果。从列表选择后记得点「保存设置」。</div>
+        <div class="row" style="margin-top:6px">
+          <span class="muted small">一键安装 Java：</span>
+          <button class="btn small" onclick="installJava(25)">Temurin 25</button>
+          <button class="btn small" onclick="installJava(21)">21</button>
+          <button class="btn small" onclick="installJava(17)">17</button>
+          <button class="btn small" onclick="installJava(8)">8</button>
+          <button class="btn ghost small" onclick="autoMatchJava()">按 MC 版本自动选择</button>
+        </div>
+        <pre id="ji-log" class="job-log" style="display:none;max-height:140px"></pre>
+        <div class="muted small">Java 26.x 服务端需要 Java 25+，1.20.5+ 需要 21，1.17+ 需要 17；安装的 JRE 也可从上方扫描列表中选择。选好后记得点「保存设置」。</div>
         <div id="java-hint" class="muted small mono"></div>
       </label>
       <label>最小内存 (MB)<input id="f-min" type="number" min="512" step="512" value="${s.min_ram_mb}">
@@ -1396,6 +1503,45 @@ async function rescanJavas() {
     toast(`扫描完成，共发现 ${d.javas.length} 个 Java`);
   } catch (e) {
     sel.innerHTML = `<option value="">扫描失败：${esc(e.message)}</option>`;
+  }
+}
+function neededJavaMajor(v) {
+  if (!v) return null;
+  const p = String(v).split(/[.\-]/).map(Number);
+  if (!p.length || isNaN(p[0])) return null;
+  if (p[0] !== 1) return 25; // 年份制（26.x+）需要 Java 25
+  const mi = p[1] || 0, pa = p[2] || 0;
+  if (mi >= 21 || (mi === 20 && pa >= 5)) return 21;
+  if (mi >= 17) return 17;
+  return 8;
+}
+async function autoMatchJava() {
+  const mc = currentInstanceInfo?.mc_version;
+  const major = neededJavaMajor(mc);
+  if (!major) return toast('未记录 MC 版本，无法自动匹配（可在创建实例时选择版本）', false);
+  const d = await api('/javas');
+  const match = (d.javas || []).filter(j => j.major === major).sort((a, b) => b.major - a.major)[0];
+  if (!match) return toast(`本机没有 Java ${major}（${mc} 需要），可用上方按钮一键安装`, false);
+  $('#f-java').value = match.path;
+  detectJava();
+  toast(`已选择 ${match.path}`);
+}
+async function installJava(major) {
+  const log = $('#ji-log');
+  if (log) { log.style.display = ''; log.textContent = `安装 Temurin JRE ${major}…`; }
+  try {
+    const r = await api(`/java-install/${major}`, { method: 'POST' });
+    await pollJob(r.job_id, j => {
+      if (log) {
+        log.textContent = j.logs.join('\n');
+        log.scrollTop = 1e6;
+      }
+    });
+    toast(`Java ${major} 安装完成`);
+    await loadCachedJavas();
+  } catch (e) {
+    toast(`安装失败: ${e.message}`, false);
+    if (log) log.textContent += `\n[错误] ${e.message}`;
   }
 }
 async function detectJar(id) {

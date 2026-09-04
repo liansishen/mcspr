@@ -18,12 +18,27 @@ pub struct ModInfo {
     pub enabled: bool,
 }
 
-pub fn mods_dir(rt: &InstanceRuntime) -> PathBuf {
-    rt.dir.join("mods")
+pub const PLUGIN_LOADERS: &[&str] = &[
+    "paper",
+    "purpur",
+    "folia",
+    "velocity",
+    "waterfall",
+    "bungeecord",
+];
+
+pub fn is_plugin_loader(loader: &str) -> bool {
+    PLUGIN_LOADERS.contains(&loader)
+}
+
+/// 实例的插件/模组目录：插件服为 plugins/，其余为 mods/
+pub async fn mods_dir(rt: &InstanceRuntime) -> PathBuf {
+    let loader = rt.meta.read().await.mod_loader.clone().unwrap_or_default();
+    rt.dir.join(if is_plugin_loader(&loader) { "plugins" } else { "mods" })
 }
 
 pub async fn list(rt: &Arc<InstanceRuntime>) -> ApiResult<Vec<ModInfo>> {
-    let dir = mods_dir(rt);
+    let dir = mods_dir(rt).await;
     if !dir.is_dir() {
         return Ok(vec![]);
     }
@@ -64,7 +79,7 @@ fn clean_file_name(name: &str) -> ApiResult<String> {
 
 pub async fn toggle(rt: &Arc<InstanceRuntime>, file: &str) -> ApiResult<String> {
     let name = clean_file_name(file)?;
-    let dir = mods_dir(rt);
+    let dir = mods_dir(rt).await;
     let (from, to) = if name.ends_with(".disabled") {
         (name.clone(), name.trim_end_matches(".disabled").to_string())
     } else {
@@ -76,7 +91,7 @@ pub async fn toggle(rt: &Arc<InstanceRuntime>, file: &str) -> ApiResult<String> 
 
 pub async fn delete(rt: &Arc<InstanceRuntime>, file: &str) -> ApiResult<()> {
     let name = clean_file_name(file)?;
-    tokio::fs::remove_file(mods_dir(rt).join(name)).await?;
+    tokio::fs::remove_file(mods_dir(rt).await.join(name)).await?;
     Ok(())
 }
 

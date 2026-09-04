@@ -51,6 +51,27 @@ pub async fn game_versions(state: &AppState, loader: &str) -> Result<Vec<Value>,
                 }
             }
         }
+        "paper" | "folia" | "waterfall" | "velocity" => {
+            // PaperMC Fill API v3：versions 为分组对象，拍平后按版本倒序
+            let v = get_json(
+                state,
+                &format!("https://fill.papermc.io/v3/projects/{loader}"),
+            )
+            .await?;
+            if let Some(groups) = v.get("versions").and_then(|x| x.as_object()) {
+                for (_group, arr) in groups {
+                    if let Some(list) = arr.as_array() {
+                        for e in list {
+                            if let Some(ver) = e.as_str() {
+                                out.push((ver.to_string(), true));
+                            }
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
+            out.dedup();
+        }
         "forge" => {
             // promotions_slim：每个 MC 版本有 latest/recommended 构建
             let v = get_json(
@@ -143,6 +164,47 @@ pub async fn loader_versions(
                 }
             }
             out.truncate(30);
+        }
+        "paper" | "folia" | "waterfall" => {
+            let v = get_json(
+                state,
+                &format!("https://fill.papermc.io/v3/projects/{loader}/versions/{game}/builds"),
+            )
+            .await?;
+            if let Some(arr) = v.as_array() {
+                for b in arr {
+                    if let Some(n) = b.get("id").and_then(|x| x.as_i64()) {
+                        out.push(n.to_string());
+                    }
+                }
+            }
+            // v3 返回新→旧，保持
+        }
+        "velocity" => {
+            let v = get_json(state, "https://fill.papermc.io/v3/projects/velocity").await?;
+            if let Some(groups) = v.get("versions").and_then(|x| x.as_object()) {
+                for (_g, arr) in groups {
+                    if let Some(list) = arr.as_array() {
+                        for e in list {
+                            if let Some(ver) = e.as_str() {
+                                out.push(ver.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| version_key(b.as_str()).cmp(&version_key(a.as_str())));
+            out.dedup();
+        }
+        "bungeecord" => {
+            let v = get_json(
+                state,
+                "https://hub.spigotmc.org/jenkins/job/BungeeCord/lastSuccessfulBuild/api/json",
+            )
+            .await?;
+            if let Some(n) = v.get("number").and_then(|x| x.as_i64()) {
+                out.push(n.to_string());
+            }
         }
         "forge" => {
             // 完整构建列表来自 maven-metadata（缓存 10 分钟）
@@ -260,6 +322,12 @@ async fn install_inner(
         "quilt" => "Quilt",
         "forge" => "Forge",
         "neoforge" => "NeoForge",
+        "paper" => "Paper",
+        "purpur" => "Purpur",
+        "folia" => "Folia",
+        "velocity" => "Velocity",
+        "waterfall" => "Waterfall",
+        "bungeecord" => "BungeeCord",
         other => return Err(format!("未知加载器: {other}")),
     };
     log_job(
@@ -296,6 +364,88 @@ async fn install_inner(
                 job_id,
                 format!("✅ {name} 服务端安装完成！已配置主程序 {jar_name}。首次启动会自动下载 Minecraft 与依赖库（需要几分钟），请耐心等待。"),
             );
+        }
+        "paper" | "folia" | "waterfall" | "velocity" => {
+            // loader_ver：Paper 系为构建号；Velocity 为自身版本号
+            let (url, jar_name) = if loader == "velocity" {
+                let vdetail = get_json(
+                    state,
+                    &format!("https://fill.papermc.io/v3/projects/velocity/versions/{loader_ver}/builds"),
+                )
+                .await?;
+                let builds = vdetail.as_array().ok_or("未获取到 Velocity 构建列表")?;
+                let dl = builds
+                    .iter()
+                    .find_map(|b| {
+                        b.get("downloads")
+                            .and_then(|d| d.get("server:default").or_else(|| {
+                                d.as_object().and_then(|o| o.values().next())
+                            }))
+                            .and_then(|d| d.get("url").and_then(|x| x.as_str()))
+                            .map(|s| s.to_string())
+                    })
+                    .ok_or("未获取到 Velocity 下载地址")?;
+                (dl, "velocity.jar".to_string())
+            } else {
+                let builds = get_json(
+                    state,
+                    &format!("https://fill.papermc.io/v3/projects/{loader}/versions/{game}/builds"),
+                )
+                .await?;
+                let arr = builds.as_array().ok_or("未获取到构建列表")?;
+                let dl = arr
+                    .iter()
+                    .find(|b| {
+                        b.get("id").and_then(|x| x.as_i64()).map(|x| x.to_string()) == Some(loader_ver.to_string())
+                    })
+                    .and_then(|b| {
+                        b.get("downloads")
+                            .and_then(|d| d.get("server:default").or_else(|| {
+                                d.as_object().and_then(|o| o.values().next())
+                            }))
+                            .and_then(|d| d.get("url").and_then(|x| x.as_str()))
+                            .map(|s| s.to_string())
+                    })
+                    .ok_or(format!("未找到构建 {loader_ver} 的下载地址"))?;
+                (dl, format!("{loader}.jar"))
+            };
+            log_job(state, job_id, "下载官方服务端 jar…");
+            let dest = rt.dir.join(&jar_name);
+            download_simple(state, &url, &dest).await?;
+            {
+                let mut meta = rt.meta.write().await;
+                meta.jar = Some(jar_name.clone());
+            }
+            rt.persist().await.map_err(|e| e.to_string())?;
+            log_job(
+                state,
+                job_id,
+                format!("✅ {name} 服务端安装完成！已配置主程序 {jar_name}。Paper 系首次启动会自动下载 Vanilla 服务端与依赖（需要几分钟）。"),
+            );
+        }
+        "purpur" => {
+            let url = format!("https://api.purpurmc.org/v2/purpur/{game}/{loader_ver}/download");
+            log_job(state, job_id, "下载官方服务端 jar…");
+            let dest = rt.dir.join("purpur.jar");
+            download_simple(state, &url, &dest).await?;
+            {
+                let mut meta = rt.meta.write().await;
+                meta.jar = Some("purpur.jar".into());
+            }
+            rt.persist().await.map_err(|e| e.to_string())?;
+            log_job(state, job_id, "✅ Purpur 服务端安装完成！已配置主程序 purpur.jar。");
+        }
+        "bungeecord" => {
+            let url = "https://hub.spigotmc.org/jenkins/job/BungeeCord/lastSuccessfulBuild/artifact/bootstrap/target/BungeeCord.jar";
+            log_job(state, job_id, "下载 BungeeCord…");
+            let dest = rt.dir.join("BungeeCord.jar");
+            download_simple(state, &url, &dest).await?;
+            {
+                let mut meta = rt.meta.write().await;
+                meta.jar = Some("BungeeCord.jar".into());
+            }
+            rt.persist().await.map_err(|e| e.to_string())?;
+            log_job(state, job_id, "✅ BungeeCord 安装完成！已配置主程序 BungeeCord.jar。");
         }
         "forge" | "neoforge" => {
             let installer_urls: Vec<String> = if loader == "forge" {

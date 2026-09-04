@@ -1,12 +1,13 @@
+mod backup;
 mod console;
 mod instances;
 mod resources;
 
 use crate::config;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -87,6 +88,24 @@ pub fn router(state: AppState) -> Router {
         .route("/settings", get(get_settings).put(put_settings))
         .route("/javas", get(javas))
         .route("/javas/scan", post(javas_scan))
+        .route("/java-install/list", get(java_install_list))
+        .route("/java-install/{major}", post(java_install))
+        .route(
+            "/instances/{id}/backups",
+            get(backup::list).post(backup::create),
+        )
+        .route(
+            "/instances/{id}/backups/{name}",
+            get(backup::download).delete(backup::delete),
+        )
+        .route(
+            "/instances/{id}/backups/{name}/preview",
+            get(backup::preview),
+        )
+        .route(
+            "/instances/{id}/backups/{name}/restore",
+            post(backup::restore),
+        )
         .route("/java", get(java_version))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
@@ -171,6 +190,30 @@ async fn put_settings(
         "ok": true,
         "note": "listen / data_dir 需重启面板后生效；token 立即生效"
     })))
+}
+
+/// 一键安装的 Java 运行时列表
+async fn java_install_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({ "installed": crate::instance::javainstall::load_registry(&state).await }))
+}
+
+/// 一键安装指定大版本的 Temurin JRE（后台任务）
+async fn java_install(State(state): State<AppState>, Path(major): Path<u32>) -> ApiResult<Json<serde_json::Value>> {
+    if !crate::instance::javainstall::MAJORS.contains(&major) {
+        return Err(ApiError::bad_request(format!("仅支持安装以下大版本: {:?}", crate::instance::javainstall::MAJORS)));
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), crate::jobs::Job::new(job_id.clone()));
+    let st2 = state.clone();
+    let jid = job_id.clone();
+    tokio::spawn(async move {
+        crate::instance::javainstall::install(&st2, &jid, major).await;
+    });
+    Ok(Json(json!({ "job_id": job_id })))
 }
 
 /// 扫描本机所有 Java 安装（含启动器自带 JRE），按版本倒序

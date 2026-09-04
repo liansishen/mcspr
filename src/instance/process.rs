@@ -91,6 +91,10 @@ async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()>
     *rt.started_at.lock().await = Some(chrono::Utc::now());
     rt.pid.store(pid, Ordering::SeqCst);
 
+    // 自动重启：全新启动时清空崩溃计数与风暴标记
+    rt.crash_times.lock().await.clear();
+    rt.restart_storm.store(false, Ordering::SeqCst);
+
     if let Some(stdout) = child.stdout.take() {
         let rt1 = rt.clone();
         tokio::spawn(async move {
@@ -168,12 +172,44 @@ async fn on_exit(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "未知".into());
         push_log(&rt, format!("[面板] 进程已退出 (code: {code_str})")).await;
-        if was_ready && auto {
-            push_log(&rt, "[面板] 5 秒后自动重启…".into()).await;
+
+        // 重启风暴熔断：窗口内连崩达到阈值则停止自动重启
+        let (window, max, delay) = {
+            let c = state.config.read().await;
+            (
+                c.thresholds.crash_window_secs,
+                c.thresholds.crash_max,
+                c.thresholds.restart_delay_secs,
+            )
+        };
+        let storm = {
+            let mut times = rt.crash_times.lock().await;
+            let now = std::time::Instant::now();
+            times.push_back(now);
+            while let Some(t) = times.front() {
+                if now.duration_since(*t).as_secs() > window {
+                    times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            times.len() >= max as usize
+        };
+        if storm {
+            rt.restart_storm.store(true, Ordering::SeqCst);
+            push_log(
+                &rt,
+                format!(
+                    "[面板] 检测到重启风暴：{window} 秒内已连续崩溃 {max} 次，已停止自动重启。请排查崩溃原因后在实例页手动启动。"
+                ),
+            )
+            .await;
+        } else if was_ready && auto {
+            push_log(&rt, format!("[面板] {delay} 秒后自动重启…").into()).await;
             let st2 = state.clone();
             let rt2 = rt.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(delay)).await;
                 let cur = *rt2.status.lock().await;
                 if cur == Status::Stopped {
                     let _ = start(st2, rt2).await;
@@ -338,4 +374,44 @@ fn parse_leave(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 面板退出时：并行向所有运行中的实例发送 stop，最长等待 15 秒后强杀
+pub async fn shutdown_all(state: &AppState) {
+    let map = state.instances.read().await.clone();
+    let mut tasks: Vec<(String, Arc<InstanceRuntime>)> = Vec::new();
+    for (id, rt) in map {
+        if *rt.status.lock().await == Status::Stopped {
+            continue;
+        }
+        tracing::info!("停止实例「{}」…", rt.meta.read().await.name);
+        rt.stopping.store(true, Ordering::SeqCst);
+        *rt.status.lock().await = Status::Stopping;
+        let _ = send_command(&rt, "stop").await;
+        tasks.push((id, rt));
+    }
+    if tasks.is_empty() {
+        return;
+    }
+    // 等待全部退出，最多 15 秒
+    for _ in 0..60 {
+        let mut all_stopped = true;
+        for (_, rt) in &tasks {
+            if *rt.status.lock().await != Status::Stopped {
+                all_stopped = false;
+                break;
+            }
+        }
+        if all_stopped {
+            tracing::info!("所有实例已停止并保存");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for (id, rt) in &tasks {
+        if *rt.status.lock().await != Status::Stopped {
+            tracing::warn!("实例 {id} 未能优雅退出，强制结束");
+            force_kill(rt.pid.load(Ordering::SeqCst));
+        }
+    }
 }

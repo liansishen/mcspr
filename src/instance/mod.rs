@@ -1,4 +1,6 @@
+pub mod backup;
 pub mod files;
+pub mod javainstall;
 pub mod loaders;
 pub mod moddb;
 pub mod modpack;
@@ -11,6 +13,7 @@ pub mod vanilla;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -91,6 +94,18 @@ pub struct InstanceRuntime {
     pub stopping: Arc<AtomicBool>,
     pub ready: AtomicBool,
     pub players: Mutex<Vec<String>>,
+    /// 崩溃时间戳（用于重启风暴熔断）
+    pub crash_times: Mutex<VecDeque<std::time::Instant>>,
+    /// 触发重启风暴后置位（不再自动重启，需手动启动）
+    pub restart_storm: AtomicBool,
+    /// 玩家在线时长（秒, 会话数）
+    pub playtime: Mutex<std::collections::BTreeMap<String, (u64, u32)>>,
+    /// 进行中的玩家会话（join 时间）
+    pub open_sessions: Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    /// CPU/内存历史采样 (时间戳, cpu%, mem_mb)
+    pub metrics: Mutex<VecDeque<(i64, f32, f64)>>,
+    /// TPS/MSPT 采样结果
+    pub tps: Mutex<Option<Value>>,
     pub log_buf: Mutex<VecDeque<LogLine>>,
     pub log_tx: broadcast::Sender<LogLine>,
     pub next_seq: AtomicU64,
@@ -112,9 +127,10 @@ pub struct InstanceSummary {
     pub max_ram_mb: u32,
     pub jvm_args: String,
     pub auto_restart: bool,
+    pub auto_start_on_boot: bool,
+    pub restart_storm: bool,
     pub mc_version: Option<String>,
     pub mod_loader: Option<String>,
-    pub auto_start_on_boot: bool,
     pub eula_accepted: bool,
 }
 
@@ -142,6 +158,12 @@ impl InstanceRuntime {
             stopping: Arc::new(AtomicBool::new(false)),
             ready: AtomicBool::new(false),
             players: Mutex::new(Vec::new()),
+            crash_times: Mutex::new(VecDeque::new()),
+            restart_storm: AtomicBool::new(false),
+            playtime: Mutex::new(std::collections::BTreeMap::new()),
+            open_sessions: Mutex::new(std::collections::HashMap::new()),
+            metrics: Mutex::new(VecDeque::new()),
+            tps: Mutex::new(None),
             log_buf: Mutex::new(buf),
             log_tx: tx,
             next_seq: AtomicU64::new(next_seq),
@@ -181,9 +203,10 @@ impl InstanceRuntime {
             max_ram_mb: meta.max_ram_mb,
             jvm_args: meta.jvm_args,
             auto_restart: meta.auto_restart,
+            auto_start_on_boot: meta.auto_start_on_boot,
+            restart_storm: self.restart_storm.load(Ordering::SeqCst),
             mc_version: meta.mc_version,
             mod_loader: meta.mod_loader,
-            auto_start_on_boot: meta.auto_start_on_boot,
             eula_accepted: eula_accepted(&self.dir),
         }
     }

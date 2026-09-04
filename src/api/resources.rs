@@ -56,7 +56,7 @@ pub async fn mods_upload(
     mut multipart: Multipart,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    let dir = mods::mods_dir(&rt);
+    let dir = mods::mods_dir(&rt).await;
     tokio::fs::create_dir_all(&dir).await?;
     let mut saved = Vec::new();
     while let Some(mut field) = multipart.next_field().await? {
@@ -404,7 +404,7 @@ pub async fn mods_download(
     {
         return Err(ApiError::bad_request("文件名不合法（需为 .jar）"));
     }
-    let dir = mods::mods_dir(&rt);
+    let dir = mods::mods_dir(&rt).await;
     tokio::fs::create_dir_all(&dir).await?;
     let size = crate::instance::moddb::download_mod(&state, &dir, &req.url, &filename)
         .await
@@ -437,7 +437,7 @@ pub async fn mods_hashes(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    let dir = mods::mods_dir(&rt);
+    let dir = mods::mods_dir(&rt).await;
     let mut out = Vec::new();
     if dir.is_dir() {
         let mut rd = tokio::fs::read_dir(&dir).await?;

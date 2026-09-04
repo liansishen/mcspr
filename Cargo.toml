@@ -1,6 +1,6 @@
 [package]
 name = "mcspr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MCS Panel - Minecraft 服务端管理面板"
 
@@ -27,3 +27,7 @@ sha1 = "0.10"
 md-5 = "0.10"
 encoding_rs = "0.8"
 percent-encoding = "2"
+tar = "0.4"
+flate2 = "1"
+fs4 = "0.9"
+tokio-util = { version = "0.7", features = ["io"] }
