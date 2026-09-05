@@ -72,32 +72,24 @@ pub async fn game_versions(state: &AppState, loader: &str) -> Result<Vec<Value>,
             out.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
             out.dedup();
         }
+        "purpur" => {
+            let v = get_json(state, "https://api.purpurmc.org/v2/purpur").await?;
+            if let Some(arr) = v.get("versions").and_then(|x| x.as_array()) {
+                for e in arr {
+                    if let Some(ver) = e.as_str() {
+                        out.push((ver.to_string(), true));
+                    }
+                }
+            }
+        }
         "forge" => {
-            // 用完整 maven-metadata（覆盖所有旧版本），promotions 仅用于标记 recommended
+            // 用完整 maven-metadata（覆盖所有旧版本）
             let builds = forge_builds(state).await?;
-            let v = get_json(
-                state,
-                "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
-            )
-            .await
-            .unwrap_or(json!({}));
-            let recommended: std::collections::HashSet<String> = v
-                .get("promos")
-                .and_then(|x| x.as_object())
-                .map(|o| {
-                    o.iter()
-                        .filter(|(k, _)| k.as_str().ends_with("-recommended"))
-                        .filter_map(|(k, _)| k.strip_suffix("-recommended"))
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
             let mut seen = std::collections::HashSet::new();
             for b in &builds {
                 if let Some(mc) = b.split('-').next() {
                     if seen.insert(mc.to_string()) {
-                        let is_rec = recommended.contains(mc);
-                        out.push((mc.to_string(), is_rec));
+                        out.push((mc.to_string(), true));
                     }
                 }
             }
@@ -192,6 +184,24 @@ pub async fn loader_versions(
                 }
             }
             // v3 返回新→旧，保持
+        }
+        "purpur" => {
+            let v = get_json(state, &format!("https://api.purpurmc.org/v2/purpur/{game}")).await?;
+            if let Some(builds) = v.get("builds").and_then(|x| x.as_object()) {
+                if let Some(n) = builds.get("latest").and_then(|x| x.as_str()) {
+                    out.push(n.to_string());
+                }
+                if let Some(arr) = builds.get("all").and_then(|x| x.as_array()) {
+                    for e in arr {
+                        if let Some(n) = e.as_str() {
+                            if !out.iter().any(|x| x == n) {
+                                out.push(n.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| b.parse::<u64>().unwrap_or(0).cmp(&a.parse::<u64>().unwrap_or(0)));
         }
         "velocity" => {
             let v = get_json(state, "https://fill.papermc.io/v3/projects/velocity").await?;

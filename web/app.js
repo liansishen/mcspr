@@ -248,7 +248,7 @@ function showCreateModal() {
     </div>
     <label>实例名称<input id="ci-name" placeholder="留空则自动命名"></label>
     <div id="create-vanilla">
-      <label>大版本<select id="ci-ver-major" onchange="updateVanillaMinor()"><option value="">加载中…</option></select></label>
+      <label>大版本<select id="ci-ver-major" onchange="updateVanillaMajor();updateVanillaMinor()"><option value="">加载中…</option></select></label>
       <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-show-pre" onchange="updateVanillaMajor();updateVanillaMinor()"> 显示预览版 / 快照 / 预发布版本</label>
       <label>具体版本（自动下载）
         <select id="ci-version"><option value="">不下载，稍后手动导入或配置</option></select>
@@ -271,12 +271,13 @@ function showCreateModal() {
         </select>
         <div class="muted small">Fabric / Quilt：官方一键启动器。Forge / NeoForge：运行官方安装器（需要几分钟）。Paper / Purpur / Folia：插件服，装 Bukkit 系插件到 plugins/。Velocity / BungeeCord：代理端，用于群组服。安装完成后建议检查实例设置的 Java 是否满足要求。</div>
       </label>
+      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-mod-pre" onchange="loadLoaderVersions()"> 显示预览版 / 快照版本</label>
       <div class="row" id="ci-loader-game-row">
         <label style="flex:1">大版本<select id="ci-loader-game" onchange="updateLoaderMinor()"><option value="">加载中…</option></select></label>
-        <label style="flex:1">具体版本<select id="ci-loader-minor" onchange="syncLoaderGame()"><option value="">—</option></select></label>
+        <label style="flex:1">具体版本<select id="ci-loader-minor" onchange="loadLoaderVerList()"><option value="">—</option></select></label>
         <label style="flex:1">服务端版本<select id="ci-loader-ver"><option value="">加载中…</option></select></label>
       </div>
-      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-mod-pre" onchange="loadLoaderVersions()"> 显示预览版 / 快照版本</label>
+      <div class="muted small" id="ci-loader-hint"></div>
     </div>
     <div id="ci-progress" style="display:none">
       <h3>安装进度</h3>
@@ -308,6 +309,23 @@ async function loadLoaderVersions() {
   if (gameLbl) gameLbl.style.display = isProxy ? 'none' : '';
   var minorLbl = gameRow.querySelector('label:nth-child(2)');
   if (minorLbl) minorLbl.style.display = isProxy ? 'none' : '';
+  // 各加载器覆盖范围提示（数据源官方下限，避免误以为列表缺失）
+  var hint = document.getElementById('ci-loader-hint');
+  if (hint) {
+    var hints = {
+      fabric: 'Fabric 官方支持 MC 1.14 及以上，更早版本请选择 Forge；默认仅列出正式版，勾选「显示预览版」可查看快照 / 预发布。',
+      quilt: 'Quilt 官方支持 MC 1.14.4 及以上，更早版本请选择 Forge；默认仅列出正式版，勾选「显示预览版」可查看快照 / 预发布。',
+      forge: 'Forge 覆盖 MC 1.1 至最新版本，列表来自官方 maven 全量数据。',
+      neoforge: 'NeoForge 支持 MC 1.20.1 及以上（年制版本 26.x 同步支持）。',
+      paper: 'Paper 官方 Fill API 提供 1.7.10 至最新版本的全量构建。',
+      purpur: 'Purpur 基于 Paper，支持 MC 1.8.8 及以上版本。',
+      folia: 'Folia 基于 Paper 的多线程分支，仅支持较新版本（1.19.4+）。',
+      velocity: 'Velocity 为现代代理端，构建与 MC 版本无关。',
+      waterfall: 'Waterfall 为 BungeeCord 分支代理端。',
+      bungeecord: 'BungeeCord 为官方代理端，提供最新稳定构建。'
+    };
+    hint.textContent = hints[loader] || '';
+  }
   try {
     var g = await api('/loaders/' + loader + '/game-versions');
     var showPre = document.getElementById('ci-mod-pre') ? document.getElementById('ci-mod-pre').checked : true;
@@ -341,19 +359,14 @@ function updateLoaderMinor(loader) {
   }).join('');
   loadLoaderVerList();
 }
-function syncLoaderGame() {
-  var minor = document.getElementById('ci-loader-minor');
-  if (minor && minor.value) {
-    var gameSel = document.getElementById('ci-loader-game');
-    if (gameSel) gameSel.value = minor.value;
-  }
-  loadLoaderVerList();
-}
 async function loadLoaderVerList() {
   const loader = $('#ci-loader')?.value;
-  const game = $('#ci-loader-game')?.value;
+  const gameSel = $('#ci-loader-game');
+  const minorSel = $('#ci-loader-minor');
   const verSel = $('#ci-loader-ver');
   if (!loader || !verSel) return;
+  // 服务端构建按具体 MC 版本查询；代理端无该维度时回退到大版本
+  const game = (minorSel && minorSel.value) || (gameSel && gameSel.value) || '';
   verSel.innerHTML = '<option value="">加载中…</option>';
   try {
     const d = await api(`/loaders/${loader}/loader-versions?game=${encodeURIComponent(game)}`);
@@ -362,15 +375,21 @@ async function loadLoaderVerList() {
     verSel.innerHTML = `<option value="">加载失败：${esc(e.message)}</option>`;
   }
 }
-// 按大版本分组（取前两段点分数字作为组名）
+// 按大版本分组（取前两段点分数字作为组名；每周快照归入同一年 "Nw 系列"）
 function groupVersions(ids) {
   var groups = {};
   var order = [];
   for (var i = 0; i < ids.length; i++) {
-    var parts = ids[i].split(/[.\-]/);
-    var g = parts.length >= 2 ? parts[0] + '.' + parts[1] : ids[i];
+    var id = ids[i];
+    var g;
+    if (/^\d{2}w\d{2}/.test(id)) {
+      g = id.slice(0, 3) + ' 系列';
+    } else {
+      var parts = id.split(/[.\-]/);
+      g = parts.length >= 2 ? parts[0] + '.' + parts[1] : id;
+    }
     if (!groups[g]) { groups[g] = []; order.push(g); }
-    groups[g].push(ids[i]);
+    groups[g].push(id);
   }
   return { groups: groups, order: order };
 }
@@ -414,12 +433,10 @@ function updateVanillaMinor() {
   var showPre = document.getElementById('ci-show-pre') ? document.getElementById('ci-show-pre').checked : false;
   var g = majorSel.value;
   var all = window._mcVersions || [];
-  // 根据选中的大版本过滤具体版本
+  // 用 updateVanillaMajor 建好的 分组映射 过滤，保证与下拉框分组一致
   var inGroup = all.filter(function(v) {
     if (showPre === false && v.type !== 'release') return false;
-    var parts = v.id.split(/[.\-]/);
-    var group = parts.length >= 2 ? parts[0] + '.' + parts[1] : v.id;
-    return group === g;
+    return window._vanillaGroupMap && window._vanillaGroupMap[v.id] === g;
   });
   minorSel.innerHTML = '<option value="">不下载，稍后手动导入或配置</option>' +
     inGroup.map(function(v) { return '<option value="' + esc(v.id) + '">' + esc(v.id) + '</option>'; }).join('');
@@ -432,6 +449,10 @@ function updateVanillaMajor() {
   var filtered = showPre ? all : all.filter(function(v) { return v.type === 'release'; });
   var ids = filtered.map(function(v) { return v.id; });
   var gv = groupVersions(ids);
+  // 保存 版本id → 组名 映射，供 updateVanillaMinor 使用
+  var map = {};
+  gv.order.forEach(function(gp) { gv.groups[gp].forEach(function(id) { map[id] = gp; }); });
+  window._vanillaGroupMap = map;
   var prev = majorSel.value;
   majorSel.innerHTML = gv.order.map(function(g) {
     return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
@@ -1703,21 +1724,11 @@ async function renderTabSettings(id, el) {
         <div class="row">
           <input id="f-java" value="${esc(s.java_path || '')}" placeholder="java（使用 PATH 中的 java）">
           <button class="btn ghost" onclick="detectJava()">检测</button>
-          <button class="btn ghost" onclick="rescanJavas()">扫描本机 Java</button>
         </div>
         <select id="java-picker" style="margin-top:6px" onchange="if(this.value){document.getElementById('f-java').value=this.value;detectJava();}">
           <option value="">加载缓存…</option>
         </select>
-        <div class="row" style="margin-top:6px">
-          <span class="muted small">一键安装 Java：</span>
-          <button class="btn small" onclick="installJava(25)">Temurin 25</button>
-          <button class="btn small" onclick="installJava(21)">21</button>
-          <button class="btn small" onclick="installJava(17)">17</button>
-          <button class="btn small" onclick="installJava(8)">8</button>
-          <button class="btn ghost small" onclick="autoMatchJava()">按 MC 版本自动选择</button>
-        </div>
-        <pre id="ji-log" class="job-log" style="display:none;max-height:140px"></pre>
-        <div class="muted small">Java 26.x 服务端需要 Java 25+，1.20.5+ 需要 21，1.17+ 需要 17；安装的 JRE 也可从上方扫描列表中选择。选好后记得点「保存设置」。</div>
+        <div class="muted small">从下拉列表选择本机扫描或面板安装的 Java；也可手动填写路径。安装 / 扫描请前往「面板设置」。</div>
         <div id="java-hint" class="muted small mono"></div>
       </label>
       <label>最小内存 (MB)<input id="f-min" type="number" min="512" step="512" value="${s.min_ram_mb}">
@@ -1728,7 +1739,6 @@ async function renderTabSettings(id, el) {
         <div class="muted small">追加在 -Xms/-Xmx 之后的 JVM 参数；主程序 JAR 为空时，这里就是完整的启动参数（支持 @user_jvm_args.txt 等 argfile 写法）。</div></label>
       <label>JVM 参数模板<div class="row"><button class="btn ghost small" onclick="fillAikar()">填入 Aikar's Flags</button></div></label>
       <label class="check"><input type="checkbox" id="f-auto" ${s.auto_restart ? 'checked' : ''}> 进程异常退出时自动重启（5 秒后）</label>
-      <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例</label>
       <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例（多个实例将间隔 5 秒依次拉起）</label>
       <div class="row right"><button class="btn primary" onclick="saveInstance('${id}')">保存设置</button></div>
     </div>`;
@@ -1855,6 +1865,20 @@ async function renderPanelSettings() {
       <div class="row right"><button class="btn primary" onclick="savePanelSettings()">保存</button></div>
     </div>
     <div class="card" style="margin-top:16px">
+      <div class="row between"><h2 style="margin:0">Java 环境</h2>
+        <div class="row">
+          <button class="btn small" onclick="rescanJavasPanel()">扫描本机 Java</button>
+          <button class="btn small ghost" onclick="installJavaPanel(8)">安装 JRE 8</button>
+          <button class="btn small ghost" onclick="installJavaPanel(11)">安装 JRE 11</button>
+          <button class="btn small ghost" onclick="installJavaPanel(17)">安装 JRE 17</button>
+          <button class="btn small ghost" onclick="installJavaPanel(21)">安装 JRE 21</button>
+          <button class="btn small ghost" onclick="installJavaPanel(25)">安装 JRE 25</button>
+        </div></div>
+      <div class="muted small" style="margin-top:8px">扫描会查找 PATH、Program Files、Prism Launcher / MultiMC、.jdks 等常见位置的 Java，结果持久化保存；安装按钮从 Adoptium 下载 Temurin JRE 到面板数据目录。各实例在「实例设置 → Java 路径」下拉框中选择。</div>
+      <div id="java-panel-list" style="margin-top:12px"><div class="empty">加载中…</div></div>
+      <pre id="ji-log" class="console-box" style="display:none;margin-top:12px;max-height:220px"></pre>
+    </div>
+    <div class="card" style="margin-top:16px">
       <div class="row between"><h2 style="margin:0">审计日志</h2>
         <div class="row">
           <input id="audit-q" placeholder="筛选路径 / 方法 / 状态码" style="width:230px" onkeydown="if(event.key==='Enter')loadAudit()">
@@ -1864,6 +1888,7 @@ async function renderPanelSettings() {
       <p class="muted small">记录所有写操作与失败请求（≥400），token / password / key 参数自动脱敏；内存保留最近 5000 条，全量写入 data/audit.log。</p>
     </div>`;
   await loadAudit();
+  loadPanelJavas();
 }
 async function loadAudit() {
   const el = $('#audit-body');
@@ -2239,4 +2264,40 @@ async function loadConfigsList(id) {
       ? d.configs.map(function(c) { return '<button class="btn small ghost" style="margin:2px" onclick="editFile(\'' + id + '\',\'' + esc(c) + '\')">' + esc(c) + '</button>'; }).join('')
       : '<span class="muted small">暂无已知配置文件</span>';
   } catch {}
+}
+
+async function loadPanelJavas() {
+  try {
+    var d = await api('/javas');
+    var el = document.getElementById('java-panel-list');
+    if (!el) return;
+    var javas = d.javas || [];
+    el.innerHTML = javas.length
+      ? '<table class="table"><thead><tr><th>版本</th><th>来源</th><th>路径</th></tr></thead><tbody>' +
+        javas.map(function(j) { return '<tr><td>Java ' + j.major + '</td><td>' + esc(j.source) + '</td><td class="mono small">' + esc(j.path) + '</td></tr>'; }).join('') +
+        '</tbody></table>'
+      : '<div class="empty" style="padding:14px">尚未扫描，点击上方「扫描本机 Java」</div>';
+  } catch (e) {
+    var el2 = document.getElementById('java-panel-list');
+    if (el2) el2.innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
+  }
+}
+async function rescanJavasPanel() {
+  try {
+    await api('/javas/scan', { method: 'POST' });
+    toast('扫描完成');
+    loadPanelJavas();
+  } catch (e) { toast(e.message, false); }
+}
+async function installJavaPanel(major) {
+  var log = document.getElementById('ji-log');
+  if (log) { log.style.display = ''; log.textContent = '安装 Temurin JRE ' + major + '…'; }
+  try {
+    var r = await api('/java-install/' + major, { method: 'POST' });
+    await pollJob(r.job_id, function(j) {
+      if (log) { log.textContent = j.logs.join('\n'); log.scrollTop = 1e6; }
+    });
+    toast('Java ' + major + ' 安装完成');
+    loadPanelJavas();
+  } catch (e) { toast(e.message, false); if (log) log.textContent += '\n[错误] ' + e.message; }
 }
