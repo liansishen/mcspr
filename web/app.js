@@ -67,7 +67,15 @@ function toast(msg, ok = true) {
 }
 
 function showModal(html, cls = '') {
-  $('#modal-root').innerHTML = `<div class="modal-backdrop" onclick="if(event.target===this)closeModal()"><div class="modal ${cls}">${html}</div></div>`;
+  $('#modal-root').innerHTML = `<div class="modal-backdrop"><div class="modal ${cls}">${html}</div></div>`;
+  // 只在按下与抬起都落在遮罩上时才关闭：避免在输入框/文本上拖动选择、
+  // 鼠标移出弹窗范围后松开，被误判为点击遮罩而关闭弹窗
+  const bd = $('#modal-root .modal-backdrop');
+  bd.addEventListener('mousedown', e => { bd._downOnBackdrop = e.target === bd; });
+  bd.addEventListener('mouseup', e => {
+    if (bd._downOnBackdrop && e.target === bd) closeModal();
+    bd._downOnBackdrop = false;
+  });
 }
 let modsTabReload = null;
 function closeModal() {
@@ -75,6 +83,63 @@ function closeModal() {
   $('#modal-root').innerHTML = '';
   // 下载模组弹窗关闭后，刷新背后的模组列表
   if (wasModDownload && modsTabReload) modsTabReload();
+}
+
+/* ---------------- 自绘对话框（替代 alert / confirm / prompt） ----------------
+   独立于主弹窗层，可叠加在任意弹窗之上；点遮罩不关闭，必须点按钮，杜绝误触丢数据 */
+function dlgLayer() {
+  let root = document.getElementById('dialog-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'dialog-root';
+    document.body.appendChild(root);
+  }
+  return root;
+}
+function dlgShow(html, onOpen) {
+  const root = dlgLayer();
+  root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:400px">${html}</div></div>`;
+  const dlg = new Promise(resolve => {
+    const done = v => { root.innerHTML = ''; resolve(v); };
+    root.querySelectorAll('[data-dlg]').forEach(btn =>
+      btn.addEventListener('click', () => done(btn.getAttribute('data-dlg'))));
+    if (onOpen) onOpen(root, done);
+  });
+  return dlg;
+}
+function appAlert(msg, title = '提示') {
+  return dlgShow(`<h3 style="margin:0 0 10px">${esc(title)}</h3>
+    <div style="white-space:pre-wrap">${esc(msg)}</div>
+    <div class="row right" style="margin-top:14px"><button class="btn primary" data-dlg="ok">确定</button></div>`);
+}
+function appConfirm(msg, { title = '确认操作', okText = '确定', danger = false } = {}) {
+  return dlgShow(`<h3 style="margin:0 0 10px">${esc(title)}</h3>
+    <div style="white-space:pre-wrap">${esc(msg)}</div>
+    <div class="row right" style="margin-top:14px">
+      <button class="btn ghost" data-dlg="no">取消</button>
+      <button class="btn ${danger ? 'danger' : 'primary'}" data-dlg="yes">${esc(okText)}</button></div>`)
+    .then(v => v === 'yes');
+}
+function appPrompt(msg, def = '', { title = '输入', placeholder = '' } = {}) {
+  return new Promise(resolve => {
+    const root = dlgLayer();
+    root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:400px"><h3 style="margin:0 0 10px">${esc(title)}</h3>
+      <div style="margin-bottom:8px">${esc(msg)}</div>
+      <input id="dlg-input" value="${esc(def)}" placeholder="${esc(placeholder)}" style="width:100%">
+      <div class="row right" style="margin-top:14px">
+        <button class="btn ghost" data-dlg="no">取消</button>
+        <button class="btn primary" data-dlg="yes">确定</button></div></div></div>`;
+    const input = root.querySelector('#dlg-input');
+    input.focus();
+    input.select();
+    const finish = ok => { const val = ok ? input.value : null; root.innerHTML = ''; resolve(val); };
+    root.querySelectorAll('[data-dlg]').forEach(btn =>
+      btn.addEventListener('click', () => finish(btn.getAttribute('data-dlg') === 'yes')));
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      if (e.key === 'Escape') finish(false);
+    });
+  });
 }
 
 function showTokenModal() {
@@ -622,7 +687,7 @@ async function instRestart(id) {
   refresh();
 }
 async function delInstance(id, name) {
-  if (!confirm(`确定删除实例「${name}」？\n实例目录将被彻底删除，不可恢复！`)) return;
+  if (!(await appConfirm(`确定删除实例「${name}」？\n实例目录将被彻底删除，不可恢复！`, { danger: true, okText: '彻底删除' }))) return;
   try { await api(`/instances/${id}`, { method: 'DELETE' }); toast('已删除'); refresh(); }
   catch (e) { toast(e.message, false); }
 }
@@ -1031,7 +1096,7 @@ async function toggleMod(id, file) {
   catch (e) { toast(e.message, false); }
 }
 async function deleteMod(id, file) {
-  if (!confirm(`确定删除 ${file}？`)) return;
+  if (!(await appConfirm(`确定删除 ${file}？`, { danger: true, okText: '删除' }))) return;
   try { await api(`/instances/${id}/mods/delete`, { method: 'POST', body: { file } }); toast('已删除'); refresh(); }
   catch (e) { toast(e.message, false); }
 }
@@ -1060,6 +1125,7 @@ function showModDownload(id) {
     installed: new Set(),
     installedFiles: [],
     installedNames: new Set(),
+    installedByProject: {},
     queue: [],
     cfOk: false,
   };
@@ -1109,19 +1175,31 @@ async function loadInstalledMods() {
   try {
     const h = await api(`/instances/${modDL.id}/mods/hashes`);
     modDL.installedFiles = h.files || [];
-    // 文件名干集合（去掉 .jar 后缀），用于同名文件跳过与名称匹配
+    // 文件名干集合（去掉 .jar 后缀），用于名称匹配
     modDL.installedNames = new Set();
     for (const f of modDL.installedFiles) {
       const n = fileStem(f.filename);
       if (n) modDL.installedNames.add(n);
     }
     const found = new Set();
-    // Modrinth：SHA1 精确匹配
+    // 项目 → 已安装文件名 映射：换版本下载时据此自动替换旧文件
+    const byProject = {};
+    const mapProject = (pid, filename) => {
+      if (!pid || !filename) return;
+      found.add(pid);
+      (byProject[pid] = byProject[pid] || []).push(filename);
+    };
+    // Modrinth：SHA1 精确匹配（响应含完整版本对象，可取到文件名）
     const sha1s = modDL.installedFiles.map(f => f.sha1).filter(Boolean);
     if (sha1s.length) {
       try {
         const r = await api('/moddb/version-files', { method: 'POST', body: { hashes: sha1s } });
-        Object.values(r || {}).forEach(v => { if (v && v.project_id) found.add(v.project_id); });
+        Object.values(r || {}).forEach(v => {
+          if (!v || !v.project_id) return;
+          const files = v.files || [];
+          const primary = files.find(f => f.primary) || files[0];
+          mapProject(v.project_id, primary && primary.filename);
+        });
       } catch {}
     }
     // CurseForge：murmur2 指纹精确匹配
@@ -1129,10 +1207,11 @@ async function loadInstalledMods() {
     if (murms.length) {
       try {
         const r = await api('/moddb/version-files', { method: 'POST', body: { source: 'curseforge', hashes: murms } });
-        Object.values(r || {}).forEach(v => { if (v && v.project_id) found.add(v.project_id); });
+        Object.values(r || {}).forEach(v => { if (v && v.project_id) mapProject(v.project_id, v.filename); });
       } catch {}
     }
     modDL.installed = found;
+    modDL.installedByProject = byProject;
     if (modDL.results) renderModResults();
   } catch {}
 }
@@ -1200,10 +1279,8 @@ function renderModResults() {
         : serverOnly
           ? '<span class="pill st-running" style="font-size:10px;padding:1px 8px">仅服务端</span>'
           : '';
-      const dis = blocked ? `disabled title="纯客户端模组（或标注不支持服务端），服务器无需下载"` : '';
-      const qDis = inQueue || installedExact
-        ? `disabled title="${inQueue ? '已在下载队列中' : '已安装（文件哈希匹配）。如需强制重装，请展开版本列表选择具体版本'}"`
-        : '';
+      const dis = blocked ? `disabled title="纯客户端模组（或标注不支持服务端），服务器无需下载"`
+        : inQueue ? `disabled title="已在下载队列中（可展开版本列表更换版本）"` : '';
       return `<tr><td>
           ${m.icon ? `<img src="${esc(m.icon)}" style="width:24px;height:24px;vertical-align:-6px;margin-right:6px" onerror="this.remove()">` : ''}
           <b>${esc(m.name)}</b>
@@ -1215,7 +1292,7 @@ function renderModResults() {
         <td class="muted">${m.downloads.toLocaleString()}</td>
         <td>
           <button class="btn small" onclick="toggleModVersions(${i})">版本 ▾</button>
-          <button class="btn small primary" onclick="addLatestToQueue(${i})" ${inQueue || installedExact || blocked ? 'disabled' : ''} ${dis || qDis}>+ 队列</button>
+          <button class="btn small primary" onclick="addLatestToQueue(${i})" ${inQueue || blocked ? 'disabled' : ''} ${dis}>+ 队列</button>
         </td></tr>` +
         (expanded ? `<tr><td colspan="3" style="background:var(--row-hover)"><div id="md-versions" class="muted small">加载版本中…</div></td></tr>` : '');
     }).join('') + '</tbody></table>';
@@ -1238,9 +1315,9 @@ async function loadVersionsInline(i) {
       const sameFile = modDL.installedNames && modDL.installedNames.has(fileStem(v.filename));
       return `<div class="row between" style="padding:6px 0;border-bottom:1px solid var(--border)">
       <div><span class="mono small"><b>${esc(v.name)}</b> · ${esc(v.filename)}</span> <span class="muted small">${esc((v.date || '').slice(0, 10))}</span>
-        ${sameFile ? '<span class="pill st-running" style="font-size:10px;padding:1px 8px">已安装</span>' : ''}
+        ${sameFile ? '<span class="pill st-running" style="font-size:10px;padding:1px 8px">当前版本</span>' : ''}
         ${clientOnly ? '<span class="pill st-warn" style="font-size:10px;padding:1px 8px">纯客户端</span>' : ''}</div>
-      <button class="btn small primary" onclick="addToQueue(${i},${vi})" ${clientOnly || sameFile ? 'disabled' : ''} title="${sameFile ? 'mods 目录已存在同名文件' : ''}">+ 队列</button></div>`;
+      <button class="btn small primary" onclick="addToQueue(${i},${vi})" ${clientOnly ? 'disabled title="纯客户端版本，服务器无需下载"' : ''}>+ 队列</button></div>`;
     }).join('');
   } catch (e) {
     const el = $('#md-versions');
@@ -1271,11 +1348,10 @@ async function addToQueue(ri, vi, dep) {
   if (item.environment === 'client_only') {
     return toast('该版本为纯客户端版本，服务器无需下载', false);
   }
-  // mods 目录已存在同名文件：跳过，避免重复下载处理
-  if (modDL.installedNames && modDL.installedNames.has(fileStem(item.filename))) {
-    return toast('mods 目录已存在同名文件，无需重复下载', false);
-  }
-  const pushed = await queuePush({
+  // Prism 式替换语义：已安装的模组选择其他版本时，下载完成后自动删除旧文件
+  const replaceFiles = ((modDL.installedByProject || {})[m.id] || [])
+    .filter(f => f !== item.filename);
+  const result = await queuePush({
     source: modDL.source,
     projectId: m.id,
     projectName: m.name,
@@ -1283,33 +1359,45 @@ async function addToQueue(ri, vi, dep) {
     filename: item.filename,
     url: item.url,
     sha1: item.sha1 || '',
+    replaceFiles,
     dependencies: item.dependencies || [],
     dep: !!dep,
   }, !!dep);
-  if (pushed && !dep) toast(`已加入队列：${item.name}`);
+  if (!dep) {
+    if (result === 'added') toast(`已加入队列：${item.name}`);
+    else if (result === 'replaced') toast(`已更换版本：${item.name}`);
+    else if (result === false) toast('该模组正在下载中，请稍候', false);
+  }
   renderModResults();
   renderModQueue();
 }
 async function queuePush(item, dep) {
-  // 同一项目（同来源）或同一文件名只入队一次
-  if (modDL.queue.some(q =>
-    (q.source === item.source && q.projectId && q.projectId === item.projectId) ||
-    q.filename === item.filename)) return false;
+  // 同一项目（同来源）只保留一个队列项：重复加入视为更换版本（尚未开始下载的才可更换）
+  const exist = modDL.queue.find(q =>
+    q.source === item.source && q.projectId && q.projectId === item.projectId);
+  if (exist) {
+    if (exist.status === 'downloading') return false;
+    Object.assign(exist, item);
+    renderModQueue();
+    if (modDL.results) renderModResults();
+    return 'replaced';
+  }
+  if (modDL.queue.some(q => q.filename === item.filename)) return 'added';
   modDL.queue.push(item);
   renderModQueue();
   // 自动解析前置依赖（仅 Modrinth 提供依赖信息）
-  if (item.source !== 'modrinth' || !item.dependencies) return true;
+  if (item.source !== 'modrinth' || !item.dependencies) return 'added';
   for (const d of item.dependencies) {
     if (d.dependency_type !== 'required') continue;
     if (modDL.queue.some(q => q.projectId === d.project_id)) continue;
     if (modDL.installed.has(d.project_id)) continue;
-    // 前置依赖的文件已存在时同样跳过
     let v = null;
     try {
       const dv = await api(`/moddb/versions?source=modrinth&project=${encodeURIComponent(d.project_id)}&game=${encodeURIComponent(modDL.game)}&loader=${encodeURIComponent(modDL.loader)}`);
       v = dv.versions.find(x => x.environment !== 'client_only');
     } catch { continue; }
     if (!v) continue;
+    // 前置依赖的最新版文件已存在（同名文件）则无需重复安装
     if (modDL.installedNames && modDL.installedNames.has(fileStem(v.filename))) continue;
     await queuePush({
       source: 'modrinth',
@@ -1324,7 +1412,7 @@ async function queuePush(item, dep) {
     }, true);
     toast(`已自动添加前置依赖：${v.filename}`);
   }
-  return true;
+  return 'added';
 }
 function removeFromQueue(i) {
   modDL.queue.splice(i, 1);
@@ -1356,7 +1444,9 @@ function renderModQueue() {
     </div>
     ${modDL.queue.map((q, i) => `<div class="row between" style="padding:5px 0;border-bottom:1px solid var(--border)">
       <span class="small">${q.dep ? '<span class="tag t-basic">前置</span>' : ''}<b>${esc(q.name || q.filename)}</b>
-        <span class="muted small mono">${esc(q.filename)}</span> ${badge(q)}</span>
+        <span class="muted small mono">${esc(q.filename)}</span>
+        ${q.replaceFiles && q.replaceFiles.length && q.status !== 'done' ? `<span class="pill st-warn" title="下载完成后将删除：${esc(q.replaceFiles.join('、'))}">替换 ${q.replaceFiles.length} 个旧文件</span>` : ''}
+        ${badge(q)}</span>
       ${q.status ? '<span></span>' : `<button class="btn small danger" onclick="removeFromQueue(${i})">移除</button>`}
     </div>`).join('')}
   </div>`;
@@ -1375,6 +1465,14 @@ async function downloadQueue() {
       });
       q.status = 'done';
       q.size = r.size;
+      // 替换语义：下载成功后删除该项目此前安装的旧文件，避免同模组多版本共存
+      for (const f of q.replaceFiles || []) {
+        if (f === q.filename) continue;
+        try {
+          await api(`/instances/${modDL.id}/mods/delete`, { method: 'POST', body: { file: f } });
+        } catch {}
+      }
+      q.replaceFiles = [];
     } catch (e) {
       q.status = 'error';
       q.err = e.message;
@@ -1469,7 +1567,7 @@ async function doRestore(id, name) {
   } catch (e) { toast(e.message, false); }
 }
 async function deleteBackup(id, name) {
-  if (!confirm(`确定删除备份 ${name}？`)) return;
+  if (!(await appConfirm(`确定删除备份 ${name}？`, { danger: true, okText: '删除' }))) return;
   try {
     await api(`/instances/${id}/backups/${encodeURIComponent(name)}`, { method: 'DELETE' });
     toast('已删除');
@@ -1552,7 +1650,7 @@ async function saveFile(id, path) {
   } catch (e) { toast(e.message, false); }
 }
 async function filesMkdir(id) {
-  const name = prompt('文件夹名称:');
+  const name = await appPrompt('输入新文件夹名称', '', { title: '新建文件夹' });
   if (!name) return;
   try {
     await api(`/instances/${id}/files/mkdir`, { method: 'POST', body: { path: curPath ? curPath + '/' + name : name } });
@@ -1560,7 +1658,7 @@ async function filesMkdir(id) {
   } catch (e) { toast(e.message, false); }
 }
 async function renameFile(id, path, oldName) {
-  const nn = prompt('新名称:', oldName);
+  const nn = await appPrompt('输入新名称', oldName, { title: '重命名' });
   if (!nn || nn === oldName) return;
   const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
   const to = parent ? parent + '/' + nn : nn;
@@ -1570,7 +1668,7 @@ async function renameFile(id, path, oldName) {
   } catch (e) { toast(e.message, false); }
 }
 async function deleteFile(id, path) {
-  if (!confirm(`确定删除 ${path}？\n如果是目录将被整个删除！`)) return;
+  if (!(await appConfirm(`确定删除 ${path}？\n如果是目录将被整个删除！`, { danger: true, okText: '删除' }))) return;
   try {
     await api(`/instances/${id}/files/delete`, { method: 'POST', body: { path } });
     toast('已删除'); loadFiles(id, routeToken, curPath);
@@ -2044,13 +2142,13 @@ async function switchWorld(id, name) {
   try { await api(`/instances/${id}/worlds/switch`, { method: 'POST', body: { path: name } }); toast(`已切换到 ${name}`); loadWorlds(id); } catch (e) { toast(e.message, false); }
 }
 async function deleteWorld(id, name) {
-  if (!confirm(`确定删除世界「${name}」？不可恢复！`)) return;
+  if (!(await appConfirm(`确定删除世界「${name}」？不可恢复！`, { danger: true, okText: '删除' }))) return;
   try { await api(`/instances/${id}/worlds/delete`, { method: 'POST', body: { path: name } }); toast('已删除'); loadWorlds(id); } catch (e) { toast(e.message, false); }
 }
 async function createWorld(id) {
-  const name = prompt('新世界名称（不含空格）:');
+  const name = await appPrompt('新世界名称（不含空格）', '', { title: '新建世界' });
   if (!name) return;
-  const seed = prompt('世界种子（留空随机）:');
+  const seed = await appPrompt('世界种子（留空为随机）', '', { title: '世界种子' });
   try { await api(`/instances/${id}/worlds/create`, { method: 'POST', body: { name, seed: seed || undefined } }); toast(`世界 ${name} 已创建（设为当前）`); loadWorlds(id); } catch (e) { toast(e.message, false); }
 }
 
@@ -2106,7 +2204,7 @@ async function doCreateTask(id) {
   } catch (e) { toast(e.message, false); }
 }
 async function taskOp(id, taskId, op) {
-  if (op === 'delete' && !confirm('确定删除此任务？')) return;
+  if (op === 'delete' && !(await appConfirm('确定删除此计划任务？', { danger: true, okText: '删除' }))) return;
   try { await api(`/instances/${id}/tasks/update`, { method: 'POST', body: { id: taskId, op } }); toast('已操作'); route(); } catch (e) { toast(e.message, false); }
 }
 
@@ -2124,7 +2222,7 @@ async function batchStop() {
   toast(`已停止 ${ids.length} 个实例`); refresh();
 }
 async function cloneInstance(id, name) {
-  const nn = prompt('克隆实例名称:', name + ' 副本');
+  const nn = await appPrompt('输入克隆后的实例名称', name + ' 副本', { title: '克隆实例' });
   if (!nn) return;
   try {
     const r = await api(`/instances/${id}/clone`, { method: 'POST', body: { name: nn } });
@@ -2166,126 +2264,7 @@ async function saveAlerts(id) {
   }}); toast('告警设置已保存'); } catch (e) { toast(e.message, false); }
 }
 
-/* ---------------- 世界管理 ---------------- */
-async function renderTabWorlds(id, el, t) {
-  el.innerHTML = '<div class="row between"><h2>世界管理</h2><button class="btn" onclick="createWorld(\'' + id + '\')">新建世界</button></div><p class="muted small">列出实例目录中所有包含 level.dat 的存档。切换/创建/删除需要服务器停止。</p><div id="worlds-body"><div class="empty">加载中…</div></div>';
-  await loadWorlds(id, t);
-}
-async function loadWorlds(id, t) {
-  try {
-    const d = await api('/instances/' + id + '/worlds');
-    if (t !== routeToken) return;
-    var el = document.getElementById('worlds-body');
-    var ws = d.worlds || [];
-    el.innerHTML = ws.length ? '<table class="table"><thead><tr><th>世界</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
-      ws.map(function(w) { return '<tr><td><b>' + esc(w.name) + '</b></td><td>' + fmtSize(w.size) + '</td><td>' +
-        (w.current ? '<span class="pill st-running">当前</span>' : '<span class="muted">-</span>') + '</td><td>' +
-        (w.current ? '<span class="muted small">使用中</span>' :
-          '<button class="btn small" onclick="switchWorld(\'' + id + '\',\'' + esc(w.name) + '\')">切换</button>' +
-          '<button class="btn small danger" onclick="deleteWorld(\'' + id + '\',\'' + esc(w.name) + '\')">删除</button>') + '</td></tr>'; }).join('') +
-      '</tbody></table>' : '<div class="empty">暂无世界存档</div>';
-  } catch (e) { var el2 = document.getElementById('worlds-body'); if (el2) el2.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
-}
-async function switchWorld(id, name) {
-  try { await api('/instances/' + id + '/worlds/switch', { method: 'POST', body: { path: name } }); toast('已切换到 ' + name); route(); } catch (e) { toast(e.message, false); }
-}
-async function deleteWorld(id, name) {
-  if (!confirm('确定删除世界「' + name + '」？不可恢复！')) return;
-  try { await api('/instances/' + id + '/worlds/delete', { method: 'POST', body: { path: name } }); toast('已删除'); route(); } catch (e) { toast(e.message, false); }
-}
-async function createWorld(id) {
-  var name = prompt('新世界名称（不含空格）:');
-  if (!name) return;
-  var seed = prompt('世界种子（留空随机）:');
-  try { await api('/instances/' + id + '/worlds/create', { method: 'POST', body: { name: name, seed: seed || undefined } }); toast('世界 ' + name + ' 已创建'); route(); } catch (e) { toast(e.message, false); }
-}
-
-/* ---------------- 计划任务 ---------------- */
-async function renderTabTasks(id, el, t) {
-  el.innerHTML = '<div class="row between"><h2>计划任务</h2><button class="btn" onclick="createTask(\'' + id + '\')">＋ 新建任务</button></div><p class="muted small">定时执行命令 / 备份 / 重启。到期自动执行并记录结果；连续失败 3 次推送告警。</p><div id="tasks-body"><div class="empty">加载中…</div></div>';
-  await loadTasks(id, t);
-}
-async function loadTasks(id, t) {
-  try {
-    var d = await api('/instances/' + id + '/tasks');
-    if (t !== routeToken) return;
-    var tasks = d.tasks || [];
-    var el = document.getElementById('tasks-body');
-    el.innerHTML = tasks.length ? '<table class="table"><thead><tr><th>任务</th><th>类型</th><th>间隔</th><th>状态</th><th>上次结果</th><th>操作</th></tr></thead><tbody>' +
-      tasks.map(function(x) { return '<tr><td><b>' + esc(x.name) + '</b>' + (x.value ? '<div class="muted small mono">' + esc(x.value) + '</div>' : '') + '</td><td>' +
-        (x.kind === 'command' ? '命令' : x.kind === 'backup' ? '备份' : '重启') + '</td><td>' + x.interval_mins + ' 分钟</td><td>' +
-        (x.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">停用</span>') + '</td><td class="muted small">' + esc(x.last_result || '-') + '</td><td>' +
-        '<button class="btn small" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'run\')">立即运行</button>' +
-        '<button class="btn small ' + (x.enabled ? 'warn' : 'primary') + '" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'' + (x.enabled ? 'disable' : 'enable') + '\')">' + (x.enabled ? '停用' : '启用') + '</button>' +
-        '<button class="btn small danger" onclick="taskOp(\'' + id + '\',\'' + x.id + '\',\'delete\')">删除</button></td></tr>'; }).join('') + '</tbody></table>'
-      : '<div class="empty">暂无计划任务</div>';
-  } catch (e) { var el2 = document.getElementById('tasks-body'); if (el2) el2.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
-}
-async function createTask(id) {
-  showModal('<h2>新建计划任务</h2><label>任务名称<input id="tk-name"></label><label>类型<select id="tk-kind"><option value="command">执行命令</option><option value="backup">备份</option><option value="restart">重启</option></select></label><label>命令内容<input id="tk-value" placeholder="仅命令类型需要"></label><label>间隔（分钟）<input id="tk-interval" type="number" value="60" min="1"></label><div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" onclick="doCreateTask(\'' + id + '\')">创建</button></div>');
-}
-async function doCreateTask(id) {
-  var name = $('#tk-name') ? $('#tk-name').value.trim() : '';
-  var kind = $('#tk-kind') ? $('#tk-kind').value : 'command';
-  var value = $('#tk-value') ? $('#tk-value').value.trim() : '';
-  var interval = +($('#tk-interval') ? $('#tk-interval').value : 0) || 0;
-  if (!name) return toast('请输入名称', false);
-  try { await api('/instances/' + id + '/tasks', { method: 'POST', body: { name: name, kind: kind, value: value, interval_mins: interval } }); closeModal(); toast('已创建'); route(); } catch (e) { toast(e.message, false); }
-}
-async function taskOp(id, taskId, op) {
-  if (op === 'delete' && !confirm('确定删除？')) return;
-  try { await api('/instances/' + id + '/tasks/update', { method: 'POST', body: { id: taskId, op: op } }); toast('已操作'); route(); } catch (e) { toast(e.message, false); }
-}
-
-/* ---------------- 批量启停 / 克隆 / Aikar / 图标 / 文件下载 / 告警 / 导入导出 ---------------- */
-async function batchStart() {
-  var ids = [];
-  document.querySelectorAll('.dash-check:checked').forEach(function(c) { ids.push(c.getAttribute('data-id')); });
-  if (!ids.length) return toast('请先勾选实例', false);
-  for (var i = 0; i < ids.length; i++) { try { await api('/instances/' + ids[i] + '/start', { method: 'POST' }); } catch(e) {} }
-  toast('已启动 ' + ids.length + ' 个实例'); refresh();
-}
-async function batchStop() {
-  var ids = [];
-  document.querySelectorAll('.dash-check:checked').forEach(function(c) { ids.push(c.getAttribute('data-id')); });
-  if (!ids.length) return toast('请先勾选实例', false);
-  for (var i = 0; i < ids.length; i++) { try { await api('/instances/' + ids[i] + '/stop', { method: 'POST' }); } catch(e) {} }
-  toast('已停止 ' + ids.length + ' 个实例'); refresh();
-}
-async function cloneInstance(id, name) {
-  var nn = prompt('克隆实例名称:', name + ' 副本');
-  if (!nn) return;
-  try { var r = await api('/instances/' + id + '/clone', { method: 'POST', body: { name: nn } }); toast('克隆完成，端口 ' + r.port); refresh(); } catch (e) { toast(e.message, false); }
-}
-function fillAikar() {
-  var el = document.getElementById('f-jvm');
-  if (el) el.value = '-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCTargetRatio=4 -XX:G1OldCSetRegionThresholdPercent=5';
-}
-async function uploadIcon(id) {
-  var inp = document.getElementById('icon-file');
-  if (!inp || !inp.files[0]) return toast('请选择 PNG 文件', false);
-  var fd = new FormData(); fd.append('file', inp.files[0]);
-  try { await api('/instances/' + id + '/icon', { method: 'POST', body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
-}
-async function downloadFile(id, path) {
-  var a = document.createElement('a');
-  a.href = '/api/instances/' + id + '/files/download?path=' + encodeURIComponent(path) + (TOKEN ? '&token=' + encodeURIComponent(TOKEN) : '');
-  a.download = path.split('/').pop(); a.click();
-}
-async function downloadArchive(id, path) {
-  var name = (path.split('/').pop() || 'archive') + '.tar.gz';
-  try { await api('/instances/' + id + '/files/archive', { method: 'POST', body: { paths: [path], name: name } });
-    var a = document.createElement('a'); a.href = '/api/instances/' + id + '/files/archive-download?name=' + encodeURIComponent(name); a.download = name; a.click();
-  } catch (e) { toast(e.message, false); }
-}
-async function saveAlerts(id) {
-  try { await api('/settings', { method: 'PUT', body: {
-    alert_type: document.getElementById('al-type') ? document.getElementById('al-type').value : 'none',
-    alert_webhook_url: document.getElementById('al-url') ? document.getElementById('al-url').value : '',
-    telegram_bot_token: document.getElementById('al-tgt') ? document.getElementById('al-tgt').value : '',
-    telegram_chat_id: document.getElementById('al-tgc') ? document.getElementById('al-tgc').value : '',
-  }}); toast('告警设置已保存'); } catch (e) { toast(e.message, false); }
-}
+/* ---------------- 配置导出导入 / 重装 ---------------- */
 async function exportConfig() {
   try {
     var d = await api('/config/export');
@@ -2307,7 +2286,7 @@ async function reinstallServer(id) {
   var t = document.getElementById('ri-type'); var g = document.getElementById('ri-game');
   var l = document.getElementById('ri-lver'); var bk = document.getElementById('ri-backup');
   if (!t || !g || !g.value.trim()) return toast('请填写 MC 版本', false);
-  if (!confirm('确定重装？世界和配置保留，服务端 jar 会被替换。')) return;
+  if (!(await appConfirm('确定重装？世界和配置保留，服务端 jar 会被替换。', { danger: true, okText: '重装' }))) return;
   try { await api('/instances/' + id + '/reinstall', { method: 'POST', body: {
     server_type: t.value, mc_version: g.value.trim(), loader_version: l ? l.value.trim() : undefined, backup_first: bk ? bk.checked : true
   }}); toast('重装任务已启动'); } catch (e) { toast(e.message, false); }

@@ -487,7 +487,7 @@ pub async fn moddb_version_files(
         let v = crate::instance::moddb::cf_fingerprints(&state, &prints)
             .await
             .map_err(ApiError::bad_request)?;
-        // 归一化为 { "<指纹>": { "project_id": "<modId>" } }
+        // 归一化为 { "<指纹>": { "project_id": "<modId>", "filename": "<fileName>" } }
         let mut out = json!({});
         if let Some(arr) = v.pointer("/data/exactFingerprints").and_then(|x| x.as_array()) {
             for e in arr {
@@ -497,8 +497,13 @@ pub async fn moddb_version_files(
                     .and_then(|x| x.as_i64())
                     .unwrap_or(0)
                     .to_string();
+                let filename = e
+                    .pointer("/file/fileName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if fp != "0" && pid != "0" {
-                    out[fp.as_str()] = json!({ "project_id": pid });
+                    out[fp.as_str()] = json!({ "project_id": pid, "filename": filename });
                 }
             }
         }
