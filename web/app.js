@@ -366,8 +366,13 @@ async function loadLoaderVersions() {
   var loader = document.getElementById('ci-loader') ? document.getElementById('ci-loader').value : '';
   var gameRow = document.getElementById('ci-loader-game-row');
   if (!loader || !gameRow) return;
+  // 切换加载器后立即清空三个下拉框，避免短暂显示上一个加载器的数据
+  var majorSel0 = document.getElementById('ci-loader-game');
+  var minorSel0 = document.getElementById('ci-loader-minor');
   var verSel = document.getElementById('ci-loader-ver');
-  if (verSel) verSel.innerHTML = '<option value="">加载中…</option>';
+  if (majorSel0) majorSel0.innerHTML = '<option value="">加载中…</option>';
+  if (minorSel0) minorSel0.innerHTML = '<option value="">—</option>';
+  if (verSel) verSel.innerHTML = '<option value="">—</option>';
   // 代理端无 MC 版本维度
   var isProxy = loader === 'velocity' || loader === 'bungeecord';
   var gameLbl = gameRow.querySelector('label:first-child');
@@ -392,27 +397,38 @@ async function loadLoaderVersions() {
     hint.textContent = hints[loader] || '';
   }
   try {
-    var g = await api('/loaders/' + loader + '/game-versions');
-    var showPre = document.getElementById('ci-mod-pre') ? document.getElementById('ci-mod-pre').checked : true;
-    var all = g.versions;
-    var filtered = showPre ? all : all.filter(function(v) { return v.stable; });
-    var ids = filtered.map(function(v) { return v.id; });
-    var gv = groupVersions(ids);
-    var majorSel = document.getElementById('ci-loader-game');
-    var minorSel = document.getElementById('ci-loader-minor');
-    if (isProxy) {
-      // 代理端：直接加载版本列表
-      await loadLoaderVerList();
-      return;
-    }
-    majorSel.innerHTML = gv.order.map(function(gp) {
-      return '<option value="' + esc(gp) + '">' + esc(gp) + '</option>';
-    }).join('');
-    window._loaderGroups = gv.groups;
-    updateLoaderMinor(loader);
+    var all = await ensureLoaderGameVersions(loader);
+    renderLoaderGameVersions(loader, all, isProxy);
   } catch (e) {
-    if (majorSel) majorSel.innerHTML = '<option value="">加载失败：' + esc(e.message) + '</option>';
+    var sel = document.getElementById('ci-loader-game');
+    if (sel) sel.innerHTML = '<option value="">加载失败：' + esc(e.message) + '</option>';
   }
+}
+// 各加载器的 MC 版本列表按加载器缓存：切换回来时无需重新请求
+async function ensureLoaderGameVersions(loader) {
+  if (!window._loaderGameCache) window._loaderGameCache = {};
+  if (!window._loaderGameCache[loader]) {
+    var g = await api('/loaders/' + loader + '/game-versions');
+    window._loaderGameCache[loader] = g.versions || [];
+  }
+  return window._loaderGameCache[loader];
+}
+function renderLoaderGameVersions(loader, all, isProxy) {
+  var showPre = document.getElementById('ci-mod-pre') ? document.getElementById('ci-mod-pre').checked : true;
+  var filtered = showPre ? all : all.filter(function(v) { return v.stable; });
+  var ids = filtered.map(function(v) { return v.id; });
+  var gv = groupVersions(ids);
+  var majorSel = document.getElementById('ci-loader-game');
+  if (isProxy) {
+    // 代理端：直接加载版本列表
+    loadLoaderVerList();
+    return;
+  }
+  majorSel.innerHTML = gv.order.map(function(gp) {
+    return '<option value="' + esc(gp) + '">' + esc(gp) + '</option>';
+  }).join('');
+  window._loaderGroups = gv.groups;
+  updateLoaderMinor(loader);
 }
 function updateLoaderMinor(loader) {
   var g = document.getElementById('ci-loader-game') ? document.getElementById('ci-loader-game').value : '';
@@ -1095,10 +1111,89 @@ async function toggleMod(id, file) {
   try { await api(`/instances/${id}/mods/toggle`, { method: 'POST', body: { file } }); toast('已切换'); refresh(); }
   catch (e) { toast(e.message, false); }
 }
+// 通过 Modrinth 哈希反查构建已安装模组的依赖图，找出（直接或间接）依赖 targetFile 的已装模组文件名
+async function modDependents(id, targetFile) {
+  const h = await api(`/instances/${id}/mods/hashes`);
+  const files = h.files || [];
+  const target = files.find(f => f.filename === targetFile);
+  if (!target || !target.sha1) return [];
+  const r = await api('/moddb/version-files', {
+    method: 'POST',
+    body: { hashes: files.map(f => f.sha1).filter(Boolean) },
+  });
+  // sha1 → 本地文件名；项目 → 本地文件名 / 必需依赖项目列表
+  const shaToFile = {};
+  files.forEach(f => { if (f.sha1) shaToFile[f.sha1] = f.filename; });
+  const pidToFile = {};
+  const requiredDeps = {};
+  let targetPid = null;
+  for (const [sha, v] of Object.entries(r || {})) {
+    if (!v || !v.project_id) continue;
+    const local = shaToFile[sha];
+    if (!local) continue;
+    pidToFile[v.project_id] = local;
+    requiredDeps[v.project_id] = (v.dependencies || [])
+      .filter(d => d.dependency_type === 'required')
+      .map(d => d.project_id);
+    if (local === targetFile) targetPid = v.project_id;
+  }
+  if (!targetPid) return [];
+  // 反向广度优先：多层依赖逐层展开（谁依赖了当前层，谁就是下一层）
+  const dependents = new Set();
+  let frontier = [targetPid];
+  while (frontier.length) {
+    const next = [];
+    for (const pid of Object.keys(requiredDeps)) {
+      if (pid === targetPid || dependents.has(pid)) continue;
+      if (requiredDeps[pid].some(d => frontier.includes(d))) {
+        dependents.add(pid);
+        next.push(pid);
+      }
+    }
+    frontier = next;
+  }
+  const stem = fileStem(targetFile);
+  return Array.from(dependents)
+    .map(pid => pidToFile[pid])
+    .filter(f => f && f !== targetFile && fileStem(f) !== stem);
+}
+// 依赖确认对话框：列出依赖它的模组，可勾选同时删除
+function deleteModDialog(file, deps) {
+  return new Promise(resolve => {
+    const root = dlgLayer();
+    root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:460px">
+      <h3 style="margin:0 0 10px">删除模组</h3>
+      <div style="margin-bottom:8px">确定删除 <b class="mono">${esc(file)}</b>？</div>
+      <div class="banner warn" style="padding:8px 12px;margin-bottom:8px">以下 ${deps.length} 个已安装模组（直接或间接）依赖此模组，删除后它们将无法正常工作：</div>
+      <div style="max-height:180px;overflow:auto;margin-bottom:10px">${deps.map(d => `<div class="mono small" style="padding:2px 0">• ${esc(d)}</div>`).join('')}</div>
+      <label class="check"><input type="checkbox" id="dlg-dep" checked> 同时删除以上依赖模组</label>
+      <div class="row right" style="margin-top:14px">
+        <button class="btn ghost" data-dlg="no">取消</button>
+        <button class="btn danger" data-dlg="yes">删除</button></div></div></div>`;
+    const cb = root.querySelector('#dlg-dep');
+    const finish = ok => { const also = ok && cb.checked; root.innerHTML = ''; resolve({ ok, also }); };
+    root.querySelectorAll('[data-dlg]').forEach(btn =>
+      btn.addEventListener('click', () => finish(btn.getAttribute('data-dlg') === 'yes')));
+  });
+}
 async function deleteMod(id, file) {
-  if (!(await appConfirm(`确定删除 ${file}？`, { danger: true, okText: '删除' }))) return;
-  try { await api(`/instances/${id}/mods/delete`, { method: 'POST', body: { file } }); toast('已删除'); refresh(); }
-  catch (e) { toast(e.message, false); }
+  let deps = [];
+  try { deps = await modDependents(id, file); } catch {}
+  let also = [];
+  if (deps.length) {
+    const r = await deleteModDialog(file, deps);
+    if (!r.ok) return;
+    if (r.also) also = deps;
+  } else {
+    if (!(await appConfirm(`确定删除 ${file}？`, { danger: true, okText: '删除' }))) return;
+  }
+  try {
+    for (const f of [file, ...also]) {
+      await api(`/instances/${id}/mods/delete`, { method: 'POST', body: { file: f } });
+    }
+    toast(also.length ? `已删除 ${also.length + 1} 个模组（含依赖它的模组）` : '已删除');
+    refresh();
+  } catch (e) { toast(e.message, false); }
 }
 function uploadMod(id) {
   showModal(`<h2>上传模组</h2>
@@ -2029,7 +2124,7 @@ async function renderPanelSettings() {
           <button class="btn small ghost" onclick="installJavaPanel(25)">安装 JRE 25</button>
         </div></div>
       <div class="muted small" style="margin-top:8px">扫描会查找 PATH、Program Files、Prism Launcher / MultiMC、.jdks 等常见位置的 Java，结果持久化保存；安装按钮从 Adoptium 下载 Temurin JRE 到面板数据目录。各实例在「实例设置 → Java 路径」下拉框中选择。</div>
-      <div id="java-panel-list" style="margin-top:12px"><div class="empty">加载中…</div></div>
+      <div id="java-panel-list" style="margin-top:12px;max-height:340px;overflow-y:auto"><div class="empty">加载中…</div></div>
       <pre id="ji-log" class="console-box" style="display:none;margin-top:12px;max-height:220px"></pre>
     </div>
     <div class="card" style="margin-top:16px">
@@ -2038,7 +2133,7 @@ async function renderPanelSettings() {
           <input id="audit-q" placeholder="筛选路径 / 方法 / 状态码" style="width:230px" onkeydown="if(event.key==='Enter')loadAudit()">
           <button class="btn small" onclick="loadAudit()">刷新</button>
         </div></div>
-      <div id="audit-body" style="margin-top:12px"><div class="empty">加载中…</div></div>
+      <div id="audit-body" style="margin-top:12px;max-height:340px;overflow-y:auto"><div class="empty">加载中…</div></div>
       <p class="muted small">记录所有写操作与失败请求（≥400），token / password / key 参数自动脱敏；内存保留最近 5000 条，全量写入 data/audit.log。</p>
     </div>`;
   await loadAudit();
