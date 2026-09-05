@@ -2,9 +2,7 @@
 
 use crate::state::AppState;
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {

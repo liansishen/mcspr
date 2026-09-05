@@ -1,7 +1,6 @@
 //! 告警推送：Webhook / Discord / Telegram，同类事件 5 分钟去重
 
 use crate::state::AppState;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// 发送告警（key 用于 5 分钟去重）；推送失败只记日志，绝不影响实例

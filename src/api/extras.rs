@@ -1,17 +1,15 @@
 //! 体验增强端点：控制台下载 / 克隆 / 重装 / 图标 / 文件下载与打包解压 / 世界管理 / 计划任务 / 配置直达
 
 use crate::error::{ApiError, ApiResult};
-use crate::instance::{files, get_instance, loaders, properties, vanilla, InstanceMeta, InstanceRuntime};
+use crate::instance::{files, get_instance, properties, InstanceMeta, InstanceRuntime};
 use crate::state::AppState;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use std::path::Path as StdPath;
+use tokio::io::AsyncWriteExt;
 
 // ---------- 控制台日志下载 ----------
 
@@ -202,7 +200,7 @@ pub async fn reinstall(
             crate::jobs::finish_job(&st2, &jid, Some("实例不存在".into()), None);
             return;
         };
-        let iname = rt.meta.read().await.name.clone();
+        let _iname = rt.meta.read().await.name.clone();
         if backup_first {
             crate::jobs::log_job(&st2, &jid, "重装前自动备份…");
             match crate::instance::backup::create(&st2, &rt).await {
@@ -628,15 +626,6 @@ pub async fn tasks_list(
     let dir = rt.dir.clone();
     let tasks = crate::instance::tasks::load(&dir);
     Ok(Json(json!({ "tasks": tasks })))
-}
-
-#[derive(Deserialize)]
-pub struct TaskCreateReq {
-    pub name: String,
-    pub kind: String,
-    #[serde(default)]
-    pub value: String,
-    pub interval_mins: u64,
 }
 
 pub async fn tasks_create(

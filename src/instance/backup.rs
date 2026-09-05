@@ -1,9 +1,8 @@
 //! 实例备份：tar.gz 全量备份 / 恢复 / 下载 / 恢复前预览 / 保留策略
 
-use crate::instance::{get_instance, InstanceRuntime, Status};
+use crate::instance::{InstanceRuntime, Status};
 use crate::state::AppState;
 use serde::Serialize;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

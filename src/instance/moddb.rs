@@ -304,14 +304,6 @@ async fn send_json(req: reqwest::RequestBuilder) -> Result<Value, String> {
     Ok(v)
 }
 
-async fn get_json(state: &AppState, url: &str) -> Result<Value, String> {
-    let req = http(state)
-        .get(url)
-        .timeout(Duration::from_secs(25))
-        .header("user-agent", "MCS-Panel/0.1");
-    send_json(req).await
-}
-
 /// 批量查询项目客户端/服务端支持情况（仅 Modrinth 提供该元数据）
 pub async fn projects_sides(state: &AppState, ids: &[String]) -> Result<Vec<ModSideInfo>, String> {
     if ids.is_empty() {

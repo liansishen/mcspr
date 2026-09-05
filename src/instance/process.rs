@@ -184,7 +184,7 @@ async fn on_exit(
             .unwrap_or_else(|| "未知".into());
         push_log(&rt, format!("[面板] 进程已退出 (code: {code_str})")).await;
         if code.map(|c| c != 0).unwrap_or(true) {
-            let name = rt.meta.read().await.name.clone();
+            let _name = rt.meta.read().await.name.clone();
             let name = rt.meta.read().await.name.clone();
             crate::alerts::send(&state, &format!("crash-{}", rt.meta.read().await.id), format!("实例「{name}」异常退出 (code: {code_str})")).await;
         }

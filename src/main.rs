@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 let map = st.instances.read().await.clone();
-                for (id, rt) in map {
+                for (_id, rt) in map {
                     if *rt.status.lock().await == instance::Status::Stopped {
                         continue;
                     }
@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let map = st.instances.read().await.clone();
-                for (id, rt) in map {
+                for (_id, rt) in map {
                     if *rt.status.lock().await == instance::Status::Stopped
                         && !std::path::Path::new(&rt.dir).join("tasks.json").exists()
                     {
