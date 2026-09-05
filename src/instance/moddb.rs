@@ -8,6 +8,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize)]
 pub struct ModSearchItem {
     pub id: String,
+    pub slug: String,
     pub name: String,
     pub summary: String,
     pub downloads: u64,
@@ -92,6 +93,7 @@ pub async fn search(
                 for h in hits {
                     out.push(ModSearchItem {
                         id: h.get("project_id").and_then(|x| x.as_str()).unwrap_or("").into(),
+                        slug: h.get("slug").and_then(|x| x.as_str()).unwrap_or("").into(),
                         name: h.get("title").and_then(|x| x.as_str()).unwrap_or("").into(),
                         summary: h.get("description").and_then(|x| x.as_str()).unwrap_or("").into(),
                         downloads: h.get("downloads").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -132,6 +134,7 @@ pub async fn search(
                 for h in arr {
                     out.push(ModSearchItem {
                         id: h.get("id").and_then(|x| x.as_i64()).unwrap_or(0).to_string(),
+                        slug: h.get("slug").and_then(|x| x.as_str()).unwrap_or("").into(),
                         name: h.get("name").and_then(|x| x.as_str()).unwrap_or("").into(),
                         summary: h.get("summary").and_then(|x| x.as_str()).unwrap_or("").into(),
                         downloads: h.get("downloadCount").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -359,6 +362,58 @@ pub async fn version_files(state: &AppState, hashes: &[String]) -> Result<Value,
         .json::<Value>()
         .await
         .map_err(|e| format!("解析 JSON 失败: {e}"))
+}
+
+/// CurseForge 文件指纹算法：murmur2（seed=1，按官方实现，length 视为有符号 i32）
+pub fn murmur2(data: &[u8]) -> u32 {
+    const M: u32 = 0x5bd1_e995;
+    const R: u32 = 24;
+    let mut length = data.len() as i32;
+    let mut h = (1i32 ^ length) as u32;
+    let mut i = 0usize;
+    while length >= 4 {
+        let mut k = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+        h = h.wrapping_mul(M);
+        h ^= k;
+        i += 4;
+        length -= 4;
+    }
+    match length {
+        3 => {
+            h ^= (data[i + 2] as u32) << 16;
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        2 => {
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        1 => {
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        _ => {}
+    }
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^= h >> 15;
+    h
+}
+
+/// 通过 murmur2 指纹批量查询 CurseForge 模组（识别已安装），返回 {指纹: 项目ID}
+pub async fn cf_fingerprints(state: &AppState, prints: &[u32]) -> Result<Value, String> {
+    let key = cf_key(state).await?;
+    let req = http(state)
+        .post("https://api.curseforge.com/v1/fingerprints/432")
+        .header("x-api-key", &key)
+        .json(&json!({ "fingerprints": prints }))
+        .timeout(Duration::from_secs(25));
+    send_json(req).await
 }
 
 /// 下载模组文件到实例 mods 目录

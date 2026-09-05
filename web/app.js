@@ -1059,6 +1059,7 @@ function showModDownload(id) {
     sides: {},
     installed: new Set(),
     installedFiles: [],
+    installedNames: new Set(),
     queue: [],
     cfOk: false,
   };
@@ -1108,17 +1109,52 @@ async function loadInstalledMods() {
   try {
     const h = await api(`/instances/${modDL.id}/mods/hashes`);
     modDL.installedFiles = h.files || [];
-    if (h.files.length) {
-      const r = await api('/moddb/version-files', {
-        method: 'POST',
-        body: { hashes: h.files.map(f => f.sha1).filter(Boolean) },
-      });
-      modDL.installed = new Set(
-        Object.values(r).map(v => v && v.project_id).filter(Boolean)
-      );
-      if (modDL.results) renderModResults();
+    // 文件名干集合（去掉 .jar 后缀），用于同名文件跳过与名称匹配
+    modDL.installedNames = new Set();
+    for (const f of modDL.installedFiles) {
+      const n = fileStem(f.filename);
+      if (n) modDL.installedNames.add(n);
     }
+    const found = new Set();
+    // Modrinth：SHA1 精确匹配
+    const sha1s = modDL.installedFiles.map(f => f.sha1).filter(Boolean);
+    if (sha1s.length) {
+      try {
+        const r = await api('/moddb/version-files', { method: 'POST', body: { hashes: sha1s } });
+        Object.values(r || {}).forEach(v => { if (v && v.project_id) found.add(v.project_id); });
+      } catch {}
+    }
+    // CurseForge：murmur2 指纹精确匹配
+    const murms = modDL.installedFiles.map(f => f.murmur2).filter(Boolean);
+    if (murms.length) {
+      try {
+        const r = await api('/moddb/version-files', { method: 'POST', body: { source: 'curseforge', hashes: murms } });
+        Object.values(r || {}).forEach(v => { if (v && v.project_id) found.add(v.project_id); });
+      } catch {}
+    }
+    modDL.installed = found;
+    if (modDL.results) renderModResults();
   } catch {}
+}
+// 文件名干（去 .jar / .jar.disabled 后缀并转小写）
+function fileStem(name) {
+  let n = (name || '').toLowerCase();
+  if (n.endsWith('.jar.disabled')) n = n.slice(0, -'.jar.disabled'.length);
+  else if (n.endsWith('.jar')) n = n.slice(0, -'.jar'.length);
+  return n;
+}
+// 已安装判定：哈希/指纹精确匹配，或名称与已装文件名前缀吻合（手动安装的模组）
+function modNameInstalled(name) {
+  if (!name || !modDL.installedNames) return false;
+  const key = String(name).toLowerCase().replace(/[\s_]+/g, '-');
+  if (!key) return false;
+  for (const n of modDL.installedNames) {
+    if (n === key || n.startsWith(key + '-')) return true;
+  }
+  return false;
+}
+function modInstalled(m) {
+  return modDL.installed.has(m.id) || modNameInstalled(m.slug);
 }
 async function searchMods() {
   const res = $('#md-results');
@@ -1152,7 +1188,8 @@ function renderModResults() {
   if (!modDL.results.length) { res.innerHTML = '<div class="empty">没有搜索结果</div>'; return; }
   res.innerHTML = `<table class="table"><thead><tr><th>模组</th><th>下载量</th><th>操作</th></tr></thead><tbody>` +
     modDL.results.map((m, i) => {
-      const installed = modDL.installed.has(m.id);
+      const installedExact = modDL.installed.has(m.id);
+      const installed = installedExact || modNameInstalled(m.slug);
       const inQueue = modDL.queue.some(q => q.projectId === m.id);
       const expanded = modDL.expanded === i;
       const side = modDL.sides[m.id];
@@ -1164,6 +1201,9 @@ function renderModResults() {
           ? '<span class="pill st-running" style="font-size:10px;padding:1px 8px">仅服务端</span>'
           : '';
       const dis = blocked ? `disabled title="纯客户端模组（或标注不支持服务端），服务器无需下载"` : '';
+      const qDis = inQueue || installedExact
+        ? `disabled title="${inQueue ? '已在下载队列中' : '已安装（文件哈希匹配）。如需强制重装，请展开版本列表选择具体版本'}"`
+        : '';
       return `<tr><td>
           ${m.icon ? `<img src="${esc(m.icon)}" style="width:24px;height:24px;vertical-align:-6px;margin-right:6px" onerror="this.remove()">` : ''}
           <b>${esc(m.name)}</b>
@@ -1175,7 +1215,7 @@ function renderModResults() {
         <td class="muted">${m.downloads.toLocaleString()}</td>
         <td>
           <button class="btn small" onclick="toggleModVersions(${i})">版本 ▾</button>
-          <button class="btn small primary" onclick="addLatestToQueue(${i})" ${inQueue || blocked ? 'disabled' : ''} ${dis}>+ 队列</button>
+          <button class="btn small primary" onclick="addLatestToQueue(${i})" ${inQueue || installedExact || blocked ? 'disabled' : ''} ${dis || qDis}>+ 队列</button>
         </td></tr>` +
         (expanded ? `<tr><td colspan="3" style="background:var(--row-hover)"><div id="md-versions" class="muted small">加载版本中…</div></td></tr>` : '');
     }).join('') + '</tbody></table>';
@@ -1195,10 +1235,12 @@ async function loadVersionsInline(i) {
     if (!d.versions.length) { el.innerHTML = '<span>没有匹配当前版本/加载器的文件，可放宽过滤条件</span>'; return; }
     el.innerHTML = d.versions.slice(0, 8).map((v, vi) => {
       const clientOnly = v.environment === 'client_only';
+      const sameFile = modDL.installedNames && modDL.installedNames.has(fileStem(v.filename));
       return `<div class="row between" style="padding:6px 0;border-bottom:1px solid var(--border)">
       <div><span class="mono small"><b>${esc(v.name)}</b> · ${esc(v.filename)}</span> <span class="muted small">${esc((v.date || '').slice(0, 10))}</span>
+        ${sameFile ? '<span class="pill st-running" style="font-size:10px;padding:1px 8px">已安装</span>' : ''}
         ${clientOnly ? '<span class="pill st-warn" style="font-size:10px;padding:1px 8px">纯客户端</span>' : ''}</div>
-      <button class="btn small primary" onclick="addToQueue(${i},${vi})" ${clientOnly ? 'disabled title="纯客户端版本，服务器无需下载"' : ''}>+ 队列</button></div>`;
+      <button class="btn small primary" onclick="addToQueue(${i},${vi})" ${clientOnly || sameFile ? 'disabled' : ''} title="${sameFile ? 'mods 目录已存在同名文件' : ''}">+ 队列</button></div>`;
     }).join('');
   } catch (e) {
     const el = $('#md-versions');
@@ -1229,6 +1271,10 @@ async function addToQueue(ri, vi, dep) {
   if (item.environment === 'client_only') {
     return toast('该版本为纯客户端版本，服务器无需下载', false);
   }
+  // mods 目录已存在同名文件：跳过，避免重复下载处理
+  if (modDL.installedNames && modDL.installedNames.has(fileStem(item.filename))) {
+    return toast('mods 目录已存在同名文件，无需重复下载', false);
+  }
   const pushed = await queuePush({
     source: modDL.source,
     projectId: m.id,
@@ -1236,6 +1282,7 @@ async function addToQueue(ri, vi, dep) {
     name: item.name,
     filename: item.filename,
     url: item.url,
+    sha1: item.sha1 || '',
     dependencies: item.dependencies || [],
     dep: !!dep,
   }, !!dep);
@@ -1244,7 +1291,10 @@ async function addToQueue(ri, vi, dep) {
   renderModQueue();
 }
 async function queuePush(item, dep) {
-  if (modDL.queue.some(q => q.filename === item.filename)) return false;
+  // 同一项目（同来源）或同一文件名只入队一次
+  if (modDL.queue.some(q =>
+    (q.source === item.source && q.projectId && q.projectId === item.projectId) ||
+    q.filename === item.filename)) return false;
   modDL.queue.push(item);
   renderModQueue();
   // 自动解析前置依赖（仅 Modrinth 提供依赖信息）
@@ -1253,22 +1303,26 @@ async function queuePush(item, dep) {
     if (d.dependency_type !== 'required') continue;
     if (modDL.queue.some(q => q.projectId === d.project_id)) continue;
     if (modDL.installed.has(d.project_id)) continue;
+    // 前置依赖的文件已存在时同样跳过
+    let v = null;
     try {
       const dv = await api(`/moddb/versions?source=modrinth&project=${encodeURIComponent(d.project_id)}&game=${encodeURIComponent(modDL.game)}&loader=${encodeURIComponent(modDL.loader)}`);
-      const v = dv.versions.find(x => x.environment !== 'client_only');
-      if (!v) continue;
-      await queuePush({
-        source: 'modrinth',
-        projectId: d.project_id,
-        projectName: v.filename,
-        name: v.name,
-        filename: v.filename,
-        url: v.url,
-        dependencies: v.dependencies || [],
-        dep: true,
-      }, true);
-      toast(`已自动添加前置依赖：${v.filename}`);
-    } catch {}
+      v = dv.versions.find(x => x.environment !== 'client_only');
+    } catch { continue; }
+    if (!v) continue;
+    if (modDL.installedNames && modDL.installedNames.has(fileStem(v.filename))) continue;
+    await queuePush({
+      source: 'modrinth',
+      projectId: d.project_id,
+      projectName: v.filename,
+      name: v.name,
+      filename: v.filename,
+      url: v.url,
+      sha1: v.sha1 || '',
+      dependencies: v.dependencies || [],
+      dep: true,
+    }, true);
+    toast(`已自动添加前置依赖：${v.filename}`);
   }
   return true;
 }
@@ -1330,6 +1384,8 @@ async function downloadQueue() {
   const ok = modDL.queue.filter(q => q.status === 'done').length;
   const bad = modDL.queue.filter(q => q.status === 'error').length;
   toast(`批量下载完成：成功 ${ok}，失败 ${bad}`, bad === 0);
+  // 刷新已安装标记与文件名集合，避免再次搜索时误判
+  loadInstalledMods();
   // 实例运行中才提示重启
   try {
     const s = await api(`/instances/${modDL.id}/status`);

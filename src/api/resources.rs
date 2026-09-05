@@ -11,6 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -449,27 +450,60 @@ pub async fn mods_hashes(
                 continue;
             }
             let path = e.path();
-            let sha1 = tokio::task::spawn_blocking(move || {
+            let (sha1, murmur) = tokio::task::spawn_blocking(move || {
                 use sha1::{Digest, Sha1};
-                let mut f = std::fs::File::open(&path).ok()?;
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)
+                    .ok()?
+                    .read_to_end(&mut bytes)
+                    .ok()?;
                 let mut hasher = Sha1::new();
-                std::io::copy(&mut f, &mut hasher).ok()?;
-                Some(format!("{:x}", hasher.finalize()))
+                hasher.update(&bytes);
+                let sha1 = format!("{:x}", hasher.finalize());
+                let murmur = crate::instance::moddb::murmur2(&bytes).to_string();
+                Some((sha1, murmur))
             })
             .await
             .unwrap_or(None)
             .unwrap_or_default();
-            out.push(json!({ "filename": filename, "sha1": sha1 }));
+            out.push(json!({ "filename": filename, "sha1": sha1, "murmur2": murmur }));
         }
     }
     Ok(Json(json!({ "files": out })))
 }
 
-/// 通过 SHA1 批量查询 Modrinth 版本（识别已安装）
+/// 通过哈希批量查询已安装模组（modrinth: SHA1 → 版本；curseforge: murmur2 指纹 → 项目ID）
 pub async fn moddb_version_files(
     State(state): State<AppState>,
     Json(req): Json<ModDownloadReq2>,
 ) -> ApiResult<Json<Value>> {
+    let source = req.source.as_deref().unwrap_or("modrinth");
+    if source == "curseforge" {
+        let prints: Vec<u32> =
+            req.hashes.iter().filter_map(|s| s.parse::<u32>().ok()).collect();
+        if prints.is_empty() {
+            return Ok(Json(json!({})));
+        }
+        let v = crate::instance::moddb::cf_fingerprints(&state, &prints)
+            .await
+            .map_err(ApiError::bad_request)?;
+        // 归一化为 { "<指纹>": { "project_id": "<modId>" } }
+        let mut out = json!({});
+        if let Some(arr) = v.pointer("/data/exactFingerprints").and_then(|x| x.as_array()) {
+            for e in arr {
+                let fp = e.get("id").and_then(|x| x.as_u64()).unwrap_or(0).to_string();
+                let pid = e
+                    .pointer("/file/modId")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0)
+                    .to_string();
+                if fp != "0" && pid != "0" {
+                    out[fp.as_str()] = json!({ "project_id": pid });
+                }
+            }
+        }
+        return Ok(Json(out));
+    }
     let v = crate::instance::moddb::version_files(&state, &req.hashes)
         .await
         .map_err(ApiError::bad_request)?;
@@ -478,6 +512,8 @@ pub async fn moddb_version_files(
 
 #[derive(Deserialize)]
 pub struct ModDownloadReq2 {
+    #[serde(default)]
+    pub source: Option<String>,
     pub hashes: Vec<String>,
 }
 
