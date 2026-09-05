@@ -326,15 +326,9 @@ pub async fn push_log(rt: &Arc<InstanceRuntime>, line: String) {
 /// 检测端口绑定失败，给出中文提示
 fn port_bind_hint(line: &str) -> Option<String> {
     if line.contains("FAILED TO BIND TO PORT") || line.contains("BindException") {
-        let port = regex::Regex::new(r#"(?:on \*:|port )"?(\d{4,5})"?)
-            .ok()?
-            .captures(line)?
-            .get(1)?
-            .as_str()
-            .to_string();
-        return Some(format!(
-            "[面板] 端口 {port} 已被占用！可能原因：① 另一个服务器实例正在使用同一端口；② 之前的服务器进程未完全退出。请修改 server.properties 中的 server-port，或关闭占用端口的进程。"
-        ));
+        return Some(
+            "[面板] 端口已被占用！可能原因：① 另一个服务器实例正在使用同一端口；② 之前的服务器进程未完全退出。请修改 server.properties 中的 server-port，或关闭占用端口的进程。".to_string(),
+        );
     }
     None
 }
