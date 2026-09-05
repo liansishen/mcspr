@@ -329,7 +329,7 @@ pub async fn install(
     }
 }
 
-async fn install_inner(
+pub(crate) async fn install_inner(
     state: &AppState,
     job_id: &str,
     instance_id: &str,

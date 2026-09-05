@@ -46,7 +46,7 @@ fn http(state: &AppState) -> &reqwest::Client {
     &state.http
 }
 
-async fn cf_key(state: &AppState) -> Result<String, String> {
+pub(crate) async fn cf_key(state: &AppState) -> Result<String, String> {
     let key = state.config.read().await.curseforge_api_key.clone();
     if key.trim().is_empty() {
         return Err("CurseForge 需要API Key：请在「面板设置」中填写（console.curseforge.com 可免费创建），或改用 Modrinth".into());
@@ -403,6 +403,41 @@ pub fn murmur2(data: &[u8]) -> u32 {
     h = h.wrapping_mul(M);
     h ^= h >> 15;
     h
+}
+
+/// 批量解析 CurseForge 文件 ID → (fileID, fileName, downloadUrl, sha1)
+pub async fn cf_resolve_files(
+    state: &AppState,
+    file_ids: &[i64],
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    let key = cf_key(state).await?;
+    let req = http(state)
+        .post("https://api.curseforge.com/v1/mods/files")
+        .header("x-api-key", &key)
+        .json(&json!({ "fileIds": file_ids }))
+        .timeout(Duration::from_secs(40));
+    let v = send_json(req).await?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+        for e in arr {
+            let id = e.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
+            let name = e.get("fileName").and_then(|x| x.as_str()).unwrap_or("").into();
+            let url = e.get("downloadUrl").and_then(|x| x.as_str()).unwrap_or("").into();
+            // hashes: [{value, algorithm}]，1 = SHA1
+            let sha1 = e
+                .get("hashes")
+                .and_then(|x| x.as_array())
+                .and_then(|hs| {
+                    hs.iter()
+                        .find(|h| h.get("algorithm").and_then(|a| a.as_i64()) == Some(1))
+                        .and_then(|h| h.get("value").and_then(|v| v.as_str()))
+                })
+                .unwrap_or("")
+                .to_string();
+            out.push((id, name, url, sha1));
+        }
+    }
+    Ok(out)
 }
 
 /// 通过 murmur2 指纹批量查询 CurseForge 模组（识别已安装），返回 {指纹: 项目ID}

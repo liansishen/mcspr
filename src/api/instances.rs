@@ -542,6 +542,91 @@ pub async fn import_upload(
     Ok(Json(json!({ "job_id": job_id })))
 }
 
+#[derive(Deserialize)]
+pub struct ModpackApplyReq {
+    pub preview_id: String,
+    #[serde(default)]
+    pub backup: bool,
+    #[serde(default = "default_orphan_mode")]
+    pub orphan_mode: String, // keep | disable | delete
+    #[serde(default = "default_true")]
+    pub allow_reinstall: bool,
+}
+fn default_orphan_mode() -> String {
+    "disable".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+/// 上传整合包 zip 并解析为更新预览（临时目录 + pack_cache.json）
+pub async fn modpack_preview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> ApiResult<Json<serde_json::Value>> {
+    get_instance(&state, &id).await?;
+    let mut zip_path: Option<PathBuf> = None;
+    while let Some(mut field) = multipart.next_field().await? {
+        if field.name().unwrap_or("") == "file" {
+            let tmp = std::env::temp_dir().join(format!("mcspr_packupload_{}.zip", uuid::Uuid::new_v4()));
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            while let Some(chunk) = field.chunk().await? {
+                f.write_all(&chunk).await?;
+            }
+            f.flush().await?;
+            drop(f);
+            zip_path = Some(tmp);
+        }
+    }
+    let Some(zip_path) = zip_path else {
+        return Err(ApiError::bad_request("请上传整合包 zip 文件"));
+    };
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let preview = crate::instance::modpack::preview_modpack(&state, &zip_path, &preview_id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let _ = tokio::fs::remove_file(&zip_path).await;
+    Ok(Json(serde_json::to_value(preview).unwrap_or_else(|_| json!({}))))
+}
+
+/// 按预览结果执行整合包更新（后台任务）
+pub async fn modpack_apply(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ModpackApplyReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    if *rt.status.lock().await != Status::Stopped {
+        return Err(ApiError::bad_request("更新前请先停止实例"));
+    }
+    if !matches!(req.orphan_mode.as_str(), "keep" | "disable" | "delete") {
+        return Err(ApiError::bad_request("orphan_mode 仅支持 keep / disable / delete"));
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), Job::new(job_id.clone()));
+    let st2 = state.clone();
+    let jid = job_id.clone();
+    let iid = id.clone();
+    let pid = req.preview_id.clone();
+    let backup = req.backup;
+    let reinstall = req.allow_reinstall;
+    let om = req.orphan_mode.clone();
+    tokio::spawn(async move {
+        let r =
+            crate::instance::modpack::apply_modpack_update(&st2, &jid, &iid, &pid, backup, &om, reinstall).await;
+        match r {
+            Ok(()) => finish_job(&st2, &jid, None, Some(iid)),
+            Err(e) => finish_job(&st2, &jid, Some(e), Some(iid)),
+        }
+    });
+    Ok(Json(json!({ "job_id": job_id })))
+}
+
 pub async fn get_job(
     State(state): State<AppState>,
     Path(jid): Path<String>,

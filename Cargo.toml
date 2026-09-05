@@ -1,6 +1,6 @@
 [package]
 name = "mcspr"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 description = "MCS Panel - Minecraft 服务端管理面板"
 

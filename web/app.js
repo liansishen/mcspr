@@ -771,7 +771,155 @@ function actionButtons(id, status) {
     `<button class="btn" onclick="instRestart('${id}')">⟳ 重启</button>`);
   else parts.push(`<span class="muted small">停止中…</span>`);
   parts.push(`<button class="btn ghost" onclick="openFolder('${id}')">打开目录</button>`);
+  parts.push(`<button class="btn ghost" onclick="showModpackUpdate('${id}')">⤒ 更新整合包</button>`);
   return parts.join('');
+}
+
+/* ---------------- 更新整合包 ---------------- */
+let mpUp = null;
+
+function showModpackUpdate(id) {
+  id = id || (currentInstanceInfo && currentInstanceInfo.id);
+  const meta = currentInstanceInfo || {};
+  mpUp = { id, preview: null, currentMods: [] };
+  showModal(`<h2>⤒ 更新整合包</h2>
+    <p class="muted small" style="margin:0 0 10px">选择新版本的整合包 zip，解析后先预览差异再执行。world 存档、server.properties 与实例设置不会被改动；更新前要求实例已停止。</p>
+    <label>整合包 zip 文件<input type="file" id="mu-file" accept=".zip" style="margin:6px 0 10px"></label>
+    <label>整合包未包含的模组<select id="mu-orphan">
+      <option value="disable">禁用（改名 .disabled，可恢复）【推荐】</option>
+      <option value="keep">保留不动</option>
+      <option value="delete">直接删除</option>
+    </select></label>
+    <div id="mu-progress" style="display:none;margin:10px 0">
+      <div class="bar"><i id="mu-bar" style="width:40%"></i></div>
+      <div class="muted small" id="mu-status">解析中…</div>
+    </div>
+    <div id="mu-preview"></div>
+    <div class="row right" style="margin-top:12px" id="mu-actions">
+      <button class="btn ghost" onclick="closeModal()">取消</button>
+      <button class="btn primary" id="mu-go" onclick="parseModpackPreview()">① 解析预览</button>
+    </div>`);
+  // 预取当前模组列表，用于差异计算
+  api(`/instances/${id}/mods`).then(d => { mpUp.currentMods = (d.mods || []).map(m => m.file); }).catch(() => {});
+}
+
+async function parseModpackPreview() {
+  const fileInput = document.getElementById('mu-file');
+  const f = fileInput && fileInput.files[0];
+  if (!f) return toast('请选择整合包 zip 文件', false);
+  if (currentInstanceInfo && currentInstanceInfo.status !== 'stopped') {
+    return toast('更新前请先停止实例', false);
+  }
+  const fd = new FormData();
+  fd.append('file', f);
+  const bar = document.getElementById('mu-bar');
+  const st = document.getElementById('mu-status');
+  document.getElementById('mu-progress').style.display = '';
+  if (bar) bar.style.width = '40%';
+  if (st) st.textContent = '上传并解析整合包…（大包可能需要一些时间）';
+  try {
+    mpUp.preview = await api(`/instances/${mpUp.id}/modpack/preview`, { method: 'POST', body: fd });
+    if (bar) bar.style.width = '100%';
+    if (st) st.textContent = '解析完成';
+    renderModpackPreview();
+  } catch (e) {
+    document.getElementById('mu-progress').style.display = 'none';
+    toast(e.message, false);
+  }
+}
+
+function renderModpackPreview() {
+  const p = mpUp.preview;
+  if (!p) return;
+  const current = new Set(mpUp.currentMods.map(x => x.toLowerCase()));
+  const packNames = p.mods.map(m => m.filename);
+  const packLower = new Set(packNames.map(x => x.toLowerCase()));
+  const added = packNames.filter(n => !current.has(n.toLowerCase()));
+  const sameName = packNames.filter(n => current.has(n.toLowerCase()));
+  const removed = mpUp.currentMods.filter(n => {
+    const low = n.toLowerCase();
+    const base = low.endsWith('.disabled') ? low.slice(0, -9) : low;
+    return !packLower.has(base);
+  });
+  const loaderChanged = p.loader && p.loader !== (currentInstanceInfo?.mod_loader || '');
+  const mcChanged = p.mc_version && p.mc_version !== (currentInstanceInfo?.mc_version || '');
+  const el = document.getElementById('mu-preview');
+  el.innerHTML = `<div class="card" style="padding:10px 14px;margin-top:8px">
+    <div class="row between"><b>${esc(p.name)}</b>
+      <span class="muted small">${{ curseforge: 'CurseForge 包', modrinth: 'Modrinth 包', generic: '通用服务端包' }[p.pack_type] || p.pack_type}</span></div>
+    <div class="muted small" style="margin:4px 0 8px">
+      MC ${esc(p.mc_version || '未声明')} · 加载器 ${esc(p.loader || '无')}${p.loader_version ? ' ' + esc(p.loader_version) : ''}
+      ${loaderChanged ? '<span class="pill st-warn">加载器将变化</span>' : ''}
+      ${mcChanged ? '<span class="pill st-warn">MC 版本将变化（自动重装加载器）</span>' : ''}
+    </div>
+    <div class="small" style="line-height:1.9">
+      模组：<b>${p.mods.length}</b> 个（新增 ${added.length}，同名覆盖 ${sameName.length}）
+      ${removed.length ? `· 包外 ${removed.length} 个将按所选方式处理` : '· 无包外模组'}
+      ${p.overrides_files ? `· 配置/资源覆盖 <b>${p.overrides_files}</b> 个文件` : ''}
+    </div>
+    ${(added.length || removed.length) ? `<details style="margin-top:6px"><summary class="muted small" style="cursor:pointer">查看明细</summary>
+      ${added.length ? `<div class="mono small" style="margin-top:6px;max-height:150px;overflow:auto">新增/更新：${added.map(n => esc(n)).join('、')}</div>` : ''}
+      ${removed.length ? `<div class="mono small" style="margin-top:6px;max-height:100px;overflow:auto">包外：${removed.map(n => esc(n)).join('、')}</div>` : ''}
+    </details>` : ''}
+    ${p.cf_unresolved ? `<div class="banner warn" style="padding:8px 12px;margin-top:8px">有 ${p.cf_unresolved} 个 CurseForge 模组未能解析（请检查面板设置中的 CurseForge API Key），将无法下载。</div>` : ''}
+  </div>`;
+  document.getElementById('mu-actions').innerHTML = `
+    <button class="btn ghost" onclick="closeModal()">取消</button>
+    <button class="btn primary" id="mu-go" onclick="startModpackUpdate()">② 开始更新</button>`;
+}
+
+function askModpackBackup() {
+  return new Promise(resolve => {
+    const root = dlgLayer();
+    root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:420px">
+      <h3 style="margin:0 0 10px">更新前备份</h3>
+      <div>更新整合包前是否先备份实例？<div class="muted small" style="margin-top:6px">备份为完整 tar.gz，保存在「备份」页，可随时恢复回滚。</div></div>
+      <div class="row right" style="margin-top:14px">
+        <button class="btn ghost" data-dlg="cancel">取消更新</button>
+        <button class="btn" data-dlg="no">直接更新</button>
+        <button class="btn primary" data-dlg="yes">备份并更新</button></div></div></div>`;
+    const finish = v => { root.innerHTML = ''; resolve(v); };
+    root.querySelectorAll('[data-dlg]').forEach(btn =>
+      btn.addEventListener('click', () => finish(btn.getAttribute('data-dlg'))));
+  });
+}
+
+async function startModpackUpdate() {
+  const p = mpUp && mpUp.preview;
+  if (!p) return;
+  const choice = await askModpackBackup();
+  if (choice === 'cancel') return;
+  document.getElementById('mu-preview').innerHTML = '';
+  document.getElementById('mu-progress').style.display = '';
+  const bar = document.getElementById('mu-bar');
+  const st = document.getElementById('mu-status');
+  if (bar) { bar.style.width = '30%'; bar.classList.add('indeterminate'); }
+  if (st) st.textContent = choice === 'yes' ? '正在执行更新（先备份）…' : '正在执行更新…';
+  const go = document.getElementById('mu-go');
+  if (go) go.disabled = true;
+  try {
+    const r = await api(`/instances/${mpUp.id}/modpack/apply`, {
+      method: 'POST',
+      body: {
+        preview_id: p.preview_id,
+        backup: choice === 'yes',
+        orphan_mode: document.getElementById('mu-orphan') ? document.getElementById('mu-orphan').value : 'disable',
+        allow_reinstall: true,
+      },
+    });
+    await pollJob(r.job_id, j => {
+      if (st) {
+        st.textContent = j.logs.slice(-1)[0] || '更新中…';
+        if (bar) bar.style.width = Math.max(30, Math.min(95, 30 + j.logs.length * 2)) + '%';
+      }
+    });
+    if (bar) bar.style.width = '100%';
+    if (st) st.textContent = '✅ 更新完成';
+    toast('整合包更新完成', true);
+  } catch (e) {
+    if (st) st.textContent = '更新失败：' + e.message;
+    toast(e.message, false);
+  }
 }
 
 /* ---------------- 控制台 + 用户管理 ---------------- */

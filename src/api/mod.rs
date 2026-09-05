@@ -46,6 +46,8 @@ pub fn router(state: AppState) -> Router {
         .route("/moddb/projects", get(resources::moddb_projects))
         .route("/moddb/version-files", post(resources::moddb_version_files))
         .route("/instances/import/upload", post(instances::import_upload))
+        .route("/instances/{id}/modpack/preview", post(instances::modpack_preview))
+        .route("/instances/{id}/modpack/apply", post(instances::modpack_apply))
         .route("/instances/import/path", post(instances::import_path))
         .route("/jobs/{id}", get(instances::get_job))
         .route(
