@@ -248,9 +248,11 @@ function showCreateModal() {
     </div>
     <label>实例名称<input id="ci-name" placeholder="留空则自动命名"></label>
     <div id="create-vanilla">
-      <label>服务端版本（自动下载）
+      <label>大版本<select id="ci-ver-major" onchange="updateVanillaMinor()"><option value="">加载中…</option></select></label>
+      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-show-pre" onchange="updateVanillaMinor()"> 显示预览版 / 快照 / 预发布版本</label>
+      <label>具体版本（自动下载）
         <select id="ci-version"><option value="">不下载，稍后手动导入或配置</option></select>
-        <div class="muted small">从官方源下载对应服务端 jar 并配置为主程序（国内网络自动切换 BMCLAPI 镜像）。模组整合包请使用「导入整合包」。</div>
+        <div class="muted small">从官方源下载对应服务端 jar 并配置为主程序（国内网络自动切换 BMCLAPI 镜像）。模组整合包请使用「导入整合包」。版本按发布时间从新到旧排列。</div>
       </label>
     </div>
     <div id="create-modded" style="display:none">
@@ -270,7 +272,8 @@ function showCreateModal() {
         <div class="muted small">Fabric / Quilt：官方一键启动器。Forge / NeoForge：运行官方安装器（需要几分钟）。Paper / Purpur / Folia：插件服，装 Bukkit 系插件到 plugins/。Velocity / BungeeCord：代理端，用于群组服。安装完成后建议检查实例设置的 Java 是否满足要求。</div>
       </label>
       <div class="row" id="ci-loader-game-row">
-        <label style="flex:1">MC 版本<select id="ci-loader-game" onchange="loadLoaderVerList()"><option value="">加载中…</option></select></label>
+        <label style="flex:1">大版本<select id="ci-loader-game" onchange="updateLoaderMinor()"><option value="">加载中…</option></select></label>
+        <label style="flex:1">具体版本<select id="ci-loader-minor" onchange="syncLoaderGame()"><option value="">—</option></select></label>
         <label style="flex:1">服务端版本<select id="ci-loader-ver"><option value="">加载中…</option></select></label>
       </div>
     </div>
@@ -389,21 +392,10 @@ function fillVersionTwoLevel(majorSel, minorSel, allIds, selectedId) {
 async function loadVersionOptions() {
   try {
     var d = await api('/versions');
-    var sel = document.getElementById('ci-version');
-    if (!sel) return;
-    // 分离正式版与快照
-    var releases = d.versions.filter(function(v) { return v.type === 'release'; }).map(function(v) { return v.id; });
-    var snaps = d.versions.filter(function(v) { return v.type === 'snapshot'; }).map(function(v) { return v.id; });
-    var all = releases.concat(snaps);
-    // 大版本下拉（正式版分组）
-    var gv = groupVersions(releases);
-    var majorSel = document.getElementById('ci-ver-major');
-    majorSel.innerHTML = gv.order.map(function(g) {
-      return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
-    }).join('');
-    // 具体版本下拉（随大版本联动：正式版 + 同期快照）
-    window._vanillaAll = all;
-    window._vanillaGroups = gv.groups;
+    // 存储全部版本（含 release_time），按发布时间从新到旧排序
+    window._mcVersions = (d.versions || []).slice().sort(function(a, b) {
+      return (b.release_time || '').localeCompare(a.release_time || '');
+    });
     updateVanillaMinor();
   } catch (e) {
     var sel = document.getElementById('ci-version');
@@ -414,19 +406,18 @@ function updateVanillaMinor() {
   var majorSel = document.getElementById('ci-ver-major');
   var minorSel = document.getElementById('ci-version');
   if (!majorSel || !minorSel) return;
+  var showPre = document.getElementById('ci-show-pre') ? document.getElementById('ci-show-pre').checked : false;
+  var all = window._mcVersions || [];
+  var filtered = showPre ? all : all.filter(function(v) { return v.type === 'release'; });
+  var ids = filtered.map(function(v) { return v.id; });
+  var gv = groupVersions(ids);
+  majorSel.innerHTML = gv.order.map(function(g) {
+    return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
+  }).join('');
   var g = majorSel.value;
-  var inGroup = window._vanillaGroups ? (window._vanillaGroups[g] || []) : [];
-  // 也包含同期的快照版本
-  var snapInGroup = [];
-  if (window._vanillaAll) {
-    for (var i = 0; i < window._vanillaAll.length; i++) {
-      var v = window._vanillaAll[i];
-      if (v.indexOf(g) === 0 && inGroup.indexOf(v) < 0) snapInGroup.push(v);
-    }
-  }
-  var all = inGroup.concat(snapInGroup);
+  var list = gv.groups[g] || [];
   minorSel.innerHTML = '<option value="">不下载，稍后手动导入或配置</option>' +
-    all.map(function(v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('');
+    list.map(function(v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('');
 }
 function pollJob(jobId, onUpdate) {
   return new Promise((resolve, reject) => {
@@ -446,7 +437,7 @@ async function doCreate() {
   const body = {};
   if (createMode === 'modded') {
     const loader = $('#ci-loader').value;
-    const game = $('#ci-loader-game').value;
+    const game = $('#ci-loader-minor') ? $('#ci-loader-minor').value : ($('#ci-loader-game') ? $('#ci-loader-game').value : '');
     const lver = $('#ci-loader-ver').value;
     if (!game || !lver) return toast('版本列表尚未加载完成，请稍候', false);
     body.mc_version = game;
