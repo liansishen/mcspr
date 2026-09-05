@@ -821,7 +821,7 @@ pub async fn apply_modpack_update(
         }
     }
 
-    // 6. 更新实例元数据
+    // 6. 更新实例元数据（persist 内部会请求 meta 读锁，必须在写锁释放后调用，否则死锁）
     {
         let mut m = rt.meta.write().await;
         if !cache.mc_version.is_empty() {
@@ -830,9 +830,9 @@ pub async fn apply_modpack_update(
         if let Some(l) = &cache.loader {
             m.mod_loader = Some(l.clone());
         }
-        if let Err(e) = rt.persist().await {
-            log_job(state, job_id, format!("⚠ 实例信息写入失败: {e}"));
-        }
+    }
+    if let Err(e) = rt.persist().await {
+        log_job(state, job_id, format!("⚠ 实例信息写入失败: {e}"));
     }
 
     // 7. 清理临时目录
