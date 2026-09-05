@@ -29,6 +29,7 @@ pub struct ModVersionItem {
     pub filename: String,
     pub url: String,
     pub date: String,
+    pub sha1: String,
     pub environment: String,
     pub dependencies: Vec<ModDep>,
 }
@@ -225,6 +226,12 @@ pub async fn versions(
                                     .collect()
                             })
                             .unwrap_or_default(),
+                        sha1: file
+                            .get("hashes")
+                            .and_then(|h| h.get("sha1"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
                         environment: e
                             .get("environment")
                             .and_then(|x| x.as_str())
@@ -264,6 +271,7 @@ pub async fn versions(
                         filename,
                         url,
                         date: e.get("fileDate").and_then(|x| x.as_str()).unwrap_or("").into(),
+                        sha1: String::new(),
                         environment: String::new(),
                         dependencies: Vec::new(),
                     });
@@ -367,6 +375,7 @@ pub async fn download_mod(
     mods_dir: &std::path::Path,
     url: &str,
     filename: &str,
+    expected_sha1: &str,
 ) -> Result<u64, String> {
     if !url.starts_with("https://") {
         return Err("下载地址不合法".into());
@@ -385,6 +394,15 @@ pub async fn download_mod(
         return Err("文件过大（>1GB）".into());
     }
     let bytes = resp.bytes().await.map_err(|e| format!("下载中断: {e}"))?;
+    if !expected_sha1.is_empty() {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(&bytes);
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected_sha1 {
+            return Err(format!("SHA1 校验失败（预期 {expected_sha1}，实际 {actual}）"));
+        }
+    }
     tokio::fs::write(mods_dir.join(filename), &bytes)
         .await
         .map_err(|e| format!("写入失败: {e}"))?;

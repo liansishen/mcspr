@@ -387,6 +387,8 @@ pub async fn moddb_versions(
 pub struct ModDownloadReq {
     pub url: String,
     pub filename: String,
+    #[serde(default)]
+    pub sha1: String,
 }
 
 pub async fn mods_download(
@@ -406,7 +408,7 @@ pub async fn mods_download(
     }
     let dir = mods::mods_dir(&rt).await;
     tokio::fs::create_dir_all(&dir).await?;
-    let size = crate::instance::moddb::download_mod(&state, &dir, &req.url, &filename)
+    let size = crate::instance::moddb::download_mod(&state, &dir, &req.url, &filename, &req.sha1)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({ "ok": true, "filename": filename, "size": size })))

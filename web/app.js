@@ -249,7 +249,7 @@ function showCreateModal() {
     <label>实例名称<input id="ci-name" placeholder="留空则自动命名"></label>
     <div id="create-vanilla">
       <label>大版本<select id="ci-ver-major" onchange="updateVanillaMinor()"><option value="">加载中…</option></select></label>
-      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-show-pre" onchange="updateVanillaMinor()"> 显示预览版 / 快照 / 预发布版本</label>
+      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-show-pre" onchange="updateVanillaMajor();updateVanillaMinor()"> 显示预览版 / 快照 / 预发布版本</label>
       <label>具体版本（自动下载）
         <select id="ci-version"><option value="">不下载，稍后手动导入或配置</option></select>
         <div class="muted small">从官方源下载对应服务端 jar 并配置为主程序（国内网络自动切换 BMCLAPI 镜像）。模组整合包请使用「导入整合包」。版本按发布时间从新到旧排列。</div>
@@ -276,6 +276,7 @@ function showCreateModal() {
         <label style="flex:1">具体版本<select id="ci-loader-minor" onchange="syncLoaderGame()"><option value="">—</option></select></label>
         <label style="flex:1">服务端版本<select id="ci-loader-ver"><option value="">加载中…</option></select></label>
       </div>
+      <label class="check" style="margin:4px 0"><input type="checkbox" id="ci-mod-pre" onchange="loadLoaderVersions()"> 显示预览版 / 快照版本</label>
     </div>
     <div id="ci-progress" style="display:none">
       <h3>安装进度</h3>
@@ -309,7 +310,10 @@ async function loadLoaderVersions() {
   if (minorLbl) minorLbl.style.display = isProxy ? 'none' : '';
   try {
     var g = await api('/loaders/' + loader + '/game-versions');
-    var ids = g.versions.map(function(v) { return v.id; });
+    var showPre = document.getElementById('ci-mod-pre') ? document.getElementById('ci-mod-pre').checked : true;
+    var all = g.versions;
+    var filtered = showPre ? all : all.filter(function(v) { return v.stable; });
+    var ids = filtered.map(function(v) { return v.id; });
     var gv = groupVersions(ids);
     var majorSel = document.getElementById('ci-loader-game');
     var minorSel = document.getElementById('ci-loader-minor');
@@ -396,6 +400,7 @@ async function loadVersionOptions() {
     window._mcVersions = (d.versions || []).slice().sort(function(a, b) {
       return (b.release_time || '').localeCompare(a.release_time || '');
     });
+    updateVanillaMajor();
     updateVanillaMinor();
   } catch (e) {
     var sel = document.getElementById('ci-version');
@@ -407,17 +412,31 @@ function updateVanillaMinor() {
   var minorSel = document.getElementById('ci-version');
   if (!majorSel || !minorSel) return;
   var showPre = document.getElementById('ci-show-pre') ? document.getElementById('ci-show-pre').checked : false;
+  var g = majorSel.value;
+  var all = window._mcVersions || [];
+  // 根据选中的大版本过滤具体版本
+  var inGroup = all.filter(function(v) {
+    if (showPre === false && v.type !== 'release') return false;
+    var parts = v.id.split(/[.\-]/);
+    var group = parts.length >= 2 ? parts[0] + '.' + parts[1] : v.id;
+    return group === g;
+  });
+  minorSel.innerHTML = '<option value="">不下载，稍后手动导入或配置</option>' +
+    inGroup.map(function(v) { return '<option value="' + esc(v.id) + '">' + esc(v.id) + '</option>'; }).join('');
+}
+function updateVanillaMajor() {
+  var majorSel = document.getElementById('ci-ver-major');
+  if (!majorSel) return;
+  var showPre = document.getElementById('ci-show-pre') ? document.getElementById('ci-show-pre').checked : false;
   var all = window._mcVersions || [];
   var filtered = showPre ? all : all.filter(function(v) { return v.type === 'release'; });
   var ids = filtered.map(function(v) { return v.id; });
   var gv = groupVersions(ids);
+  var prev = majorSel.value;
   majorSel.innerHTML = gv.order.map(function(g) {
     return '<option value="' + esc(g) + '">' + esc(g) + '</option>';
   }).join('');
-  var g = majorSel.value;
-  var list = gv.groups[g] || [];
-  minorSel.innerHTML = '<option value="">不下载，稍后手动导入或配置</option>' +
-    list.map(function(v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('');
+  if (prev && gv.order.includes(prev)) majorSel.value = prev;
 }
 function pollJob(jobId, onUpdate) {
   return new Promise((resolve, reject) => {
@@ -1277,7 +1296,7 @@ async function downloadQueue() {
     try {
       const r = await api(`/instances/${modDL.id}/mods/download`, {
         method: 'POST',
-        body: { url: q.url, filename: q.filename },
+        body: { url: q.url, filename: q.filename, sha1: q.sha1 || '' },
       });
       q.status = 'done';
       q.size = r.size;
