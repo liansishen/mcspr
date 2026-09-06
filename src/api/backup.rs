@@ -17,13 +17,31 @@ pub async fn list(
     Ok(Json(json!({ "backups": backup::list(&dir) })))
 }
 
+/// Content-Disposition 头：清洗文件名中的控制字符与引号，非法时回退通用值
+pub fn safe_disposition(name: &str) -> axum::http::HeaderValue {
+    let clean: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect();
+    axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{clean}\""))
+        .unwrap_or(axum::http::HeaderValue::from_static("attachment"))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rt = get_instance(&state, &id).await?;
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
+    }
+    let rt = match get_instance(&state, &id).await {
+        Ok(rt) => rt,
+        Err(e) => { state.release_busy(&id); return Err(e); }
+    };
     let iname = rt.meta.read().await.name.clone();
-    let name = match backup::create(&state, &rt).await {
+    let result = backup::create(&state, &rt).await;
+    state.release_busy(&id);
+    let name = match result {
         Ok(n) => n,
         Err(e) => {
             crate::alerts::send(&state, &format!("backup-{id}"), format!("实例「{iname}」备份失败: {e}")).await;
@@ -49,8 +67,7 @@ pub async fn download(
     );
     hm.insert(
         axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
-            .unwrap(),
+        safe_disposition(&name),
     );
     let body = axum::body::Body::from_stream(stream);
     let mut resp = Response::new(body);
@@ -76,13 +93,21 @@ pub async fn restore(
     if *rt.status.lock().await != crate::instance::Status::Stopped {
         return Err(ApiError::bad_request("恢复备份前请先停止实例"));
     }
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作正在进行，请稍候"));
+    }
     let bdir = crate::instance::backup::backups_dir(&state, &id).await;
-    let p = backup::backup_file(&bdir, &name).map_err(ApiError::bad_request)?;
+    let p = match backup::backup_file(&bdir, &name) {
+        Ok(p) => p,
+        Err(e) => { state.release_busy(&id); return Err(ApiError::bad_request(e)); }
+    };
     let dir = rt.dir.clone();
-    tokio::task::spawn_blocking(move || backup::restore(&dir, &p))
+    let r = tokio::task::spawn_blocking(move || backup::restore(&dir, &p))
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::bad_request)?;
+        .map_err(|e| ApiError::internal(e.to_string()))
+        .and_then(|r| r.map_err(ApiError::bad_request));
+    state.release_busy(&id);
+    r?;
     Ok(Json(json!({ "ok": true })))
 }
 

@@ -19,6 +19,25 @@ pub struct AppStateInner {
     pub size_cache: std::sync::Mutex<HashMap<String, (std::time::Instant, u64)>>,
     /// 告警去重 (key, 上次发送时间)
     pub alert_dedup: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// 实例级任务互斥：正在执行克隆/重装/更新/备份等整体操作的实例 ID
+    pub busy: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl AppStateInner {
+    /// 尝试占用实例（防止克隆/重装/更新等整体操作并发执行）
+    pub fn acquire_busy(&self, id: &str) -> bool {
+        self.busy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string())
+    }
+
+    pub fn release_busy(&self, id: &str) {
+        self.busy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+    }
 }
 
 #[derive(Clone)]
@@ -50,6 +69,7 @@ impl AppState {
             audit: Mutex::new(VecDeque::new()),
             size_cache: std::sync::Mutex::new(HashMap::new()),
             alert_dedup: std::sync::Mutex::new(HashMap::new()),
+            busy: std::sync::Mutex::new(std::collections::HashSet::new()),
         })))
     }
 }

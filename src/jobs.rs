@@ -31,19 +31,19 @@ impl Job {
 }
 
 pub fn log_job(state: &AppState, id: &str, msg: impl Into<String>) {
-    if let Some(j) = state.jobs.lock().unwrap().get_mut(id) {
+    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
         j.log(msg);
     }
 }
 
 pub fn set_progress(state: &AppState, id: &str, pct: u8) {
-    if let Some(j) = state.jobs.lock().unwrap().get_mut(id) {
+    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
         j.progress = pct;
     }
 }
 
 pub fn finish_job(state: &AppState, id: &str, err: Option<String>, instance_id: Option<String>) {
-    if let Some(j) = state.jobs.lock().unwrap().get_mut(id) {
+    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
         match err {
             Some(e) => {
                 j.status = "error".into();

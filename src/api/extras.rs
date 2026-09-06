@@ -34,8 +34,7 @@ pub async fn console_download(
     );
     resp.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"console-{id}.log\""))
-            .unwrap(),
+        crate::api::backup::safe_disposition(&format!("console-{id}.log")),
     );
     Ok(resp)
 }
@@ -70,6 +69,14 @@ pub struct CloneReq {
     pub name: String,
 }
 
+/// RAII：离开作用域自动释放实例占用（用于多错误返回路径的端点）
+pub struct BusyGuard<'a>(&'a AppState, String);
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release_busy(&self.1);
+    }
+}
+
 pub async fn clone_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -79,6 +86,10 @@ pub async fn clone_instance(
     if *rt.status.lock().await != crate::instance::Status::Stopped {
         return Err(ApiError::bad_request("克隆前请先停止实例"));
     }
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
+    }
+    let _guard = BusyGuard(&state, id.clone());
     let new_id = uuid::Uuid::new_v4().to_string();
     let new_dir = state.config.read().await.instances_dir().join(&new_id);
     let new_dir_clone = new_dir.clone();
@@ -160,6 +171,9 @@ pub async fn reinstall(
     if *rt.status.lock().await != crate::instance::Status::Stopped {
         return Err(ApiError::bad_request("重装前请先停止实例"));
     }
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
+    }
     let game = req.mc_version.trim().to_string();
     if game.is_empty() {
         return Err(ApiError::bad_request("请选择 MC 版本"));
@@ -198,6 +212,7 @@ pub async fn reinstall(
     tokio::spawn(async move {
         let Some(rt) = st2.instances.read().await.get(&iid).cloned() else {
             crate::jobs::finish_job(&st2, &jid, Some("实例不存在".into()), None);
+            st2.release_busy(&iid);
             return;
         };
         let _iname = rt.meta.read().await.name.clone();
@@ -212,6 +227,7 @@ pub async fn reinstall(
                         Some(format!("自动备份失败: {e}（已中止重装）")),
                         Some(iid.clone()),
                     );
+                    st2.release_busy(&iid);
                     return;
                 }
             }
@@ -221,6 +237,7 @@ pub async fn reinstall(
         } else {
             crate::instance::loaders::install(&st2, &jid, &iid, &loader_c, &game_c, &lver_c).await;
         }
+        st2.release_busy(&iid);
         crate::jobs::log_job(
             &st2,
             &jid,
@@ -305,11 +322,7 @@ pub async fn files_download(
     );
     resp.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&format!(
-            "attachment; filename=\"{}\"",
-            fname.replace('"', "")
-        ))
-        .unwrap(),
+        crate::api::backup::safe_disposition(&fname),
     );
     Ok(resp)
 }
@@ -414,7 +427,7 @@ pub async fn files_archive_download(
     );
     resp.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")).unwrap(),
+        crate::api::backup::safe_disposition(&name),
     );
     Ok(resp)
 }
@@ -439,32 +452,43 @@ pub async fn files_extract(
         .parent()
         .ok_or_else(|| ApiError::bad_request("无法确定目标目录"))?
         .to_path_buf();
+    // 解包可能涉及大文件，放阻塞线程执行，避免冻结整个面板
+    let r = tokio::task::spawn_blocking(move || extract_archive(&p, &parent))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let n = r.map_err(ApiError::bad_request)?;
+    Ok(Json(json!({ "ok": true, "files": n })))
+}
+
+fn extract_archive(p: &StdPath, parent: &StdPath) -> Result<u64, String> {
     let lower = p.to_string_lossy().to_lowercase();
-    let f = std::fs::File::open(&p).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut extracted: u64 = 0;
+    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
     if lower.ends_with(".zip") || lower.ends_with(".mrpack") {
-        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(f))
-            .map_err(|e| ApiError::internal(format!("读取 zip 失败: {e}")))?;
+        let mut archive =
+            zip::ZipArchive::new(std::io::BufReader::new(f)).map_err(|e| format!("读取 zip 失败: {e}"))?;
         let mut total: u64 = 0;
         for i in 0..archive.len() {
-            let e = archive.by_index(i).map_err(|err| ApiError::internal(err.to_string()))?;
+            let e = archive.by_index(i).map_err(|err| err.to_string())?;
             total += e.size();
             if total > 8 * 1024 * 1024 * 1024 {
-                return Err(ApiError::bad_request("解压总量超过 8GB 上限（疑似 zip 炸弹）"));
+                return Err("解压总量超过 8GB 上限（疑似 zip 炸弹）".into());
             }
         }
         for i in 0..archive.len() {
-            let mut e = archive.by_index(i).map_err(|err| ApiError::internal(err.to_string()))?;
+            let mut e = archive.by_index(i).map_err(|err| err.to_string())?;
             let Some(rel) = e.enclosed_name() else { continue };
             let out = parent.join(rel);
             if e.is_dir() {
-                std::fs::create_dir_all(&out).map_err(|err| ApiError::internal(err.to_string()))?;
+                std::fs::create_dir_all(&out).map_err(|err| err.to_string())?;
                 continue;
             }
             if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| ApiError::internal(err.to_string()))?;
+                std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
             }
-            let mut out_f = std::fs::File::create(&out).map_err(|err| ApiError::internal(err.to_string()))?;
-            std::io::copy(&mut e, &mut out_f).map_err(|err| ApiError::internal(err.to_string()))?;
+            let mut out_f = std::fs::File::create(&out).map_err(|err| err.to_string())?;
+            std::io::copy(&mut e, &mut out_f).map_err(|err| err.to_string())?;
+            extracted += 1;
         }
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar") {
         let raw: Box<dyn std::io::Read> = if lower.ends_with(".tar") {
@@ -476,29 +500,29 @@ pub async fn files_extract(
         let mut total: u64 = 0;
         for e in archive
             .entries()
-            .map_err(|e| ApiError::internal(format!("读取归档失败: {e}")))?
+            .map_err(|e| format!("读取归档失败: {e}"))?
             .flatten()
         {
             let mut e = e;
             let rel = e
                 .path()
-                .map_err(|err| ApiError::internal(err.to_string()))?
+                .map_err(|err| err.to_string())?
                 .to_string_lossy()
                 .replace('\\', "/");
             if rel.contains("..") || StdPath::new(&rel).is_absolute() {
-                return Err(ApiError::bad_request("归档包含不安全路径，已拒绝解压"));
+                return Err("归档包含不安全路径，已拒绝解压".into());
             }
             total += e.size();
             if total > 8 * 1024 * 1024 * 1024 {
-                return Err(ApiError::bad_request("解压总量超过 8GB 上限"));
+                return Err("解压总量超过 8GB 上限".into());
             }
-            e.unpack_in(&parent)
-                .map_err(|err| ApiError::internal(format!("解压失败: {err}")))?;
+            e.unpack_in(parent).map_err(|err| format!("解压失败: {err}"))?;
+            extracted += 1;
         }
     } else {
-        return Err(ApiError::bad_request("仅支持 zip / mrpack / tar.gz / tar"));
+        return Err("仅支持 zip / mrpack / tar.gz / tar".into());
     }
-    Ok(Json(json!({ "ok": true })))
+    Ok(extracted)
 }
 
 // ---------- 世界管理 ----------
@@ -518,28 +542,35 @@ pub async fn worlds_list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
     let current = current_level(&rt.dir);
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&rt.dir) {
-        for e in rd.flatten() {
-            if !e.path().is_dir() || !e.path().join("level.dat").exists() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().to_string();
-            let mut size = 0u64;
-            for f in walkdir::WalkDir::new(e.path()).into_iter().flatten() {
-                if let Ok(md) = f.metadata() {
-                    if md.is_file() {
-                        size += md.len();
+    // 世界目录大小需要递归遍历，放阻塞线程执行
+    let dir = rt.dir.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() || !e.path().join("level.dat").exists() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                let mut size = 0u64;
+                for f in walkdir::WalkDir::new(e.path()).into_iter().flatten() {
+                    if let Ok(md) = f.metadata() {
+                        if md.is_file() {
+                            size += md.len();
+                        }
                     }
                 }
+                out.push(json!({
+                    "name": name,
+                    "size": size,
+                    "current": name == current,
+                }));
             }
-            out.push(json!({
-                "name": name,
-                "size": size,
-                "current": name == current,
-            }));
         }
-    }
+        out
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "worlds": out, "running": *rt.status.lock().await != crate::instance::Status::Stopped })))
 }
 

@@ -286,7 +286,7 @@ pub async fn loader_versions(
 
 async fn forge_builds(state: &AppState) -> Result<Vec<String>, String> {
     {
-        let cache = state.forge_builds.lock().unwrap();
+        let cache = state.forge_builds.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, v)) = cache.as_ref() {
             if at.elapsed() < Duration::from_secs(600) {
                 return Ok(v.clone());
@@ -309,7 +309,7 @@ async fn forge_builds(state: &AppState) -> Result<Vec<String>, String> {
     if list.is_empty() {
         return Err("Forge 构建列表为空".into());
     }
-    *state.forge_builds.lock().unwrap() = Some((std::time::Instant::now(), list.clone()));
+    *state.forge_builds.lock().unwrap_or_else(|p| p.into_inner()) = Some((std::time::Instant::now(), list.clone()));
     Ok(list)
 }
 

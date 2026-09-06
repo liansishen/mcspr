@@ -377,7 +377,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
 
     let mut per_instance = serde_json::Map::new();
     let (cpu, mem_total, mem_used) = {
-        let mut sys = state.sys.lock().unwrap();
+        let mut sys = state.sys.lock().unwrap_or_else(|p| p.into_inner());
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         let pids: Vec<sysinfo::Pid> = pid_map
@@ -416,7 +416,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     };
     let mut sizes = serde_json::Map::new();
     for id in &instance_ids {
-        let cached = state.size_cache.lock().unwrap().get(id).cloned();
+        let cached = state.size_cache.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned();
         let bytes = match cached {
             Some((at, bytes)) if at.elapsed().as_secs() < 300 => bytes,
             _ => {
@@ -424,7 +424,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
                 let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
                     .await
                     .unwrap_or(0);
-                state.size_cache.lock().unwrap().insert(id.clone(), (std::time::Instant::now(), bytes));
+                state.size_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), (std::time::Instant::now(), bytes));
                 bytes
             }
         };
@@ -600,7 +600,11 @@ pub async fn modpack_apply(
     if *rt.status.lock().await != Status::Stopped {
         return Err(ApiError::bad_request("更新前请先停止实例"));
     }
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
+    }
     if !matches!(req.orphan_mode.as_str(), "keep" | "disable" | "delete") {
+        state.release_busy(&id);
         return Err(ApiError::bad_request("orphan_mode 仅支持 keep / disable / delete"));
     }
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -619,6 +623,7 @@ pub async fn modpack_apply(
     tokio::spawn(async move {
         let r =
             crate::instance::modpack::apply_modpack_update(&st2, &jid, &iid, &pid, backup, &om, reinstall).await;
+        st2.release_busy(&iid);
         match r {
             Ok(()) => finish_job(&st2, &jid, None, Some(iid)),
             Err(e) => finish_job(&st2, &jid, Some(e), Some(iid)),

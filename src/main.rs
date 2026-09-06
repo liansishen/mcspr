@@ -29,6 +29,29 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load_or_create()?;
     let app_state = state::AppState::new(cfg.clone()).await?;
 
+    // 清理上次运行遗留的整合包预览临时目录（超过 1 小时即过期）
+    {
+        let tmp = std::env::temp_dir();
+        if let Ok(rd) = std::fs::read_dir(&tmp) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !name.starts_with("mcspr_pack_") && !name.starts_with("mcspr_packupload_") {
+                    continue;
+                }
+                let expired = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().map(|d| d.as_secs() > 3600).unwrap_or(true))
+                    .unwrap_or(false);
+                if expired {
+                    let p = e.path();
+                    let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                    tracing::info!("已清理过期临时文件: {}", name);
+                }
+            }
+        }
+    }
+
     let addr = cfg.listen.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -140,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     // metrics 写入（rt.metrics 锁）在 sys 锁的作用域外逐个进行
                     let samples: Vec<(u32, f32, f64)> = {
-                        let mut sys = st.sys.lock().unwrap();
+                        let mut sys = st.sys.lock().unwrap_or_else(|p| p.into_inner());
                         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
                         running
                             .iter()

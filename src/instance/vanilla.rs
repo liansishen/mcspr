@@ -27,7 +27,7 @@ fn url_variants(url: &str) -> Vec<String> {
 /// 版本清单（缓存 10 分钟）
 pub async fn fetch_manifest(state: &AppState) -> Result<Value, String> {
     {
-        let cache = state.mc_versions.lock().unwrap();
+        let cache = state.mc_versions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, v)) = cache.as_ref() {
             if at.elapsed() < Duration::from_secs(600) {
                 return Ok(v.clone());
@@ -39,7 +39,7 @@ pub async fn fetch_manifest(state: &AppState) -> Result<Value, String> {
         "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
     )
     .await?;
-    *state.mc_versions.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    *state.mc_versions.lock().unwrap_or_else(|p| p.into_inner()) = Some((std::time::Instant::now(), v.clone()));
     Ok(v)
 }
 

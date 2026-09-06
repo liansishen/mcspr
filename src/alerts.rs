@@ -20,7 +20,7 @@ pub async fn send(state: &AppState, key: &str, text: impl Into<String>) {
     }
     // 5 分钟去重
     {
-        let mut dedup = state.alert_dedup.lock().unwrap();
+        let mut dedup = state.alert_dedup.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(t) = dedup.get(key) {
             if t.elapsed() < Duration::from_secs(300) {
                 return;

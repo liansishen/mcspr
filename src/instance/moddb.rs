@@ -406,35 +406,38 @@ pub fn murmur2(data: &[u8]) -> u32 {
 }
 
 /// 批量解析 CurseForge 文件 ID → (fileID, fileName, downloadUrl, sha1)
+/// 官方 API 对单次 fileIds 数量有限制，按 100 个一批请求
 pub async fn cf_resolve_files(
     state: &AppState,
     file_ids: &[i64],
 ) -> Result<Vec<(i64, String, String, String)>, String> {
     let key = cf_key(state).await?;
-    let req = http(state)
-        .post("https://api.curseforge.com/v1/mods/files")
-        .header("x-api-key", &key)
-        .json(&json!({ "fileIds": file_ids }))
-        .timeout(Duration::from_secs(40));
-    let v = send_json(req).await?;
     let mut out = Vec::new();
-    if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
-        for e in arr {
-            let id = e.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
-            let name = e.get("fileName").and_then(|x| x.as_str()).unwrap_or("").into();
-            let url = e.get("downloadUrl").and_then(|x| x.as_str()).unwrap_or("").into();
-            // hashes: [{value, algorithm}]，1 = SHA1
-            let sha1 = e
-                .get("hashes")
-                .and_then(|x| x.as_array())
-                .and_then(|hs| {
-                    hs.iter()
-                        .find(|h| h.get("algorithm").and_then(|a| a.as_i64()) == Some(1))
-                        .and_then(|h| h.get("value").and_then(|v| v.as_str()))
-                })
-                .unwrap_or("")
-                .to_string();
-            out.push((id, name, url, sha1));
+    for chunk in file_ids.chunks(100) {
+        let req = http(state)
+            .post("https://api.curseforge.com/v1/mods/files")
+            .header("x-api-key", &key)
+            .json(&json!({ "fileIds": chunk }))
+            .timeout(Duration::from_secs(40));
+        let v = send_json(req).await?;
+        if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+            for e in arr {
+                let id = e.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
+                let name = e.get("fileName").and_then(|x| x.as_str()).unwrap_or("").into();
+                let url = e.get("downloadUrl").and_then(|x| x.as_str()).unwrap_or("").into();
+                // hashes: [{value, algorithm}]，1 = SHA1
+                let sha1 = e
+                    .get("hashes")
+                    .and_then(|x| x.as_array())
+                    .and_then(|hs| {
+                        hs.iter()
+                            .find(|h| h.get("algorithm").and_then(|a| a.as_i64()) == Some(1))
+                            .and_then(|h| h.get("value").and_then(|v| v.as_str()))
+                    })
+                    .unwrap_or("")
+                    .to_string();
+                out.push((id, name, url, sha1));
+            }
         }
     }
     Ok(out)
@@ -451,6 +454,33 @@ pub async fn cf_fingerprints(state: &AppState, prints: &[u32]) -> Result<Value, 
     send_json(req).await
 }
 
+/// 允许下载的模组文件来源域名（防 SSRF：拒绝把面板变成任意 URL 下载器）
+const DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
+    "cdn.modrinth.com",
+    "forgecdn.net",          // 及全部子域（mediafilez / edge / media 等）
+    "curseforge.com",        // 及子域（www.curseforge.com 的 API 下载跳转）
+    "github.com",
+    "githubusercontent.com",
+    "maven.minecraftforge.net",
+    "maven.neoforged.net",
+    "bmclapi2.bangbang93.com",
+];
+
+fn download_host_allowed(url: &str) -> bool {
+    let Some(host) = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return false;
+    };
+    let host = host.rsplit('@').next().unwrap_or(host); // 去掉可能的 userinfo
+    let host = host.split(':').next().unwrap_or(host); // 去掉端口
+    let host = host.to_lowercase();
+    DOWNLOAD_HOST_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")))
+}
+
 /// 下载模组文件到实例 mods 目录
 pub async fn download_mod(
     state: &AppState,
@@ -459,8 +489,8 @@ pub async fn download_mod(
     filename: &str,
     expected_sha1: &str,
 ) -> Result<u64, String> {
-    if !url.starts_with("https://") {
-        return Err("下载地址不合法".into());
+    if !url.starts_with("https://") || !download_host_allowed(url) {
+        return Err("下载地址不在允许的来源域名内（仅支持 Modrinth / CurseForge CDN 等官方源）".into());
     }
     let resp = http(state)
         .get(url)

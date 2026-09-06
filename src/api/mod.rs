@@ -162,12 +162,12 @@ async fn auth_mw(state: State<AppState>, req: Request, next: Next) -> Response {
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == format!("Bearer {token}"))
+            .map(|v| crate::util::ct_eq(v, &format!("Bearer {token}")))
             .unwrap_or(false);
         let query_ok = req.uri().query().map(|q| {
             q.split('&').any(|pair| {
                 pair.split_once('=')
-                    .map(|(k, v)| k == "token" && v == token)
+                    .map(|(k, v)| k == "token" && crate::util::ct_eq(v, &token))
                     .unwrap_or(false)
             })
         }).unwrap_or(false);
@@ -194,10 +194,28 @@ struct SettingsUpdate {
     token: Option<String>,
     data_dir: Option<String>,
     curseforge_api_key: Option<String>,
+    telegram_bot_token: Option<String>,
 }
 
-async fn get_settings(State(state): State<AppState>) -> Json<config::PanelConfig> {
-    Json(state.config.read().await.clone())
+/// 设置读取：机密字段（token / CurseForge Key / Telegram Token）脱敏返回，
+/// 只回 `*_set` 标志，避免机密常驻前端 DOM
+async fn get_settings(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let c = state.config.read().await;
+    Json(json!({
+        "listen": c.listen,
+        "data_dir": c.data_dir,
+        "backup_keep": c.backup_keep,
+        "backup_keep_days": c.backup_keep_days,
+        "alert_type": c.alert_type,
+        "alert_webhook_url": c.alert_webhook_url,
+        "telegram_chat_id": c.telegram_chat_id,
+        "token": "",
+        "token_set": !c.token.is_empty(),
+        "curseforge_api_key": "",
+        "curseforge_api_key_set": !c.curseforge_api_key.is_empty(),
+        "telegram_bot_token": "",
+        "telegram_bot_token_set": !c.telegram_bot_token.is_empty(),
+    }))
 }
 
 async fn put_settings(
@@ -211,8 +229,12 @@ async fn put_settings(
                 cfg.listen = l.trim().to_string();
             }
         }
+        // 机密字段：留空 = 保持不变（配合前端脱敏显示）；如需清除请编辑 config.toml
         if let Some(t) = u.token {
-            cfg.token = t.trim().to_string();
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                cfg.token = t;
+            }
         }
         if let Some(d) = u.data_dir {
             if !d.trim().is_empty() {
@@ -220,7 +242,16 @@ async fn put_settings(
             }
         }
         if let Some(k) = u.curseforge_api_key {
-            cfg.curseforge_api_key = k.trim().to_string();
+            let k = k.trim().to_string();
+            if !k.is_empty() {
+                cfg.curseforge_api_key = k;
+            }
+        }
+        if let Some(k) = u.telegram_bot_token {
+            let k = k.trim().to_string();
+            if !k.is_empty() {
+                cfg.telegram_bot_token = k;
+            }
         }
         config::save(&cfg)?;
     }

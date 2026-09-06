@@ -2138,9 +2138,37 @@ async function renderTabSettings(id, el) {
       <label class="check"><input type="checkbox" id="f-auto" ${s.auto_restart ? 'checked' : ''}> 进程异常退出时自动重启（5 秒后）</label>
       <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例（多个实例将间隔 5 秒依次拉起）</label>
       <div class="row right"><button class="btn primary" onclick="saveInstance('${id}')">保存设置</button></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="row between"><h2 style="margin:0">告警推送（面板级）</h2><span class="muted small">实例异常退出 / 计划任务连败 / 磁盘不足时推送</span></div>
+      <div class="form" style="margin-top:10px">
+        <label>推送方式<select id="al-type">
+          <option value="none">不推送</option>
+          <option value="webhook">Webhook（POST JSON）</option>
+          <option value="discord">Discord Webhook</option>
+          <option value="telegram">Telegram Bot</option>
+        </select></label>
+        <label class="full">Webhook 地址<input id="al-url" placeholder="https://…">
+          <div class="muted small">Discord 直接粘贴频道 Webhook URL。</div></label>
+        <label>Telegram Bot Token<input id="al-tgt" placeholder="${window.__alertTgtSet ? '已设置（留空保持不变）' : '留空表示未设置'}"></label>
+        <label>Telegram Chat ID<input id="al-tgc" value="${esc(window.__alertChatId || '')}" placeholder="例如 123456789"></label>
+        <div class="row right"><button class="btn primary" onclick="saveAlerts('${id}')">保存告警设置</button></div>
+      </div>
     </div>`;
   loadCachedJavas();
   loadConfigsList(id);
+  // 回填告警设置（面板级；token 脱敏只显示是否已设置）
+  api('/settings').then(c => {
+    const t = document.getElementById('al-type');
+    if (t) t.value = c.alert_type || 'none';
+    const u = document.getElementById('al-url');
+    if (u) u.value = c.alert_webhook_url || '';
+    window.__alertTgtSet = !!c.telegram_bot_token_set;
+    const tg = document.getElementById('al-tgt');
+    if (tg) tg.placeholder = c.telegram_bot_token_set ? '已设置（留空保持不变）' : '留空表示未设置';
+    const ci = document.getElementById('al-tgc');
+    if (ci) ci.value = c.telegram_chat_id || '';
+  }).catch(() => {});
 }
 async function loadCachedJavas() {
   const sel = $('#java-picker');
@@ -2253,10 +2281,10 @@ async function renderPanelSettings() {
     <div class="form card">
       <label>监听地址<input id="ps-listen" value="${esc(c.listen)}" placeholder="127.0.0.1:8080">
         <div class="muted small">格式 IP:端口；127.0.0.1 仅本机访问，0.0.0.0 对局域网开放。修改后需重启面板生效。</div></label>
-      <label>访问令牌<input id="ps-token" value="${esc(c.token)}" placeholder="留空则无需鉴权">
-        <div class="muted small">设置后所有 API 与 WebSocket 控制台都需要令牌，保存后立即生效；对外暴露时建议设置。</div></label>
-      <label>CurseForge API Key<input id="ps-cfkey" value="${esc(c.curseforge_api_key || '')}" placeholder="留空则模组下载仅支持 Modrinth">
-        <div class="muted small">用于「模组下载」中 CurseForge 的搜索与文件列表；在 console.curseforge.com 可免费创建。</div></label>
+      <label>访问令牌<input id="ps-token" value="" placeholder="${c.token_set ? '已设置（留空保持不变）' : '留空则无需鉴权'}">
+        <div class="muted small">设置后所有 API 与 WebSocket 控制台都需要令牌，保存后立即生效；对外暴露时建议设置。为安全起见已保存的令牌不回显，留空保存即保持不变。</div></label>
+      <label>CurseForge API Key<input id="ps-cfkey" value="" placeholder="${c.curseforge_api_key_set ? '已设置（留空保持不变）' : '留空则模组下载仅支持 Modrinth'}">
+        <div class="muted small">用于「模组下载」中 CurseForge 的搜索与文件列表；在 console.curseforge.com 可免费创建。已保存的 Key 不回显，留空保存即保持不变。</div></label>
       <label class="full">数据目录<input id="ps-dir" value="${esc(c.data_dir)}">
         <div class="muted small">实例存放的根目录（相对路径基于面板工作目录），重启面板后生效。</div></label>
       <div class="row right"><button class="btn primary" onclick="savePanelSettings()">保存</button></div>
