@@ -3,4 +3,4 @@
 /.testdata
 config.toml
 package/
-ocr_files.json/
+ocr_files.json
