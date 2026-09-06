@@ -89,8 +89,7 @@ pub async fn create(
         let lver = loader_version.expect("上面已校验");
         state
             .jobs
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|p| p.into_inner())
             .insert(job_id.clone(), Job::new(job_id.clone()));
         let st2 = state.clone();
         let jid = job_id.clone();
@@ -104,8 +103,7 @@ pub async fn create(
         // 原版官方服务端下载任务
         state
             .jobs
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|p| p.into_inner())
             .insert(job_id.clone(), Job::new(job_id.clone()));
         let st2 = state.clone();
         let jid = job_id.clone();
@@ -470,8 +468,7 @@ pub async fn import_path(
     let job_id = uuid::Uuid::new_v4().to_string();
     state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .insert(job_id.clone(), Job::new(job_id.clone()));
     let st2 = state.clone();
     let jid = job_id.clone();
@@ -527,8 +524,7 @@ pub async fn import_upload(
     let job_id = uuid::Uuid::new_v4().to_string();
     state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .insert(job_id.clone(), Job::new(job_id.clone()));
     let st2 = state.clone();
     let jid = job_id.clone();
@@ -610,8 +606,7 @@ pub async fn modpack_apply(
     let job_id = uuid::Uuid::new_v4().to_string();
     state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .insert(job_id.clone(), Job::new(job_id.clone()));
     let st2 = state.clone();
     let jid = job_id.clone();
@@ -638,8 +633,7 @@ pub async fn get_job(
 ) -> ApiResult<Json<Job>> {
     let job = state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .get(&jid)
         .cloned()
         .ok_or_else(|| ApiError::not_found("任务不存在"))?;

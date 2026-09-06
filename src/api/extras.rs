@@ -171,9 +171,6 @@ pub async fn reinstall(
     if *rt.status.lock().await != crate::instance::Status::Stopped {
         return Err(ApiError::bad_request("重装前请先停止实例"));
     }
-    if !state.acquire_busy(&id) {
-        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
-    }
     let game = req.mc_version.trim().to_string();
     if game.is_empty() {
         return Err(ApiError::bad_request("请选择 MC 版本"));
@@ -196,11 +193,14 @@ pub async fn reinstall(
         meta.mod_loader = if loader == "vanilla" { None } else { Some(loader.clone()) };
     }
 
+    // 所有校验通过后再占用实例，避免校验错误路径泄漏占用标记
+    if !state.acquire_busy(&id) {
+        return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
+    }
     let job_id = uuid::Uuid::new_v4().to_string();
     state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .insert(job_id.clone(), crate::jobs::Job::new(job_id.clone()));
     let st2 = state.clone();
     let jid = job_id.clone();

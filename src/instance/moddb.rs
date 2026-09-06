@@ -454,6 +454,8 @@ pub async fn cf_fingerprints(state: &AppState, prints: &[u32]) -> Result<Value, 
     send_json(req).await
 }
 
+const BACKSLASH: char = char::from_u32(0x5C).unwrap();
+
 /// 允许下载的模组文件来源域名（防 SSRF：拒绝把面板变成任意 URL 下载器）
 const DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
     "cdn.modrinth.com",
@@ -467,6 +469,11 @@ const DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
 ];
 
 fn download_host_allowed(url: &str) -> bool {
+    // WHATWG URL 解析会把 "\" 当作 "/" 处理（如 https://evil.com\@cdn.modrinth.com
+    // 实际连接 evil.com），而我们的主机提取会误判——合法模组 URL 不含反斜杠，直接拒绝
+    if url.contains(BACKSLASH) {
+        return false;
+    }
     let Some(host) = url
         .strip_prefix("https://")
         .and_then(|rest| rest.split('/').next())

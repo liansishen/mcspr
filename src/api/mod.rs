@@ -274,8 +274,7 @@ async fn java_install(State(state): State<AppState>, Path(major): Path<u32>) -> 
     let job_id = uuid::Uuid::new_v4().to_string();
     state
         .jobs
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .insert(job_id.clone(), crate::jobs::Job::new(job_id.clone()));
     let st2 = state.clone();
     let jid = job_id.clone();
