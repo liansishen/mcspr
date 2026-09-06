@@ -4,3 +4,8 @@
 config.toml
 package/
 ocr_files.json
+
+fp.tgz
+fp12.zip
+neoforge-installer.jar.part.log
+*.part.log

@@ -1,97 +1,147 @@
 # MCS Panel — Minecraft 服务端管理面板
 
-基于 **Rust (Axum + Tokio)** 的本地 Minecraft 服务器管理面板。前端资源内嵌进二进制，`cargo build` 后得到单个可执行文件，开箱即用。
+![Version](https://img.shields.io/badge/version-0.10.0-green) ![License](https://img.shields.io/badge/license-MIT-blue) ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 
-## 功能
+基于 Rust（Axum + Tokio）的本地 Minecraft 服务器管理面板。前端资源内嵌进二进制，构建产物为**单个可执行文件**，开箱即用，支持 Windows 与 Linux。
 
-| 模块 | 说明 |
-| --- | --- |
-| 📊 仪表盘 | 系统 CPU / 内存使用率，实例运行状态、在线玩家、进程 CPU / 内存占用，快捷启停 |
-| 🗂 实例管理 | 新建实例三种方式：**自动下载官方原版服务端**（版本清单 BMCLAPI 镜像回退、SHA1 校验、进度条）、**创建模组服**（Fabric / Quilt 官方一键启动器；Forge / NeoForge 运行官方安装器，自动识别 `@argfile` 启动方式）、导入整合包（ZIP / 本地目录）；启动 / 停止 / 重启 / 删除、异常退出自动重启 |
-| 📦 整合包导入 | 上传 ZIP 或指定本地目录；自动解压（去除公共根目录）、应用 CurseForge / Modrinth `overrides`、自动识别主程序 JAR 与 Forge / NeoForge 1.17+ 启动参数（`@argfile`），导入过程带实时日志 |
-| 🧩 模组管理 | 解析 Fabric / Quilt / Forge / NeoForge 模组元数据（名称、版本、加载器、MC 版本、作者），启用 / 禁用（`.disabled` 重命名）、上传、删除；**在线下载模组**：Modrinth（无需鉴权）与 CurseForge（面板设置中填 API Key）搜索、按版本/加载器过滤、一键下载到 mods 目录 |
-| ⚙️ 服务器设置 | 图形化编辑 `server.properties`（保留注释与顺序，按类型渲染输入框 + 中文说明）；实例设置（Java 路径、JVM 内存、JVM 参数、主程序 JAR 选择） |
-| 📁 配置文件 | 文件浏览器：浏览 / 新建文件夹 / 上传 / 重命名 / 删除；文本文件在线编辑（`config/`、`ops.json`、白名单等） |
-| 🖥 控制台 | 实时 WebSocket 控制台（着色日志、GBK 自动转码）、发送任意服务器命令、玩家进出自动追踪、EULA 提示与一键同意；**Java 版本不匹配自动给出中文提示** |
-| 👥 用户管理 | 控制台页内管理**在线玩家**（一键 OP / 踢出 / 封禁 / 加白名单）与 OP / 白名单 / 封禁玩家 / 封禁 IP：服务器运行中走命令实时生效；未运行直接读写 ops.json / whitelist.json / banned-*.json（自动解析玩家 UUID：本地缓存 → Mojang API → 离线 UUID 回退） |
-| ☕ Java 扫描 | 一键扫描本机全部 Java（Program Files 各发行版、Prism / MultiMC / 官方启动器自带 JRE、IntelliJ .jdks、JAVA_HOME、PATH），结果持久化，实例设置中下拉选择 |
-| 🎨 三套主题 | 深色 / 亮色 / **MC 像素**（泥土背景、背包灰面板、石质按钮、MC 聊天配色控制台，内置开源像素字体「缝合像素」覆盖中文），侧边栏底部一键循环切换，偏好本地记忆并跟随系统 |
-| 🔐 安全 | 可选访问令牌（`config.toml` 中设置 `token` 后 API 与 WebSocket 均需鉴权） |
+## ✨ 功能特性
 
-## 环境要求
+**实例管理**
+- 新建实例三种方式：自动下载官方原版服务端（版本清单、镜像回退、SHA1 校验、下载进度）；创建模组服（Fabric / Quilt / Forge / NeoForge / Paper / Purpur / Folia / Velocity / Waterfall / BungeeCord）；导入整合包
+- 启动 / 停止 / 重启 / 删除 / 克隆 / 重装；异常退出自动重启，重启风暴熔断
+- **整合包更新**：上传新版本 zip → 预览差异（新增 / 覆盖 / 包外模组）→ 可选自动备份 → 自动同步模组与配置；CurseForge / Modrinth / 通用服务端包均支持；MC 版本或加载器变化时自动重装加载器
+- 世界存档管理：查看、切换、新建、删除
 
-- Java（与服务器版本匹配的 JRE/JDK，如 Java 17+ / 21+）
-- Rust 1.75+（仅构建时需要）
+**监控与可观测性**
+- 仪表盘：系统 CPU / 内存、磁盘用量、各实例进程 CPU / 内存占用、实例空间排行
+- 实例监控：TPS / MSPT（RCON 采集）与 CPU / 内存历史图表
+- 操作审计：写操作与失败请求自动记录，敏感参数脱敏，支持查询
+- 告警推送：实例崩溃、计划任务连续失败、磁盘水位——支持 Webhook / Discord / Telegram
 
-## 构建与运行
+**模组与配置**
+- 模组在线下载：Modrinth 与 CurseForge 搜索，按游戏版本 / 加载器过滤，队列式批量安装，自动解析前置依赖，SHA1 校验
+- 换版本即替换：已安装模组下载新版本后自动清理旧文件；删除模组时自动检查多层依赖并可级联删除
+- 模组元数据解析（名称、版本、加载器、MC 版本），启用 / 禁用 / 上传 / 删除
+- 文件浏览器：浏览 / 编辑 / 上传 / 下载 / 重命名 / 删除 / 在线解压（zip / tar.gz）
+- 图形化编辑 `server.properties`（保留注释与顺序，按类型渲染输入框并附中文说明）
+
+**运维**
+- 实时 WebSocket 控制台：着色日志、命令历史、Tab 补全、日志搜索过滤与下载；GBK 自动转码
+- 用户管理：在线玩家快捷操作，OP / 白名单 / 封禁玩家 / 封禁 IP（运行中实时生效，停止时读写对应 JSON 文件，UUID 自动解析）
+- 计划任务：定时执行命令 / 备份 / 重启，连续失败自动告警
+- 备份：全量 tar.gz，恢复前预览差异，按份数与天数自动清理
+- Java 环境：扫描本机全部 Java（各发行版 / 启动器自带 / IDE 下载），一键安装 Temurin JRE 8 / 11 / 17 / 21 / 25
+- 三套主题：深色 / 亮色 / MC 像素（内置中文像素字体）
+
+## 🚀 快速开始
+
+**方式一：下载预编译版本**
+
+从 [GitHub Releases](../../releases) 下载对应平台压缩包，解压后运行。
+
+**方式二：从源码构建**
 
 ```bash
-cargo run --release
+git clone https://github.com/liansishen/mcspr.git
+cd mcspr
+cargo build --release
 ```
 
-浏览器打开 **http://127.0.0.1:8080** 即可。
+构建产物为 `target/release/mcspr`（Linux）或 `target/release/mcspr.exe`（Windows）。运行后浏览器打开 `http://127.0.0.1:8080`。
 
-首次运行会在当前目录生成 `config.toml`：
+> 环境要求：运行需要 Java（与服务器版本匹配）；仅构建需要 Rust 1.75+，Linux 构建无需任何系统 TLS 依赖。
 
-```toml
-listen = "127.0.0.1:8080"   # 监听地址，改为 0.0.0.0:8080 可局域网访问
-data_dir = "data"           # 实例数据目录
-token = ""                  # 访问令牌，留空则无需鉴权；设置后立即生效
+## ⚙️ 配置
+
+首次运行自动生成 `config.toml`：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `listen` | `"127.0.0.1:8080"` | 监听地址；`0.0.0.0:8080` 对局域网开放（建议配合访问令牌） |
+| `data_dir` | `"data"` | 实例数据目录 |
+| `token` | 空 | 访问令牌；设置后所有 API 与 WebSocket 均需鉴权，立即生效 |
+| `curseforge_api_key` | 空 | CurseForge 模组搜索下载用；留空仅支持 Modrinth |
+| `backup_keep` / `backup_keep_days` | `10` / `30` | 备份保留份数与天数 |
+| `alert_type` | `"none"` | 告警推送：`none` / `webhook` / `discord` / `telegram` |
+| `alert_webhook_url` / `telegram_bot_token` / `telegram_chat_id` | 空 | 告警推送目标 |
+| `[thresholds]` | 见下 | `crash_window_secs=600`、`crash_max=3`、`restart_delay_secs=5`、`disk_warn_percent=90` |
+
+机密字段（令牌 / API Key / Bot Token）在「面板设置」页保存后不回显，留空保存即保持不变。
+
+## 🐧 Linux 部署
+
+Release 提供 Linux x64 / ARM64 的 musl **静态链接**二进制，任何发行版解压即用：
+
+```bash
+tar xzf mcspr-linux-x64.tar.gz && chmod +x mcspr
+./mcspr
 ```
 
-## 使用流程
+建议用 systemd 托管（`/etc/systemd/system/mcspr.service`）：
 
-1. **导入整合包**：实例管理 → 导入整合包 → 上传 ServerPack 的 ZIP（或填本地已解压目录路径）。导入完成后自动跳到实例控制台。
-2. **同意 EULA**：实例页顶部横幅点击「同意 EULA」（或手动确认 `eula.txt`）。
-3. **检查设置**：实例设置中确认主程序 JAR、Java 路径、内存分配；点「检测」验证 Java。
-4. **启动**：点击 ▶ 启动，控制台实时查看日志；`Done (...)` 出现即启动完成。
-5. **日常管理**：模组页管理 mods；文件页直接改 `config/` 下的配置；服务器设置页改 `server.properties`（改完重启生效）。
+```ini
+[Unit]
+Description=MCS Panel
+After=network.target
 
-## 目录结构
+[Service]
+WorkingDirectory=/opt/mcspr
+ExecStart=/opt/mcspr/mcspr
+Restart=on-failure
 
-```
-data/instances/<实例ID>/
-├── instance.json        # 实例元数据（面板管理，勿手改）
-├── server.jar / 模组启动脚本
-├── mods/  config/  world/ ...
-└── logs/latest.log      # 控制台重启后自动回填末尾 200 行
-
-web/                     # 前端源码（构建时内嵌进二进制）
-└── fonts/               # MC 主题像素字体（Fusion Pixel，OFL 许可）
+[Install]
+WantedBy=multi-user.target
 ```
 
-## 说明与已知限制
+面板自身的自动启动 / 重启与服务器进程管理均已在 Linux 下适配；强制结束时使用 `kill -9`。
 
-- **Forge / NeoForge 1.17+**：新版服务包使用 `@libraries/.../win_args.txt` 启动，导入器会自动从 `run.bat` 中提取参数；若包内未安装 libraries，需先运行一次官方安装器。
-- 面板进程重启时，正在运行的服务器进程会成为孤儿进程（不会退出），建议先停止实例再重启面板。
-- `server.properties` 修改在服务器运行期间不会热生效，需重启实例。
-- 大于 2MB 或二进制格式的文件不允许在线编辑（可上传替换）。
-- 所有路径操作都限制在实例目录内，拒绝 `..` 与绝对路径。
+## 🔁 自动构建
 
-## API 一览（供脚本调用）
+仓库内置 GitHub Actions 工作流：推送 `v*` 标签自动构建三平台产物并发布 Release——`mcspr-windows-x64.zip`、`mcspr-linux-x64.tar.gz`、`mcspr-linux-arm64.tar.gz`。
 
-```
-GET    /api/stats                        全局统计
-GET    /api/versions                     Minecraft 版本清单（官方源 + 镜像回退）
-GET    /api/instances                    实例列表
-POST   /api/instances                    新建 {name, mc_version?}（带版本则自动下载服务端）
-GET    /api/instances/{id}/users         用户列表（ops/whitelist/banned/bannedIps）
-POST   /api/instances/{id}/users/action  用户操作 {action, target, reason?}
-POST   /api/instances/import/upload      上传 zip 导入（multipart: name, file）
-POST   /api/instances/import/path        本地目录导入 {path, name?}
-GET    /api/jobs/{id}                    导入任务进度
-GET    /api/instances/{id}               实例详情（含状态/玩家/EULA）
-PATCH  /api/instances/{id}               修改实例设置
-DELETE /api/instances/{id}               停止并删除实例
-POST   /api/instances/{id}/start|stop|restart|eula|open
-POST   /api/instances/{id}/command       发送控制台命令 {command}
-GET    /api/instances/{id}/console?after= 拉取日志（REST 备用）
-WS     /api/instances/{id}/ws?token=     实时控制台（收 JSON 日志行 / 发文本命令）
-GET    /api/instances/{id}/mods          模组列表
-POST   /api/instances/{id}/mods/toggle|delete|upload
-GET    /api/instances/{id}/files?path=   目录列表
-GET/PUT /api/instances/{id}/files/content 读取/保存文本文件
-POST   /api/instances/{id}/files/mkdir|delete|rename|upload
-GET/PUT /api/instances/{id}/properties   server.properties 读写
-GET/PUT /api/settings                    面板设置
-```
+## 🖼 界面预览
+
+**三套主题（仪表盘）**
+
+| 深色 | 亮色 | MC 像素 |
+| --- | --- | --- |
+| ![深色主题仪表盘](docs/screenshots/dashboard-dark.png) | ![亮色主题仪表盘](docs/screenshots/dashboard-light.png) | ![MC 像素主题仪表盘](docs/screenshots/dashboard-mc.png) |
+
+**MC 像素主题**
+
+| 实时控制台 | 模组管理 |
+| --- | --- |
+| ![实时控制台](docs/screenshots/mc-console.png) | ![模组管理](docs/screenshots/mc-mods.png) |
+| 模组在线下载 | 服务器设置 |
+| ![模组在线下载](docs/screenshots/mc-mods-download.png) | ![服务器设置](docs/screenshots/mc-props.png) |
+| 文件管理 | |
+| ![文件管理](docs/screenshots/mc-files.png) | |
+
+## 📖 API 概览
+
+所有接口位于 `/api` 前缀下；设置令牌后需携带 `Authorization: Bearer <token>` 或 `?token=` 参数。
+
+| 分组 | 端点 |
+| --- | --- |
+| 全局 | `GET /api/stats` · `GET /api/versions` · `GET /api/settings` · `PUT /api/settings` · `GET /api/audit` · `GET /api/config/export` · `POST /api/config/import` |
+| 实例 | `GET/POST /api/instances` · `GET/PATCH/DELETE /api/instances/{id}` · `GET /api/instances/{id}/status` |
+| 进程 | `POST .../start` `.../stop` `.../restart` `.../command` `.../eula` `.../open` · `GET .../console` · `WS .../ws` |
+| 模组 | `GET .../mods` · `POST .../mods/toggle` `.../delete` `.../upload` · `GET .../mods/hashes` |
+| 模组市场 | `GET /api/moddb/search` `.../versions` `.../projects` · `POST /api/moddb/version-files` |
+| 文件 | `GET .../files` · `GET/PUT .../files/content` · `POST .../files/mkdir` `.../delete` `.../rename` `.../upload` `.../extract` `.../archive` · `GET .../files/download` `.../archive-download` |
+| 备份与世界 | `GET/POST /api/instances/{id}/backups` · `GET .../backups/{name}/preview` · `POST .../backups/{name}/restore` · `GET .../backups/{name}/download` · `DELETE .../backups/{name}` · `GET/POST .../worlds` `.../worlds/switch` `.../worlds/create` `.../worlds/delete` |
+| 计划任务 | `GET/POST .../tasks` · `POST .../tasks/update` |
+| Java | `GET /api/javas` · `POST /api/javas/scan` · `GET /api/java-install/list` · `POST /api/java-install/{major}` |
+| 其他 | `GET/POST .../users` `.../users/action` · `GET/PUT .../properties` · `POST .../clone` `.../reinstall` · `GET .../icon` · `POST /api/instances/import/upload` `.../import/path` · `POST /api/instances/{id}/modpack/preview` `.../modpack/apply` · `GET /api/jobs/{id}` |
+
+## ❓ 已知限制
+
+- Forge / NeoForge 1.17+ 服务包以 `@argfile` 方式启动，导入器会自动从 `run.bat` 提取参数；若包内未安装 libraries，需先运行一次官方安装器
+- 面板进程重启时，正在运行的服务器进程会成为孤儿进程（不会退出），建议先停止实例再重启面板
+- `server.properties` 修改在服务器运行期间不会热生效，需重启实例
+- 超过 2MB 或二进制格式的文件不允许在线编辑（可上传替换）
+- 所有路径操作都限制在实例目录内，拒绝 `..` 与绝对路径；对局域网开放时建议设置访问令牌
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 开源；内置 MC 主题像素字体为 [Fusion Pixel Font](https://github.com/TakWolf/fusion-pixel-font)（OFL 许可）。

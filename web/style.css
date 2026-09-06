@@ -81,6 +81,9 @@ body {
 .theme-toggle:hover { color: var(--text); background: var(--panel2); }
 
 .side-foot { padding: 14px 18px; border-top: 1px solid var(--border); }
+.gh-link { color: var(--muted); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; vertical-align: middle; }
+.gh-link:hover { color: var(--text, inherit); text-decoration: underline; }
+.gh-link svg { vertical-align: -2px; }
 
 /* ---------------- 主区域（全宽） ---------------- */
 #main { flex: 1; padding: 26px 40px 40px; min-width: 0; }
