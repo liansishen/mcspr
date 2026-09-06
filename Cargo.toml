@@ -1,6 +1,6 @@
 [package]
 name = "mcspr"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "MCS Panel - Minecraft 服务端管理面板"
 
@@ -22,7 +22,7 @@ walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 regex = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 sha1 = "0.10"
 md-5 = "0.10"
 encoding_rs = "0.8"

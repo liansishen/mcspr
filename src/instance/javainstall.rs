@@ -36,7 +36,7 @@ async fn save_registry(state: &AppState, list: &[InstalledJava]) -> std::io::Res
     std::fs::write(registry_path(state).await, serde_json::to_string_pretty(list)?)
 }
 
-/// Adoptium 最新 JRE 下载地址（Windows x64 zip）
+/// Adoptium 最新 JRE 下载地址（按当前平台选择 os / arch / image 类型）
 async fn fetch_latest_url(state: &AppState, major: u32) -> Result<(String, u64), String> {
     let os = if cfg!(windows) { "windows" } else { "linux" };
     let arch = if cfg!(target_arch = "x86_64") { "x64" } else { "aarch64" };
@@ -94,7 +94,12 @@ async fn install_inner(state: &AppState, job_id: &str, major: u32) -> Result<Pat
 
     let dir = data_java_dir(state).await;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let zip_path = dir.join(format!("temurin-{major}.zip"));
+    let is_tar = url.ends_with(".tar.gz") || url.ends_with(".tgz");
+    let archive_path = dir.join(if is_tar {
+        format!("temurin-{major}.tar.gz")
+    } else {
+        format!("temurin-{major}.zip")
+    });
     let resp = state
         .http
         .get(&url)
@@ -105,7 +110,7 @@ async fn install_inner(state: &AppState, job_id: &str, major: u32) -> Result<Pat
         .error_for_status()
         .map_err(|e| format!("下载失败: {e}"))?;
     let total = resp.content_length().unwrap_or(size);
-    let mut file = tokio::fs::File::create(&zip_path)
+    let mut file = tokio::fs::File::create(&archive_path)
         .await
         .map_err(|e| e.to_string())?;
     let mut stream = resp.bytes_stream();
@@ -129,13 +134,53 @@ async fn install_inner(state: &AppState, job_id: &str, major: u32) -> Result<Pat
     crate::jobs::set_progress(state, job_id, 100);
     crate::jobs::log_job(state, job_id, "解压中…");
 
-    // 解压（防路径穿越 + 总量上限）
-    let f = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(f))
-        .map_err(|e| format!("读取 zip 失败: {e}"))?;
+    // 解压（防路径穿越 + 总量上限）；Adoptium Linux/macOS 包为 tar.gz，Windows 为 zip
     let dest = dir.join(format!("temurin-{major}"));
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    if is_tar {
+        let f = std::fs::File::open(&archive_path).map_err(|e| e.to_string())?;
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut archive = tar::Archive::new(gz);
+        let mut total: u64 = 0;
+        for e in archive.entries().map_err(|e| format!("读取 tar.gz 失败: {e}"))? {
+            let mut e = e.map_err(|e| format!("读取 tar.gz 失败: {e}"))?;
+            total += e.size();
+            if total > 1024 * 1024 * 1024 {
+                return Err("解压总量超过 1GB 上限".into());
+            }
+            // tar crate 的 unpack_in 自带路径穿越防护，并保留可执行权限
+            e.unpack_in(&dest).map_err(|e| format!("解压失败: {e}"))?;
+        }
+    } else {
+        extract_zip(&archive_path, &dest)?;
+    }
+    let _ = std::fs::remove_file(&archive_path);
+
+    // 定位 java 可执行文件
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    let mut found: Option<PathBuf> = None;
+    for e in walkdir::WalkDir::new(&dest).max_depth(4).into_iter().flatten() {
+        let p = e.path();
+        if p.is_file() && p.file_name().map(|n| n == exe).unwrap_or(false) {
+            found = Some(p.to_path_buf());
+            break;
+        }
+    }
+    let java_path = found.ok_or("解压完成但未找到 java 可执行文件")?;
+    crate::jobs::log_job(
+        state,
+        job_id,
+        format!("✅ Temurin Java {major} 安装完成：{}", java_path.display()),
+    );
+    Ok(java_path)
+}
+
+/// 解压 Adoptium Windows zip 包（防路径穿越 + 总量上限）
+fn extract_zip(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let f = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(f))
+        .map_err(|e| format!("读取 zip 失败: {e}"))?;
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut e = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -155,23 +200,5 @@ async fn install_inner(state: &AppState, job_id: &str, major: u32) -> Result<Pat
         let mut out_f = std::fs::File::create(&out).map_err(|e| e.to_string())?;
         std::io::copy(&mut e, &mut out_f).map_err(|e| e.to_string())?;
     }
-    let _ = std::fs::remove_file(&zip_path);
-
-    // 定位 java 可执行文件
-    let exe = if cfg!(windows) { "java.exe" } else { "java" };
-    let mut found: Option<PathBuf> = None;
-    for e in walkdir::WalkDir::new(&dest).max_depth(4).into_iter().flatten() {
-        let p = e.path();
-        if p.is_file() && p.file_name().map(|n| n == exe).unwrap_or(false) {
-            found = Some(p.to_path_buf());
-            break;
-        }
-    }
-    let java_path = found.ok_or("解压完成但未找到 java 可执行文件")?;
-    crate::jobs::log_job(
-        state,
-        job_id,
-        format!("✅ Temurin JRE {major} 安装完成：{}", java_path.display()),
-    );
-    Ok(java_path)
+    Ok(())
 }
