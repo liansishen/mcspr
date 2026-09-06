@@ -31,7 +31,7 @@
 - 计划任务：定时执行命令 / 备份 / 重启，连续失败自动告警
 - 备份：全量 tar.gz，恢复前预览差异，按份数与天数自动清理
 - Java 环境：扫描本机全部 Java（各发行版 / 启动器自带 / IDE 下载），一键安装 Temurin JRE 8 / 11 / 17 / 21 / 25
-- 三套主题：深色 / 亮色 / MC 像素（内置中文像素字体）
+- 四套主题：深色 / 亮色 / MC 像素（内置中文像素字体）/ Claude（暖纸色），侧边栏底部下拉切换
 
 ## 🚀 快速开始
 
@@ -103,9 +103,9 @@ WantedBy=multi-user.target
 
 **三套主题（仪表盘）**
 
-| 深色 | 亮色 | MC 像素 |
-| --- | --- | --- |
-| ![深色主题仪表盘](docs/screenshots/dashboard-dark.png) | ![亮色主题仪表盘](docs/screenshots/dashboard-light.png) | ![MC 像素主题仪表盘](docs/screenshots/dashboard-mc.png) |
+| 深色 | 亮色 | MC 像素 | Claude |
+| --- | --- | --- | --- |
+| ![深色主题仪表盘](docs/screenshots/dashboard-dark.png) | ![亮色主题仪表盘](docs/screenshots/dashboard-light.png) | ![MC 像素主题仪表盘](docs/screenshots/dashboard-mc.png) | ![Claude 主题仪表盘](docs/screenshots/dashboard-claude.png) |
 
 **MC 像素主题**
 

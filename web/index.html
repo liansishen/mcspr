@@ -9,12 +9,13 @@
 (function () {
   var t = null;
   try { t = localStorage.getItem('mcspr.theme'); } catch (e) {}
-  if (t !== 'light' && t !== 'dark' && t !== 'mc') {
+  if (t !== 'light' && t !== 'dark' && t !== 'mc' && t !== 'claude') {
     t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   }
   var de = document.documentElement;
   de.classList.toggle('light', t === 'light');
   de.classList.toggle('mc', t === 'mc');
+  de.classList.toggle('claude', t === 'claude');
 })();
 </script>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🟩</text></svg>">
@@ -28,7 +29,12 @@
       <a href="#/dashboard" data-nav="dashboard">📊 仪表盘</a>
       <a href="#/instances" data-nav="instances">🗂 实例管理</a>
       <a href="#/settings" data-nav="settings">⚙️ 面板设置</a>
-      <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()">🎨 深色</button>
+      <select id="theme-select" class="theme-select" onchange="applyTheme(this.value)" aria-label="主题选择">
+        <option value="dark">🎨 深色</option>
+        <option value="light">☀️ 亮色</option>
+        <option value="mc">🧱 MC 像素</option>
+        <option value="claude">✳️ Claude</option>
+      </select>
     </nav>
     <div class="side-foot">
       <div class="muted small">MCS Panel v<span id="ver"></span></div>

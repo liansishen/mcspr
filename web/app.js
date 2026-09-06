@@ -159,23 +159,23 @@ const STATUS_TEXT = { stopped: '已停止', starting: '启动中', running: '运
 function statusPill(s) { return `<span class="pill st-${esc(s)}">${STATUS_TEXT[s] || esc(s)}</span>`; }
 
 /* ---------------- 主题切换（深色 / 亮色 / MC 像素） ---------------- */
-const THEME_ORDER = ['dark', 'light', 'mc'];
-const THEME_LABEL = { dark: '深色', light: '亮色', mc: 'MC 像素' };
+const THEME_ORDER = ['dark', 'light', 'mc', 'claude'];
+const THEME_LABEL = { dark: '深色', light: '亮色', mc: 'MC 像素', claude: 'Claude' };
 
 function currentTheme() {
   const de = document.documentElement;
-  return de.classList.contains('light') ? 'light' : de.classList.contains('mc') ? 'mc' : 'dark';
+  return de.classList.contains('light') ? 'light'
+    : de.classList.contains('mc') ? 'mc'
+    : de.classList.contains('claude') ? 'claude' : 'dark';
 }
 function applyTheme(t) {
   const de = document.documentElement;
   de.classList.toggle('light', t === 'light');
   de.classList.toggle('mc', t === 'mc');
+  de.classList.toggle('claude', t === 'claude');
   try { localStorage.setItem('mcspr.theme', t); } catch {}
-  const btn = $('#theme-toggle');
-  if (btn) btn.textContent = '🎨 ' + (THEME_LABEL[t] || t);
-}
-function toggleTheme() {
-  applyTheme(THEME_ORDER[(THEME_ORDER.indexOf(currentTheme()) + 1) % THEME_ORDER.length]);
+  const sel = $('#theme-select');
+  if (sel) sel.value = t;
 }
 applyTheme(currentTheme());
 
