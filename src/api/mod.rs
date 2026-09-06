@@ -347,6 +347,8 @@ async fn static_handler(uri: Uri) -> Response {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, asset.metadata.mimetype())
+            // 内嵌资源随版本更新变化：禁止缓存，避免面板升级后浏览器仍用旧前端
+            .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::from(asset.data.to_vec()))
             .unwrap();
     }
