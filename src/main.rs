@@ -115,18 +115,18 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let dir = rt.dir.clone();
+                    let runtime = rt.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        let Some((addr, pass, _)) = rcon::rcon_config(&dir) else {
-                            return Some(serde_json::json!({ "needs_rcon": true }));
-                        };
-                        let mut c = rcon::RconClient::connect(&addr, &pass).ok()?;
-                        let out = c.command("tps").ok()?;
-                        rcon::parse_tps(&out)
-                            .map(|(tps, mspt)| serde_json::json!({ "tps": tps, "mspt": mspt }))
+                        if rcon::rcon_config(&dir).is_none() {
+                            return serde_json::json!({ "needs_rcon": true });
+                        }
+                        match rcon::sample_tps(&runtime.rcon, &dir) {
+                            Ok((tps, mspt)) => serde_json::json!({ "tps": tps, "mspt": mspt }),
+                            Err(error) => serde_json::json!({ "error": error }),
+                        }
                     })
                     .await
-                    .ok()
-                    .flatten();
+                    .ok();
                     if let Some(v) = res {
                         *rt.tps.lock().await = Some(v);
                     }

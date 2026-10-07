@@ -165,6 +165,8 @@ async fn on_exit(
     let auto = rt.meta.read().await.auto_restart;
 
     *rt.stdin.lock().await = None;
+    // 服务端已退出，缓存的 RCON 连接随之失效
+    *rt.rcon.lock().unwrap_or_else(|p| p.into_inner()) = None;
     rt.ready.store(false, Ordering::SeqCst);
     rt.players.lock().await.clear();
     rt.pid.store(0, Ordering::SeqCst);

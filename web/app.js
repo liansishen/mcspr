@@ -1333,8 +1333,9 @@ async function renderTabMonitor(id, el, t) {
       if (t !== routeToken) return;
       const tps = s.tps;
       const tEl = document.getElementById('mon-tps'), hEl = document.getElementById('mon-tps-hint');
-      if (tps && tps.tps !== undefined) { tEl.textContent = tps.tps.toFixed(1); hEl.textContent = tps.mspt !== undefined ? `MSPT ${tps.mspt}ms` : ''; }
+      if (tps && tps.tps !== undefined) { tEl.textContent = tps.tps.toFixed(1); hEl.textContent = (tps.mspt !== undefined && tps.mspt !== null) ? `MSPT ${tps.mspt}ms` : ''; }
       else if (tps && tps.needs_rcon) { tEl.textContent = '需要 RCON'; hEl.textContent = '在服务器设置中开启 enable-rcon 并设置 rcon.password 后，面板每 10 秒采样 TPS。'; }
+      else if (tps && tps.error) { tEl.textContent = '采样失败'; hEl.textContent = `RCON 采样失败：${tps.error}`; }
       else { tEl.textContent = '采样中…'; hEl.textContent = ''; }
       document.getElementById('mon-live').innerHTML = s.status === 'running'
         ? `运行 ${fmtUptime(s.uptime_secs)} · PID ${s.pid || '-'}`

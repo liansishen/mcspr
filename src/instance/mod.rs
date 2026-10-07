@@ -108,6 +108,8 @@ pub struct InstanceRuntime {
     pub metrics: Mutex<VecDeque<(i64, f32, f64)>>,
     /// TPS/MSPT 采样结果
     pub tps: Mutex<Option<Value>>,
+    /// 复用的 RCON 连接（TPS 采样与远程命令）；服务端会为每次新建连接打一行日志
+    pub rcon: std::sync::Mutex<Option<crate::rcon::Session>>,
     pub log_buf: Mutex<VecDeque<LogLine>>,
     pub log_tx: broadcast::Sender<LogLine>,
     pub next_seq: AtomicU64,
@@ -173,6 +175,7 @@ impl InstanceRuntime {
             open_sessions: Mutex::new(std::collections::HashMap::new()),
             metrics: Mutex::new(VecDeque::new()),
             tps: Mutex::new(None),
+            rcon: std::sync::Mutex::new(None),
             log_buf: Mutex::new(buf),
             log_tx: tx,
             next_seq: AtomicU64::new(next_seq),

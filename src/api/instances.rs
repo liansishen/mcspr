@@ -284,11 +284,11 @@ pub async fn command(
     let cmd = req.command.trim().to_string();
     // RCON 优先：能拿到命令输出，写回控制台
     let dir = rt.dir.clone();
+    let runtime = rt.clone();
     let cmd2 = cmd.clone();
     let rcon_out = tokio::task::spawn_blocking(move || {
-        let Some((addr, pass, _)) = crate::rcon::rcon_config(&dir) else { return None };
-        let mut c = crate::rcon::RconClient::connect(&addr, &pass).ok()?;
-        c.command(&cmd2).ok()
+        crate::rcon::rcon_config(&dir)?;
+        crate::rcon::exec(&runtime.rcon, &dir, &cmd2).ok()
     })
     .await
     .unwrap_or(None);
