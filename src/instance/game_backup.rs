@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -57,6 +57,19 @@ pub struct BackupInfo {
     pub created: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BackupConfigUpdate {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub interval_hours: Option<f64>,
+    #[serde(default)]
+    pub keep: Option<u32>,
+    #[serde(default)]
+    pub need_online_players: Option<bool>,
+    #[serde(default)]
+    pub only_claimed: Option<bool>,
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {
@@ -271,6 +284,122 @@ pub fn detect(dir: &Path) -> Result<Option<Provider>, String> {
         return Ok(Some(provider));
     }
     Ok(None)
+}
+pub fn update_config(dir: &Path, updates: &BackupConfigUpdate) -> Result<Provider, String> {
+    let dir = root(dir)?;
+    let config_path = dir.join("serverutilities/serverutilities.cfg");
+    no_links(&config_path)?;
+    if !config_path.is_file() {
+        return Err("ServerUtilities 配置文件不存在".into());
+    }
+    if let Some(h) = updates.interval_hours {
+        if !h.is_finite() || h <= 0.0 {
+            return Err("备份间隔必须大于 0".into());
+        }
+    }
+    if let Some(k) = updates.keep {
+        if k < 1 {
+            return Err("备份保留数量至少为 1".into());
+        }
+    }
+    let content = fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
+    let updated = update_backups_section(&content, updates);
+    fs::write(&config_path, updated).map_err(|e| format!("写入配置失败: {e}"))?;
+
+    detect(&dir)?.ok_or_else(|| "未能重新识别 ServerUtilities".into())
+}
+
+fn update_backups_section(content: &str, updates: &BackupConfigUpdate) -> String {
+    let mut out = Vec::new();
+    let mut in_backups = false;
+    let mut updated_keys = std::collections::HashSet::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !in_backups {
+            if trimmed.ends_with('{')
+                && trimmed.trim_end_matches('{').trim().trim_matches('"') == "backups"
+            {
+                in_backups = true;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if trimmed == "}" {
+            if let Some(v) = updates.enabled {
+                if !updated_keys.contains("enable_backups") {
+                    out.push(format!("    B:enable_backups={v}"));
+                }
+            }
+            if let Some(v) = updates.interval_hours {
+                if !updated_keys.contains("backup_timer") {
+                    out.push(format!("    S:backup_timer={v}"));
+                }
+            }
+            if let Some(v) = updates.keep {
+                if !updated_keys.contains("backups_to_keep") {
+                    out.push(format!("    I:backups_to_keep={v}"));
+                }
+            }
+            if let Some(v) = updates.need_online_players {
+                if !updated_keys.contains("need_online_players") {
+                    out.push(format!("    B:need_online_players={v}"));
+                }
+            }
+            if let Some(v) = updates.only_claimed {
+                if !updated_keys.contains("only_backup_claimed_chunks") {
+                    out.push(format!("    B:only_backup_claimed_chunks={v}"));
+                }
+            }
+            in_backups = false;
+            out.push(line.to_string());
+            continue;
+        }
+
+        let key = if let Some((k, _)) = trimmed.split_once('=') {
+            let k = k.trim();
+            k.split_once(':')
+                .map(|(_, name)| name)
+                .unwrap_or(k)
+                .trim_matches('"')
+        } else {
+            ""
+        };
+
+        match key {
+            "enable_backups" if updates.enabled.is_some() => {
+                updated_keys.insert("enable_backups".to_string());
+                out.push(format!("    B:enable_backups={}", updates.enabled.unwrap()));
+            }
+            "backup_timer" if updates.interval_hours.is_some() => {
+                updated_keys.insert("backup_timer".to_string());
+                out.push(format!("    S:backup_timer={}", updates.interval_hours.unwrap()));
+            }
+            "backups_to_keep" if updates.keep.is_some() => {
+                updated_keys.insert("backups_to_keep".to_string());
+                out.push(format!("    I:backups_to_keep={}", updates.keep.unwrap()));
+            }
+            "need_online_players" if updates.need_online_players.is_some() => {
+                updated_keys.insert("need_online_players".to_string());
+                out.push(format!(
+                    "    B:need_online_players={}",
+                    updates.need_online_players.unwrap()
+                ));
+            }
+            "only_backup_claimed_chunks" if updates.only_claimed.is_some() => {
+                updated_keys.insert("only_backup_claimed_chunks".to_string());
+                out.push(format!(
+                    "    B:only_backup_claimed_chunks={}",
+                    updates.only_claimed.unwrap()
+                ));
+            }
+            _ => {
+                out.push(line.to_string());
+            }
+        }
+    }
+    out.join("\n")
 }
 
 fn world(dir: &Path) -> Result<String, String> {

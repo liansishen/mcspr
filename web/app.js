@@ -1294,22 +1294,151 @@ async function userAction(id, action, target, reason) {
 
 /* ---------------- 监控（TPS / CPU 内存历史 / 在线时长 / 崩溃归档） ---------------- */
 function renderChart(el, points) {
-  if (!points.length) { el.innerHTML = '<div class="empty">暂无数据（实例运行后每 30 秒采样一次）</div>'; return; }
-  const w = 800, h = 220, pad = 36;
+  if (!points || !points.length) {
+    el.innerHTML = '<div class="empty">暂无数据（实例运行后每 30 秒采样一次）</div>';
+    return;
+  }
   const n = points.length;
-  const x = i => pad + (w - 2 * pad) * (i / Math.max(n - 1, 1));
-  const cpuMax = Math.max(10, ...points.map(p => p[1]));
-  const memMax = Math.max(1, ...points.map(p => p[2]));
-  const cpuPts = points.map((p, i) => `${x(i)},${h - pad - (h - 2 * pad) * (p[1] / cpuMax)}`).join(' ');
-  const memPts = points.map((p, i) => `${x(i)},${h - pad - (h - 2 * pad) * (p[2] / memMax)}`).join(' ');
-  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" style="width:100%;background:var(--console-bg);border-radius:8px">
-    <polyline fill="none" stroke="var(--accent)" stroke-width="1.5" points="${cpuPts}"/>
-    <polyline fill="none" stroke="var(--blue)" stroke-width="1.5" points="${memPts}"/>
-    <text x="${pad}" y="18" fill="var(--accent)" font-size="12">CPU%（峰 ${cpuMax.toFixed(1)}）</text>
-    <text x="${pad + 240}" y="18" fill="var(--blue)" font-size="12">内存 MB（峰 ${memMax.toFixed(0)}）</text>
-    <text x="${pad}" y="${h - 8}" fill="var(--muted)" font-size="11">${new Date(points[0][0] * 1000).toLocaleTimeString()}</text>
-    <text x="${w - pad - 110}" y="${h - 8}" fill="var(--muted)" font-size="11">${new Date(points[n - 1][0] * 1000).toLocaleTimeString()}</text>
-  </svg>`;
+  const cpuValues = points.map(p => p[1]);
+  const memValues = points.map(p => p[2]);
+  const curCpu = cpuValues[n - 1] || 0;
+  const avgCpu = cpuValues.reduce((a, b) => a + b, 0) / n;
+  const cpuMax = Math.max(10, ...cpuValues);
+  const curMem = memValues[n - 1] || 0;
+  const avgMem = memValues.reduce((a, b) => a + b, 0) / n;
+  const memMax = Math.max(100, ...memValues);
+
+  const fmtMem = mb => mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(0) + ' MB';
+  const startTs = points[0][0];
+  const endTs = points[n - 1][0];
+  const startTime = new Date(startTs * 1000).toLocaleTimeString();
+  const endTime = new Date(endTs * 1000).toLocaleTimeString();
+  const spanText = fmtUptime(endTs - startTs);
+
+  const w = 840, h = 260, padL = 48, padR = 64, padT = 24, padB = 32;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const x = i => padL + plotW * (i / Math.max(n - 1, 1));
+  const yCpu = val => padT + plotH - (plotH * (Math.max(0, val) / cpuMax));
+  const yMem = val => padT + plotH - (plotH * (Math.max(0, val) / memMax));
+
+  const gridSteps = [0, 0.25, 0.5, 0.75, 1.0];
+  const gridLines = gridSteps.map(step => {
+    const yPos = padT + plotH * (1 - step);
+    const cpuVal = (cpuMax * step).toFixed(0);
+    const memVal = fmtMem(memMax * step);
+    return `<line x1="${padL}" y1="${yPos}" x2="${padL + plotW}" y2="${yPos}" stroke="var(--border)" stroke-dasharray="3 3" opacity="0.65"/>
+      <text x="${padL - 8}" y="${yPos + 4}" text-anchor="end" fill="var(--accent)" font-size="10" opacity="0.75">${cpuVal}%</text>
+      <text x="${padL + plotW + 8}" y="${yPos + 4}" text-anchor="start" fill="var(--blue)" font-size="10" opacity="0.8">${memVal}</text>`;
+  }).join('');
+
+  const cpuCoords = points.map((p, i) => [x(i), yCpu(p[1])]);
+  const memCoords = points.map((p, i) => [x(i), yMem(p[2])]);
+
+  const cpuPtsStr = cpuCoords.map(([cx, cy]) => `${cx.toFixed(1)},${cy.toFixed(1)}`).join(' ');
+  const memPtsStr = memCoords.map(([mx, my]) => `${mx.toFixed(1)},${my.toFixed(1)}`).join(' ');
+
+  const baselineY = padT + plotH;
+  const cpuAreaD = `M ${padL},${baselineY} L ${cpuPtsStr.replace(/ /g, ' L ')} L ${x(n - 1).toFixed(1)},${baselineY} Z`;
+  const memAreaD = `M ${padL},${baselineY} L ${memPtsStr.replace(/ /g, ' L ')} L ${x(n - 1).toFixed(1)},${baselineY} Z`;
+
+  const lastCpuPt = cpuCoords[n - 1];
+  const lastMemPt = memCoords[n - 1];
+
+  el.innerHTML = `
+    <div style="position:relative;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px">
+      <div class="row between" style="margin-bottom:10px;font-size:12px">
+        <div class="row" style="gap:10px;flex-wrap:wrap">
+          <span class="pill" style="background:rgba(74,222,128,0.12);color:var(--accent);border:1px solid rgba(74,222,128,0.3)">
+            ● CPU 当前: <b>${curCpu.toFixed(1)}%</b> · 均值: ${avgCpu.toFixed(1)}% · 峰值: ${Math.max(...cpuValues).toFixed(1)}%
+          </span>
+          <span class="pill" style="background:rgba(96,165,250,0.12);color:var(--blue);border:1px solid rgba(96,165,250,0.3)">
+            ● 内存 当前: <b>${fmtMem(curMem)}</b> · 均值: ${fmtMem(avgMem)} · 峰值: ${fmtMem(Math.max(...memValues))}
+          </span>
+        </div>
+        <span class="muted small">${n} 次采样${spanText ? ` (跨度 ${spanText})` : ''}</span>
+      </div>
+      <div style="position:relative">
+        <svg id="mon-svg" viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;display:block;background:var(--console-bg);border-radius:6px;user-select:none">
+          <defs>
+            <linearGradient id="mon-cpu-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.35"/>
+              <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.0"/>
+            </linearGradient>
+            <linearGradient id="mon-mem-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--blue)" stop-opacity="0.25"/>
+              <stop offset="100%" stop-color="var(--blue)" stop-opacity="0.0"/>
+            </linearGradient>
+          </defs>
+          ${gridLines}
+          <path d="${cpuAreaD}" fill="url(#mon-cpu-grad)"/>
+          <path d="${memAreaD}" fill="url(#mon-mem-grad)"/>
+          <polyline fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${cpuPtsStr}"/>
+          <polyline fill="none" stroke="var(--blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${memPtsStr}"/>
+          <circle cx="${lastCpuPt[0].toFixed(1)}" cy="${lastCpuPt[1].toFixed(1)}" r="4" fill="var(--accent)"/>
+          <circle cx="${lastCpuPt[0].toFixed(1)}" cy="${lastCpuPt[1].toFixed(1)}" r="7" fill="none" stroke="var(--accent)" opacity="0.4"/>
+          <circle cx="${lastMemPt[0].toFixed(1)}" cy="${lastMemPt[1].toFixed(1)}" r="4" fill="var(--blue)"/>
+          <circle cx="${lastMemPt[0].toFixed(1)}" cy="${lastMemPt[1].toFixed(1)}" r="7" fill="none" stroke="var(--blue)" opacity="0.4"/>
+          <text x="${padL}" y="${h - 10}" fill="var(--muted)" font-size="11">${startTime}</text>
+          <text x="${padL + plotW}" y="${h - 10}" text-anchor="end" fill="var(--muted)" font-size="11">${endTime}</text>
+          <line id="mon-cursor" x1="0" y1="${padT}" x2="0" y2="${padT + plotH}" stroke="rgba(255,255,255,0.45)" stroke-dasharray="3 3" style="display:none"/>
+          <circle id="mon-dot-cpu" r="5" fill="var(--accent)" stroke="#fff" stroke-width="1.5" style="display:none"/>
+          <circle id="mon-dot-mem" r="5" fill="var(--blue)" stroke="#fff" stroke-width="1.5" style="display:none"/>
+          <rect id="mon-hover-rect" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:crosshair"/>
+        </svg>
+        <div id="mon-tip" style="position:absolute;display:none;pointer-events:none;background:var(--panel2);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font-size:11px;box-shadow:var(--shadow);white-space:nowrap;z-index:20"></div>
+      </div>
+    </div>`;
+
+  const svg = el.querySelector('#mon-svg');
+  const hoverRect = el.querySelector('#mon-hover-rect');
+  const cursor = el.querySelector('#mon-cursor');
+  const dotCpu = el.querySelector('#mon-dot-cpu');
+  const dotMem = el.querySelector('#mon-dot-mem');
+  const tip = el.querySelector('#mon-tip');
+  if (!svg || !hoverRect || !cursor || !tip) return;
+
+  hoverRect.addEventListener('mousemove', e => {
+    const rect = svg.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const svgX = mouseX * (w / rect.width);
+    const ratio = Math.max(0, Math.min(1, (svgX - padL) / plotW));
+    const idx = Math.min(n - 1, Math.max(0, Math.round(ratio * (n - 1))));
+    const p = points[idx];
+    const px = x(idx);
+    const pyC = yCpu(p[1]);
+    const pyM = yMem(p[2]);
+
+    cursor.setAttribute('x1', px);
+    cursor.setAttribute('x2', px);
+    cursor.style.display = '';
+
+    dotCpu.setAttribute('cx', px);
+    dotCpu.setAttribute('cy', pyC);
+    dotCpu.style.display = '';
+
+    dotMem.setAttribute('cx', px);
+    dotMem.setAttribute('cy', pyM);
+    dotMem.style.display = '';
+
+    const timeStr = new Date(p[0] * 1000).toLocaleTimeString();
+    tip.innerHTML = `<div class="muted small">${timeStr}</div><div><span style="color:var(--accent)">● CPU:</span> <b>${p[1].toFixed(1)}%</b></div><div><span style="color:var(--blue)">● 内存:</span> <b>${fmtMem(p[2])}</b></div>`;
+    tip.style.display = 'block';
+
+    const tipW = tip.offsetWidth || 110;
+    const leftPx = (px / w) * rect.width;
+    let finalLeft = leftPx + 14;
+    if (finalLeft + tipW > rect.width) finalLeft = leftPx - tipW - 14;
+    tip.style.left = `${Math.max(4, finalLeft)}px`;
+    tip.style.top = '16px';
+  });
+
+  hoverRect.addEventListener('mouseleave', () => {
+    cursor.style.display = 'none';
+    dotCpu.style.display = 'none';
+    dotMem.style.display = 'none';
+    tip.style.display = 'none';
+  });
 }
 async function renderTabMonitor(id, el, t) {
   el.innerHTML = `<h2>监控</h2>
@@ -1891,7 +2020,8 @@ async function loadGameBackups(id, t, resumeJob = true) {
     if (t !== routeToken) return;
     const target = $('#gb-body'); if (!target) return;
     const provider = d.provider;
-    target.innerHTML = `${provider ? `<div class="card"><b>ServerUtilities ${esc(provider.version)}</b><p class="muted small">${provider.enabled ? '已启用' : '未启用'}；自动保留最近 ${provider.keep} 份，备份目录 ${esc(provider.backup_dir)}。${provider.interval_hours ? `自动间隔 ${provider.interval_hours} 小时。` : ''}${provider.need_online_players ? '仅在线玩家数满足条件时自动备份。' : ''}${provider.only_claimed ? '仅备份已认领区域。' : ''}</p></div>` : '<div class="banner warn">当前实例未识别到支持的游戏内备份模组；目前支持 ServerUtilities。</div>'}
+    currentGameBackupProvider = provider;
+    target.innerHTML = `${provider ? `<div class="card"><div class="row between"><div><b>ServerUtilities ${esc(provider.version)}</b><p class="muted small">${provider.enabled ? '已启用自动备份' : '未启用自动备份'}；自动保留最近 ${provider.keep} 份，备份目录 ${esc(provider.backup_dir)}。${provider.interval_hours ? `自动间隔 ${provider.interval_hours} 小时。` : ''}${provider.need_online_players ? '仅在线玩家数满足条件时自动备份。' : ''}${provider.only_claimed ? '仅备份已认领区域。' : ''}</p></div><button class="btn small" onclick="editGameBackupConfig('${id}')">⚙ 备份设置</button></div></div>` : '<div class="banner warn">当前实例未识别到支持的游戏内备份模组；目前支持 ServerUtilities。</div>'}
       ${provider && (!provider.enabled || !provider.command_enabled) ? `<div class="banner warn">${provider.enabled ? 'backup 命令已禁用，无法立即备份。' : 'ServerUtilities 配置已禁用，无法创建游戏内备份。'}</div>` : ''}
       <p class="muted small">立即备份需要实例完成启动；恢复需要先停止实例。恢复前会保留当前受影响的数据，完成后请手动启动。</p>
       <div class="row between" style="margin:12px 0"><span>状态：${statusPill(d.status)}${d.active_job ? ' · 任务进行中' : ''}</span><button id="gb-create" class="btn primary" ${!provider || !provider.enabled || !provider.command_enabled || d.status !== 'running' || d.active_job ? 'disabled' : ''} onclick="startGameBackup('${id}')">立即备份</button></div>
@@ -1930,6 +2060,50 @@ async function deleteGameBackup(id, name) {
   try {
     await api(`/instances/${id}/game-backups/${name}`, { method: 'DELETE' });
     toast('已删除');
+    loadGameBackups(id, routeToken);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+let currentGameBackupProvider = null;
+function editGameBackupConfig(id) {
+  if (!currentGameBackupProvider) return;
+  const p = currentGameBackupProvider;
+  showModal(`<h2>修改游戏内备份设置</h2>
+    <p class="muted small">对应 ServerUtilities 配置文件（serverutilities.cfg）。修改后保存生效。</p>
+    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
+      <label class="check"><input type="checkbox" id="gbs-enabled" ${p.enabled ? 'checked' : ''}> 启用自动备份</label>
+      <label>备份间隔（小时）<input id="gbs-interval" type="number" step="0.1" min="0.1" value="${p.interval_hours || 0.5}" placeholder="例如 0.5 表示 30 分钟"></label>
+      <label>保留备份份数<input id="gbs-keep" type="number" min="1" step="1" value="${p.keep || 12}" placeholder="例如 12"></label>
+      <label class="check"><input type="checkbox" id="gbs-online" ${p.need_online_players ? 'checked' : ''}> 仅当有玩家在线时自动备份</label>
+      <label class="check"><input type="checkbox" id="gbs-claimed" ${p.only_claimed ? 'checked' : ''}> 仅备份已认领领地区块</label>
+    </div>
+    <div class="row right">
+      <button class="btn ghost" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="saveGameBackupConfig('${id}')">保存设置</button>
+    </div>`);
+}
+async function saveGameBackupConfig(id) {
+  const enabled = $('#gbs-enabled')?.checked;
+  const interval = parseFloat($('#gbs-interval')?.value);
+  const keep = parseInt($('#gbs-keep')?.value, 10);
+  const online = $('#gbs-online')?.checked;
+  const claimed = $('#gbs-claimed')?.checked;
+  if (isNaN(interval) || interval <= 0) return toast('备份间隔必须大于 0', false);
+  if (isNaN(keep) || keep < 1) return toast('保留份数至少为 1', false);
+  try {
+    await api(`/instances/${id}/game-backups/config`, {
+      method: 'POST',
+      body: {
+        enabled,
+        interval_hours: interval,
+        keep,
+        need_online_players: online,
+        only_claimed: claimed
+      }
+    });
+    closeModal();
+    toast('备份设置已保存');
     loadGameBackups(id, routeToken);
   } catch (e) {
     toast(e.message, false);
@@ -2052,14 +2226,21 @@ async function renderTabFiles(id, el, t) {
   curPath = '';
   el.innerHTML = `
     <div class="row between"><h2>文件管理</h2>
-      <div class="row"><button class="btn" onclick="filesMkdir('${id}')">新建文件夹</button><button class="btn" onclick="filesUpload('${id}')">上传文件</button></div></div>
-    <div id="files-crumb" class="crumb"></div>
+      <div class="row">
+        <input id="files-search" placeholder="搜索当前目录文件…" oninput="filterFiles()" style="width:200px">
+        <button class="btn" onclick="filesMkdir('${id}')">新建文件夹</button>
+        <button class="btn" onclick="filesUpload('${id}')">上传文件</button>
+      </div>
+    </div>
     <div id="files-body"><div class="empty">加载中…</div></div>`;
   await loadFiles(id, t, '');
 }
 
+let filesEntriesCache = null;
 async function loadFiles(id, t, path) {
   curPath = path;
+  const searchInput = $('#files-search');
+  if (searchInput) searchInput.value = '';
   try {
     const { entries } = await api(`/instances/${id}/files?path=${encodeURIComponent(path)}`);
     if (t !== routeToken) return;
@@ -2071,23 +2252,39 @@ async function loadFiles(id, t, path) {
       crumbs += ` / <a onclick="loadFiles('${id}',${t},'${esc(acc)}')">${esc(p)}</a>`;
     }
     $('#files-crumb').innerHTML = crumbs;
-    const full = f => (path ? path + '/' : '') + f.name;
-    $('#files-body').innerHTML = `<div class="table-wrap"><table class="table">
-      <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
-      <tbody>${entries.map(f => `<tr>
-        <td>${f.dir ? '📁' : '📄'} <a onclick="${f.dir
-          ? `loadFiles('${id}',${t},'${esc(full(f))}')`
-          : `editFile('${id}','${esc(full(f))}')`}">${esc(f.name)}</a></td>
-        <td class="muted">${f.dir ? '-' : fmtSize(f.size)}</td>
-        <td class="muted">${esc(f.modified)}</td>
-        <td>
-          <button class="btn small" onclick="${f.dir ? `downloadArchive('${id}','${esc(full(f))}')` : `downloadFile('${id}','${esc(full(f))}')`}">下载</button>
-          <button class="btn small" onclick="renameFile('${id}','${esc(full(f))}','${esc(f.name)}')">重命名</button>
-          <button class="btn small danger" onclick="deleteFile('${id}','${esc(full(f))}')">删除</button>
-        </td></tr>`).join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>'}</tbody></table></div>`;
+    filesEntriesCache = { id, t, path, entries: entries || [] };
+    renderFilesList(filesEntriesCache.entries, '');
   } catch (e) {
     $('#files-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
+}
+
+function filterFiles() {
+  if (!filesEntriesCache) return;
+  const q = ($('#files-search')?.value || '').trim().toLowerCase();
+  const list = q ? filesEntriesCache.entries.filter(f => f.name.toLowerCase().includes(q)) : filesEntriesCache.entries;
+  renderFilesList(list, q);
+}
+
+function renderFilesList(entries, q = '') {
+  if (!filesEntriesCache) return;
+  const { id, t, path } = filesEntriesCache;
+  const full = f => (path ? path + '/' : '') + f.name;
+  const rows = entries.map(f => `<tr>
+    <td>${f.dir ? '📁' : '📄'} <a onclick="${f.dir
+      ? `loadFiles('${id}',${t},'${esc(full(f))}')`
+      : `editFile('${id}','${esc(full(f))}')`}">${esc(f.name)}</a></td>
+    <td class="muted">${f.dir ? '-' : fmtSize(f.size)}</td>
+    <td class="muted">${esc(f.modified)}</td>
+    <td>
+      <button class="btn small" onclick="${f.dir ? `downloadArchive('${id}','${esc(full(f))}')` : `downloadFile('${id}','${esc(full(f))}')`}">下载</button>
+      <button class="btn small" onclick="renameFile('${id}','${esc(full(f))}','${esc(f.name)}')">重命名</button>
+      <button class="btn small danger" onclick="deleteFile('${id}','${esc(full(f))}')">删除</button>
+    </td></tr>`).join('');
+  const emptyText = q ? '未找到匹配的文件' : '空目录';
+  $('#files-body').innerHTML = `<div class="table-wrap"><table class="table">
+    <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="4" class="muted">${emptyText}</td></tr>`}</tbody></table></div>`;
 }
 
 async function editFile(id, path) {
@@ -2620,8 +2817,10 @@ async function loadWorlds(id, t) {
       <tbody>${d.worlds.map(w => `<tr>
         <td><b>${esc(w.name)}</b></td><td>${fmtSize(w.size)}</td>
         <td>${w.current ? '<span class="pill st-running">当前</span>' : '<span class="muted">-</span>'}</td>
-        <td>${w.current ? '<span class="muted small">使用中</span>' :
+        <td>${w.current ?
+          `<span class="muted small" style="margin-right:8px">使用中</span><button class="btn small" onclick="cloneWorld('${id}','${esc(w.name)}')">复制</button>` :
           `<button class="btn small" onclick="switchWorld('${id}','${esc(w.name)}')">切换</button>
+           <button class="btn small" onclick="cloneWorld('${id}','${esc(w.name)}')">复制</button>
            <button class="btn small danger" onclick="deleteWorld('${id}','${esc(w.name)}')">删除</button>`}</td>
       </tr>`).join('')}</tbody></table></div>` : '<div class="empty">暂无世界存档</div>';
   } catch (e) { $('#worlds-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
@@ -2629,9 +2828,20 @@ async function loadWorlds(id, t) {
 async function switchWorld(id, name) {
   try { await api(`/instances/${id}/worlds/switch`, { method: 'POST', body: { path: name } }); toast(`已切换到 ${name}`); loadWorlds(id); } catch (e) { toast(e.message, false); }
 }
+async function cloneWorld(id, name) {
+  const newName = await appPrompt(`复制世界「${name}」为新世界名称（不含空格）：`, `${name}_copy`, { title: '复制世界' });
+  if (!newName || !newName.trim()) return;
+  try {
+    await api(`/instances/${id}/worlds/clone`, { method: 'POST', body: { from: name, to: newName.trim() } });
+    toast(`世界已复制为 ${newName.trim()}`);
+    loadWorlds(id, routeToken);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
 async function deleteWorld(id, name) {
   if (!(await appConfirm(`确定删除世界「${name}」？不可恢复！`, { danger: true, okText: '删除' }))) return;
-  try { await api(`/instances/${id}/worlds/delete`, { method: 'POST', body: { path: name } }); toast('已删除'); loadWorlds(id); } catch (e) { toast(e.message, false); }
+  try { await api(`/instances/${id}/worlds/delete`, { method: 'POST', body: { name } }); toast('已删除'); loadWorlds(id, routeToken); } catch (e) { toast(e.message, false); }
 }
 async function createWorld(id) {
   const name = await appPrompt('新世界名称（不含空格）', '', { title: '新建世界' });

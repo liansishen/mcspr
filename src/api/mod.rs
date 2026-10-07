@@ -115,6 +115,10 @@ pub fn router(state: AppState) -> Router {
             get(game_backup::list).post(game_backup::create),
         )
         .route(
+            "/instances/{id}/game-backups/config",
+            post(game_backup::update_config),
+        )
+        .route(
             "/instances/{id}/game-backups/{name}",
             get(game_backup::download).delete(game_backup::delete),
         )
@@ -139,6 +143,7 @@ pub fn router(state: AppState) -> Router {
         .route("/instances/{id}/worlds", get(extras::worlds_list))
         .route("/instances/{id}/worlds/switch", post(extras::worlds_switch))
         .route("/instances/{id}/worlds/create", post(extras::worlds_create))
+        .route("/instances/{id}/worlds/clone", post(extras::worlds_clone))
         .route("/instances/{id}/worlds/delete", post(extras::worlds_delete))
         .route("/instances/{id}/tasks", get(extras::tasks_list).post(extras::tasks_create))
         .route("/instances/{id}/tasks/update", post(extras::tasks_update))

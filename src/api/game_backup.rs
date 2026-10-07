@@ -244,6 +244,21 @@ pub async fn delete(
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({ "ok": true })))
 }
+pub async fn update_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<game_backup::BackupConfigUpdate>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let dir = rt.dir.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        game_backup::update_config(&dir, &req)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({ "ok": true, "provider": provider })))
+}
 
 pub async fn restore(
     State(state): State<AppState>,
@@ -524,6 +539,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert!(!f.rt.dir.join("backups/old.zip").exists());
+        let update_res: serde_json::Value = client
+            .post(format!("{base}/config"))
+            .bearer_auth("unit-test-secret")
+            .json(&serde_json::json!({
+                "enabled": false,
+                "interval_hours": 2.5,
+                "keep": 15
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(update_res["provider"]["enabled"], false);
+        assert_eq!(update_res["provider"]["interval_hours"], 2.5);
+        assert_eq!(update_res["provider"]["keep"], 15);
         fs::rename(
             f.rt.dir.join("mods/ServerUtilities.jar"),
             f.rt.dir.join("mods/ServerUtilities.jar.disabled"),

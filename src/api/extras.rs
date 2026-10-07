@@ -622,14 +622,68 @@ pub async fn worlds_create(
     Ok(Json(json!({ "ok": true, "world": name })))
 }
 
+#[derive(Deserialize)]
+pub struct WorldOpReq {
+    pub name: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct WorldCloneReq {
+    pub from: String,
+    pub to: String,
+}
+
+pub async fn worlds_clone(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<WorldCloneReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    if *rt.status.lock().await != crate::instance::Status::Stopped {
+        return Err(ApiError::bad_request("复制世界前请先停止实例"));
+    }
+    let from = req.from.trim().to_string();
+    let to = req.to.trim().to_string();
+    if from.is_empty() || from.contains("..") || from.contains('/') || from.contains('\\') {
+        return Err(ApiError::bad_request("源世界名不合法"));
+    }
+    if to.is_empty()
+        || to.contains("..")
+        || to.contains('/')
+        || to.contains('\\')
+        || to.contains(' ')
+    {
+        return Err(ApiError::bad_request("新世界名不合法（不能含空格与路径符号）"));
+    }
+    let src = rt.dir.join(&from);
+    if !src.join("level.dat").exists() {
+        return Err(ApiError::not_found("源世界不存在"));
+    }
+    let dst = rt.dir.join(&to);
+    if dst.exists() {
+        return Err(ApiError::bad_request("目标世界已存在"));
+    }
+    tokio::task::spawn_blocking(move || copy_dir_all(&src, &dst))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::internal(format!("复制失败: {e}")))?;
+    Ok(Json(json!({ "ok": true, "world": to })))
+}
+
 pub async fn worlds_delete(
     State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
+    Path(id): Path<String>,
+    Json(req): Json<WorldOpReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
     if *rt.status.lock().await != crate::instance::Status::Stopped {
         return Err(ApiError::bad_request("删除世界前请先停止实例"));
     }
+    let name = req
+        .name
+        .or(req.path)
+        .ok_or_else(|| ApiError::bad_request("缺少世界名称"))?;
     let current = current_level(&rt.dir);
     if name == current {
         return Err(ApiError::bad_request("不能删除正在使用的世界"));
@@ -769,4 +823,77 @@ pub async fn configs_list(
         }
     }
     Ok(Json(json!({ "configs": out })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::InstanceMeta;
+
+    #[tokio::test]
+    async fn test_worlds_clone_and_delete() {
+        let temp = std::env::temp_dir().join(format!("mcspr-test-worlds-{}", uuid::Uuid::new_v4()));
+        let instances_dir = temp.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let cfg = crate::config::PanelConfig {
+            data_dir: temp.to_string_lossy().to_string(),
+            token: "test".into(),
+            ..Default::default()
+        };
+        let state = AppState::new(cfg).await.unwrap();
+        let inst_dir = instances_dir.join("test_inst");
+        std::fs::create_dir_all(&inst_dir).unwrap();
+        let meta = InstanceMeta {
+            id: "test_inst".into(),
+            name: "Test".into(),
+            ..Default::default()
+        };
+        let rt = crate::instance::InstanceRuntime::new(meta, inst_dir.clone());
+        state.instances.write().await.insert("test_inst".into(), rt);
+
+        let world1 = inst_dir.join("World1");
+        std::fs::create_dir_all(&world1).unwrap();
+        std::fs::write(world1.join("level.dat"), b"data").unwrap();
+        std::fs::write(inst_dir.join("server.properties"), "level-name=World1\n").unwrap();
+
+        let res = worlds_clone(
+            State(state.clone()),
+            Path("test_inst".into()),
+            Json(WorldCloneReq {
+                from: "World1".into(),
+                to: "World2".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.0["ok"], true);
+        assert!(inst_dir.join("World2").join("level.dat").exists());
+
+        let err = worlds_delete(
+            State(state.clone()),
+            Path("test_inst".into()),
+            Json(WorldOpReq {
+                name: Some("World1".into()),
+                path: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("正在使用"));
+
+        let res = worlds_delete(
+            State(state.clone()),
+            Path("test_inst".into()),
+            Json(WorldOpReq {
+                name: Some("World2".into()),
+                path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.0["ok"], true);
+        assert!(!inst_dir.join("World2").exists());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
 }
