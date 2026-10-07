@@ -231,6 +231,19 @@ pub async fn preview(
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({"preview": preview})))
 }
+pub async fn delete(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rt = get_instance(&state, &id).await?;
+    let p = provider(&rt).await?;
+    let dir = rt.dir.clone();
+    tokio::task::spawn_blocking(move || game_backup::delete(&dir, &p, &name))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
 
 pub async fn restore(
     State(state): State<AppState>,
@@ -503,6 +516,14 @@ mod tests {
             response.bytes().await.unwrap().as_ref(),
             fs::read(f.rt.dir.join("backups/old.zip")).unwrap()
         );
+        let response = client
+            .delete(format!("{base}/old.zip"))
+            .bearer_auth("unit-test-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!f.rt.dir.join("backups/old.zip").exists());
         fs::rename(
             f.rt.dir.join("mods/ServerUtilities.jar"),
             f.rt.dir.join("mods/ServerUtilities.jar.disabled"),

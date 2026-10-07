@@ -1001,9 +1001,49 @@ function consoleTabComplete(id) {
     input.value = parts.join(' ');
   }
 }
-function consoleLineParts(line) {
-  const m = /^(\[[^\]]+\])\s+(\[[^\]]+\])\s*(?:\[([^\]]+)\]\s*)?(.*)$/.exec(String(line));
-  return m ? [m[1], m[2], m[3] || '', m[4]] : null;
+function consoleLineParts(line, fallbackTs) {
+  const raw = String(line ?? '');
+
+  // 1. Timestamp: [HH:MM:SS] or [HH:MM]
+  const timeMatch = /^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*/.exec(raw);
+  let time = '';
+  let rest = raw;
+  if (timeMatch) {
+    time = '[' + timeMatch[1] + ']';
+    rest = raw.slice(timeMatch[0].length);
+  } else if (fallbackTs) {
+    time = '[' + fallbackTs + ']';
+  }
+
+  // 2. Thread / Level: e.g. [Server thread/INFO] or [INFO]
+  const levelMatch = /^(\[[^\]]+\])\s*/.exec(rest);
+  let level = '';
+  if (levelMatch) {
+    level = levelMatch[1];
+    rest = rest.slice(levelMatch[0].length);
+  }
+
+  if (!time && !level) return null;
+
+  // 3. Mod / Source tag: e.g. [examplemod]: or [FML]
+  let mod = '';
+  const weirdMatch = /^\[?([A-Za-z0-9_.-]+)\]?\s*\[:\s*(.*)\]$/.exec(rest);
+  if (weirdMatch) {
+    mod = weirdMatch[1];
+    rest = ': ' + weirdMatch[2];
+  } else {
+    const modMatch = /^\[([^\]]+)\](?::\s*|\s*)/.exec(rest);
+    if (modMatch) {
+      mod = modMatch[1];
+      rest = rest.slice(modMatch[0].length);
+      if (!rest.startsWith(':') && !rest.startsWith(' ')) rest = ': ' + rest;
+      else if (!rest.startsWith(':')) rest = ':' + rest;
+    }
+  }
+
+  if (rest.startsWith('::')) rest = rest.slice(1);
+
+  return [time, level, mod, rest];
 }
 function consoleBatch(message, lastSeq = 0) {
   if (message?.type === 'history' && Array.isArray(message.lines)) {
@@ -1064,14 +1104,30 @@ function renderTabConsole(id, el, t) {
     for (const o of items) {
       const line = String(o.line ?? ''), meta = consoleLineMeta(line);
       const div = document.createElement('div'); div.className = `cline ${meta.classes.join(' ')}`;
-      const match = consoleLineParts(line);
-      if (!match && o.ts) { const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = String(o.ts); div.appendChild(ts); }
+      const match = consoleLineParts(line, o.ts);
       if (match) {
-        for (const [text, cls] of [[match[1], 'log-time'], [match[2], meta.levelClass], [match[3] ? `[${match[3]}]` : '', 'log-mod'], [match[4], '']]) {
-          if (!text) continue;
-          const span = document.createElement('span'); if (cls) span.className = cls; span.textContent = text + (cls ? ' ' : ''); div.appendChild(span);
+        for (const [rawText, cls] of [
+          [match[0], 'log-time ts'],
+          [match[1], meta.levelClass],
+          [match[2] ? `[${match[2]}]` : '', 'log-mod'],
+          [match[3], '']
+        ]) {
+          if (!rawText) continue;
+          const text = rawText + (cls && !rawText.endsWith(' ') ? ' ' : '');
+          const span = document.createElement('span');
+          if (cls) span.className = cls;
+          span.textContent = text;
+          div.appendChild(span);
         }
-      } else div.appendChild(document.createTextNode(line));
+      } else {
+        if (o.ts) {
+          const ts = document.createElement('span');
+          ts.className = 'ts log-time';
+          ts.textContent = `[${o.ts}] `;
+          div.appendChild(ts);
+        }
+        div.appendChild(document.createTextNode(line));
+      }
       frag.appendChild(div);
     }
     logEl.appendChild(frag);
@@ -1840,7 +1896,7 @@ async function loadGameBackups(id, t, resumeJob = true) {
       <div class="row between" style="margin:12px 0"><span>状态：${statusPill(d.status)}${d.active_job ? ' · 任务进行中' : ''}</span><button id="gb-create" class="btn primary" ${!provider || !provider.enabled || !provider.command_enabled || d.status !== 'running' || d.active_job ? 'disabled' : ''} onclick="startGameBackup('${id}')">立即备份</button></div>
       <div id="gb-job"></div>${d.backups?.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>名称</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${d.backups.map(b => {
         const n = encodeURIComponent(b.name).replace(/'/g, '%27');
-        return `<tr><td class="mono">${esc(b.name)}${b.problem ? `<div class="muted small">${esc(b.problem)}</div>` : ''}</td><td>${fmtSize(b.size)}</td><td>${esc(b.created)}</td><td><button class="btn small" onclick="downloadGameBackup('${id}','${n}')">下载</button> <button class="btn small" ${b.problem ? 'disabled' : ''} onclick="previewGameBackup('${id}','${n}')">预览</button> <button class="btn small warn" ${b.problem || d.status !== 'stopped' || d.active_job ? 'disabled' : ''} onclick="restoreGameBackup('${id}','${n}')">恢复</button></td></tr>`;
+        return `<tr><td class="mono">${esc(b.name)}${b.problem ? `<div class="muted small">${esc(b.problem)}</div>` : ''}</td><td>${fmtSize(b.size)}</td><td>${esc(b.created)}</td><td><button class="btn small" onclick="downloadGameBackup('${id}','${n}')">下载</button> <button class="btn small" ${b.problem ? 'disabled' : ''} onclick="previewGameBackup('${id}','${n}')">预览</button> <button class="btn small warn" ${b.problem || d.status !== 'stopped' || d.active_job ? 'disabled' : ''} onclick="restoreGameBackup('${id}','${n}')">恢复</button> <button class="btn small danger" onclick="deleteGameBackup('${id}','${n}')">删除</button></td></tr>`;
       }).join('')}</tbody></table></div>` : '<div class="empty">暂无游戏内备份</div>'}`;
     if (resumeJob && (d.active_job || d.last_job)) watchGameBackupJob(d.active_job || d.last_job, t, id, !!d.active_job);
   } catch (e) { if (t === routeToken && $('#gb-body')) $('#gb-body').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
@@ -1866,6 +1922,17 @@ async function restoreGameBackup(id,name) {
     closeModal();
     if(t === routeToken) watchGameBackupJob(j.job_id,t,id);
   } catch(e) { toast(e.message,false); }
+}
+async function deleteGameBackup(id, name) {
+  const decoded = decodeURIComponent(name);
+  if (!await appConfirm(`确定删除游戏内备份「${decoded}」？\n文件将被彻底删除，不可恢复！`, { danger: true, okText: '彻底删除' })) return;
+  try {
+    await api(`/instances/${id}/game-backups/${name}`, { method: 'DELETE' });
+    toast('已删除');
+    loadGameBackups(id, routeToken);
+  } catch (e) {
+    toast(e.message, false);
+  }
 }
 function watchGameBackupJob(id, t, instanceId, refreshOnComplete = true) {
   const poll = async () => {

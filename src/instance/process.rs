@@ -180,7 +180,8 @@ async fn on_exit(
     }
 
     let code = res.ok().and_then(|s| s.code());
-    if stopping {
+    let clean_exit = stopping || code == Some(0);
+    if clean_exit {
         push_log(&rt, "[面板] 进程已停止".into()).await;
     } else {
         let code_str = code
@@ -294,6 +295,11 @@ fn force_kill(pid: u32) {
 }
 
 pub async fn send_command(rt: &Arc<InstanceRuntime>, cmd: &str) -> ApiResult<()> {
+    let trimmed = cmd.trim();
+    if trimmed.eq_ignore_ascii_case("stop") || trimmed.eq_ignore_ascii_case("/stop") {
+        rt.stopping.store(true, Ordering::SeqCst);
+        *rt.status.lock().await = Status::Stopping;
+    }
     let mut g = rt.stdin.lock().await;
     match g.as_mut() {
         Some(stdin) => {
@@ -357,6 +363,9 @@ fn java_version_hint(line: &str) -> Option<String> {
 }
 
 async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
+    if line.contains("Stopping the server") || line.contains("Stopping server") {
+        rt.stopping.store(true, Ordering::SeqCst);
+    }
     let seq = rt.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let ll = LogLine {
         seq,

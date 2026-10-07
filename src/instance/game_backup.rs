@@ -329,6 +329,10 @@ pub fn backup_file(dir: &Path, provider: &Provider, name: &str) -> Result<PathBu
     }
     Ok(path)
 }
+pub fn delete(dir: &Path, provider: &Provider, name: &str) -> Result<(), String> {
+    let path = backup_file(dir, provider, name)?;
+    fs::remove_file(path).map_err(|e| format!("删除备份失败: {e}"))
+}
 
 pub fn list(dir: &Path, provider: &Provider) -> Result<Vec<BackupInfo>, String> {
     let storage = backup_dir(dir, provider)?;

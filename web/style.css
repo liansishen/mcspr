@@ -194,7 +194,7 @@ b { color: var(--text); }
 .chip.active { color: var(--accent); border-color: var(--accent); background: rgba(74,222,128,.12); }
 
 /* ---------------- 表格 ---------------- */
-.table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
 .table th, .table td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .table th { background: var(--panel2); color: var(--muted); font-size: 12px; font-weight: 600; }
 .table tbody tr:hover td { background: var(--row-hover); }
@@ -520,6 +520,15 @@ body.detail-view #app { height: 100vh; min-height: 0; }
   flex-direction: column;
   gap: 10px;
 }
+#tab-body:has(#mods-body),
+#tab-body:has(#files-body),
+#tab-body:has(#props-body),
+#tab-body:has(#bk-body),
+#tab-body:has(#worlds-body),
+#tab-body:has(#tasks-body),
+#tab-body:has(#gb-body) {
+  overflow-y: hidden;
+}
 #mods-body, #files-body, #props-body, #bk-body, #worlds-body, #tasks-body, #gb-body {
   flex: 1;
   min-height: 0;
@@ -530,18 +539,24 @@ body.detail-view #app { height: 100vh; min-height: 0; }
   flex: 1;
   min-height: 120px;
   overflow: auto;
+  position: relative;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
 .table-wrap .table {
-  border-collapse: separate;
-  border-spacing: 0;
-  border: none;
-  border-radius: 0;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  border: none !important;
   margin: 0;
   width: 100%;
 }
+.table-wrap thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.table-wrap thead tr th,
 .table-wrap th {
   position: sticky;
   top: 0;
@@ -564,10 +579,23 @@ body.detail-view #app { height: 100vh; min-height: 0; }
   border: none;
   box-shadow: none;
 }
+:root.mc .table-wrap thead tr th,
 :root.mc .table-wrap th {
   background: #3a3a3a;
   border-bottom: 2px solid #000;
   box-shadow: 0 2px 0 #000;
+}
+:root.light .table-wrap thead tr th,
+:root.light .table-wrap th {
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 0 var(--border);
+}
+:root.claude .table-wrap thead tr th,
+:root.claude .table-wrap th {
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 0 var(--border);
 }
 #users-body .table-wrap {
   max-height: 240px;

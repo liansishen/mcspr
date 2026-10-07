@@ -116,7 +116,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/instances/{id}/game-backups/{name}",
-            get(game_backup::download),
+            get(game_backup::download).delete(game_backup::delete),
         )
         .route(
             "/instances/{id}/game-backups/{name}/preview",
