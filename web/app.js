@@ -2232,6 +2232,7 @@ async function renderTabFiles(id, el, t) {
         <button class="btn" onclick="filesUpload('${id}')">上传文件</button>
       </div>
     </div>
+    <div id="files-crumb" class="crumb"></div>
     <div id="files-body"><div class="empty">加载中…</div></div>`;
   await loadFiles(id, t, '');
 }
@@ -2251,11 +2252,13 @@ async function loadFiles(id, t, path) {
       acc = acc ? acc + '/' + p : p;
       crumbs += ` / <a onclick="loadFiles('${id}',${t},'${esc(acc)}')">${esc(p)}</a>`;
     }
-    $('#files-crumb').innerHTML = crumbs;
+    const crumbEl = $('#files-crumb');
+    if (crumbEl) crumbEl.innerHTML = crumbs;
     filesEntriesCache = { id, t, path, entries: entries || [] };
     renderFilesList(filesEntriesCache.entries, '');
   } catch (e) {
-    $('#files-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    const bodyEl = $('#files-body');
+    if (bodyEl) bodyEl.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
 
@@ -2282,9 +2285,12 @@ function renderFilesList(entries, q = '') {
       <button class="btn small danger" onclick="deleteFile('${id}','${esc(full(f))}')">删除</button>
     </td></tr>`).join('');
   const emptyText = q ? '未找到匹配的文件' : '空目录';
-  $('#files-body').innerHTML = `<div class="table-wrap"><table class="table">
+  const bodyEl = $('#files-body');
+  if (bodyEl) {
+    bodyEl.innerHTML = `<div class="table-wrap"><table class="table">
     <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
     <tbody>${rows || `<tr><td colspan="4" class="muted">${emptyText}</td></tr>`}</tbody></table></div>`;
+  }
 }
 
 async function editFile(id, path) {
