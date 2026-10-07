@@ -43,6 +43,17 @@ impl AppStateInner {
 #[derive(Clone)]
 pub struct AppState(pub Arc<AppStateInner>);
 
+pub struct BusyGuard {
+    state: AppState,
+    id: String,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.state.release_busy(&self.id);
+    }
+}
+
 impl std::ops::Deref for AppState {
     type Target = AppStateInner;
     fn deref(&self) -> &Self::Target {
@@ -51,6 +62,12 @@ impl std::ops::Deref for AppState {
 }
 
 impl AppState {
+    pub fn busy_guard(&self, id: &str) -> Option<BusyGuard> {
+        self.acquire_busy(id).then(|| BusyGuard {
+            state: self.clone(),
+            id: id.to_string(),
+        })
+    }
     pub async fn new(cfg: PanelConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.instances_dir())?;
         let instances = crate::instance::scan_instances(&cfg.instances_dir());

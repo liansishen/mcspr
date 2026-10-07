@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod game_backup;
 pub mod files;
 pub mod javainstall;
 pub mod loaders;

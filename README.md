@@ -30,9 +30,17 @@
 - 用户管理：在线玩家快捷操作，OP / 白名单 / 封禁玩家 / 封禁 IP（运行中实时生效，停止时读写对应 JSON 文件，UUID 自动解析）
 - 计划任务：定时执行命令 / 备份 / 重启，连续失败自动告警
 - 备份：全量 tar.gz，恢复前预览差异，按份数与天数自动清理
+- 游戏内备份：识别 ServerUtilities 模组与配置，在独立标签页触发模组备份、列出和下载 ZIP、预览及停止后恢复；恢复前保留受影响数据副本
 - Java 环境：扫描本机全部 Java（各发行版 / 启动器自带 / IDE 下载），一键安装 Temurin JRE 8 / 11 / 17 / 21 / 25
 - 四套主题：深色 / 亮色 / MC 像素（内置中文像素字体）/ Claude（暖纸色），侧边栏底部下拉切换
 
+### 游戏内备份
+
+打开实例详情的「游戏内备份」标签页，可查看 ServerUtilities 的版本、自动备份间隔、保留数量和历史 ZIP。实例完成启动后点击「立即备份」，面板发送 `backup start`，等待模组完成并校验归档。返回标签页时可继续查看最近任务的日志；「刷新」可更新模组自动生成的备份。
+
+恢复前先停止实例，预览世界及额外文件范围，并确认所选备份。面板完整校验 ZIP，暂存解压结果，再保存当前受影响数据并安装备份；恢复前副本位于实例的 `.mcspr-recovery/<时间-唯一标识>/`，任务日志显示具体位置。恢复完成后手动启动实例。生产世界恢复会回退玩家进度，请明确恢复点并保留当前副本。
+
+当前支持 ServerUtilities；其备份目录须位于实例内。拒绝路径穿越、符号链接、保护路径、重复冲突条目及超过 32 GB 或 200,000 条目的归档。列表中损坏的 ZIP 会显示异常提示，预览和恢复执行完整 CRC 校验。
 ## 🚀 快速开始
 
 **方式一：下载预编译版本**
@@ -130,6 +138,7 @@ WantedBy=multi-user.target
 | 模组市场 | `GET /api/moddb/search` `.../versions` `.../projects` · `POST /api/moddb/version-files` |
 | 文件 | `GET .../files` · `GET/PUT .../files/content` · `POST .../files/mkdir` `.../delete` `.../rename` `.../upload` `.../extract` `.../archive` · `GET .../files/download` `.../archive-download` |
 | 备份与世界 | `GET/POST /api/instances/{id}/backups` · `GET .../backups/{name}/preview` · `POST .../backups/{name}/restore` · `GET .../backups/{name}/download` · `DELETE .../backups/{name}` · `GET/POST .../worlds` `.../worlds/switch` `.../worlds/create` `.../worlds/delete` |
+| 游戏内备份 | `GET/POST /api/instances/{id}/game-backups` · `GET .../game-backups/{name}` · `GET .../game-backups/{name}/preview` · `POST .../game-backups/{name}/restore` |
 | 计划任务 | `GET/POST .../tasks` · `POST .../tasks/update` |
 | Java | `GET /api/javas` · `POST /api/javas/scan` · `GET /api/java-install/list` · `POST /api/java-install/{major}` |
 | 其他 | `GET/POST .../users` `.../users/action` · `GET/PUT .../properties` · `POST .../clone` `.../reinstall` · `GET .../icon` · `POST /api/instances/import/upload` `.../import/path` · `POST /api/instances/{id}/modpack/preview` `.../modpack/apply` · `GET /api/jobs/{id}` |

@@ -8,6 +8,9 @@ pub struct Job {
     pub progress: u8,   // 0-100，仅下载类任务使用
     pub logs: Vec<String>,
     pub instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub created_at: String,
 }
 
 impl Job {
@@ -18,11 +21,17 @@ impl Job {
             progress: 0,
             logs: Vec::new(),
             instance_id: None,
+            kind: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
         }
     }
 
     pub fn log(&mut self, msg: impl Into<String>) {
-        let line = format!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg.into());
+        let line = format!(
+            "[{}] {}",
+            chrono::Local::now().format("%H:%M:%S"),
+            msg.into()
+        );
         self.logs.push(line);
         if self.logs.len() > 400 {
             self.logs.drain(0..self.logs.len() - 400);
@@ -31,19 +40,34 @@ impl Job {
 }
 
 pub fn log_job(state: &AppState, id: &str, msg: impl Into<String>) {
-    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
+    if let Some(j) = state
+        .jobs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(id)
+    {
         j.log(msg);
     }
 }
 
 pub fn set_progress(state: &AppState, id: &str, pct: u8) {
-    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
+    if let Some(j) = state
+        .jobs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(id)
+    {
         j.progress = pct;
     }
 }
 
 pub fn finish_job(state: &AppState, id: &str, err: Option<String>, instance_id: Option<String>) {
-    if let Some(j) = state.jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id) {
+    if let Some(j) = state
+        .jobs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(id)
+    {
         match err {
             Some(e) => {
                 j.status = "error".into();

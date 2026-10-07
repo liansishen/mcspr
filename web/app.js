@@ -185,28 +185,30 @@ function refresh() { route(); }
 window.addEventListener('hashchange', route);
 
 async function route() {
+  const t = ++routeToken;
   clearTimers();
   const hash = location.hash.replace(/^#/, '') || '/dashboard';
   const parts = hash.split('/').filter(Boolean);
+  document.body.classList.toggle('detail-view', parts[0] === 'instance' && !!parts[1]);
+  $('#main').classList.toggle('detail-layout', parts[0] === 'instance' && !!parts[1]);
   $$('#nav a').forEach(a => {
     const nav = a.dataset.nav;
     const active = (nav === 'instances' && parts[0] === 'instance') || nav === parts[0];
     a.classList.toggle('active', active);
   });
   try {
-    if (parts[0] === 'dashboard') await renderDashboard();
-    else if (parts[0] === 'instances') await renderInstances();
-    else if (parts[0] === 'instance' && parts[1]) await renderInstance(parts[1], parts[2] || 'console');
-    else if (parts[0] === 'settings') await renderPanelSettings();
+    if (parts[0] === 'dashboard') await renderDashboard(t);
+    else if (parts[0] === 'instances') await renderInstances(t);
+    else if (parts[0] === 'instance' && parts[1]) await renderInstance(parts[1], parts[2] || 'console', t);
+    else if (parts[0] === 'settings') await renderPanelSettings(t);
     else location.hash = '#/dashboard';
   } catch (e) {
-    $('#main').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+    if (t === routeToken) $('#main').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
   }
 }
 
 /* ---------------- 仪表盘 ---------------- */
-async function renderDashboard() {
-  const t = ++routeToken;
+async function renderDashboard(t = ++routeToken) {
   $('#main').innerHTML = `<h1>仪表盘</h1><div id="dash"><div class="empty">加载中…</div></div>`;
   const load = async () => {
     try {
@@ -258,12 +260,11 @@ async function renderDashboard() {
     }
   };
   await load();
-  every(3000, load);
+  if (t === routeToken) every(3000, load);
 }
 
 /* ---------------- 实例列表 ---------------- */
-async function renderInstances() {
-  const t = ++routeToken;
+async function renderInstances(t = ++routeToken) {
   $('#main').innerHTML = `
     <div class="page-head"><h1>实例管理</h1>
       <div class="row">
@@ -293,11 +294,11 @@ async function renderInstances() {
           </td></tr>`).join('')}</tbody></table>`
         : '<div class="empty">暂无实例。点击右上角「导入整合包」或「新建空白实例」开始。</div>';
     } catch (e) {
-      $('#inst-list').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+      if (t === routeToken) $('#inst-list').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
     }
   };
   await load();
-  every(3000, load);
+  if (t === routeToken) every(3000, load);
 }
 
 let usersData = null;
@@ -717,23 +718,38 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['game-backups', '游戏内备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
 
-async function renderInstance(id, tab) {
-  const t = ++routeToken;
+function instanceRuntimeText(s) {
+  return (s.status === 'running' || s.status === 'starting')
+    ? `已运行 ${fmtUptime(s.uptime_secs)} · PID ${s.pid || '-'} · ${s.players || 0} 名玩家在线`
+    : STATUS_TEXT[s.status] || s.status;
+}
+
+async function renderInstance(id, tab, t = ++routeToken) {
   let s;
   try { s = await api(`/instances/${id}`); }
-  catch (e) { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  catch (e) { if (t === routeToken) $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  if (t !== routeToken) return;
   currentInstanceInfo = s;
-  $('#main').innerHTML = `
-    <div class="page-head">
-      <div><h1>${esc(s.name)} ${statusPill(s.status)}</h1><div class="muted small" id="inst-sub"></div></div>
-      <div class="row" id="inst-actions"></div>
-    </div>
+  const main = $('#main');
+  if (main.dataset.instanceId === String(id) && $('#tab-body')) {
+    $$('#main > .detail-tabs .tab').forEach(a => a.classList.toggle('active', a.getAttribute('href') === `#/instance/${id}/${tab}`));
+    $('#tab-body').replaceChildren();
+    $('#tab-body').scrollTop = 0;
+  } else {
+    main.dataset.instanceId = String(id);
+    main.classList.add('detail-layout');
+    main.innerHTML = `
+    <div class="page-head detail-head"><div class="detail-title"><h1><span id="inst-name">${esc(s.name)}</span><span id="inst-status">${statusPill(s.status)}</span><span class="muted small" id="inst-sub"></span></h1></div><div class="row" id="inst-actions"></div></div>
     <div id="eula-banner"></div>
-    <div class="tabs">${INST_TABS.map(([k, label]) =>
-      `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
+    <div class="tabs detail-tabs">${INST_TABS.map(([k, label]) => `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
     <div id="tab-body"></div>`;
+  }
+  $('#inst-name').textContent = s.name;
+  $('#inst-status').innerHTML = statusPill(s.status);
+  $('#inst-sub').textContent = instanceRuntimeText(s);
+  $('#inst-actions').innerHTML = actionButtons(id, s.status);
   const body = $('#tab-body');
   if (tab === 'console') renderTabConsole(id, body, t);
   else if (tab === 'monitor') renderTabMonitor(id, body, t);
@@ -743,24 +759,29 @@ async function renderInstance(id, tab) {
   else if (tab === 'tasks') renderTabTasks(id, body, t);
   else if (tab === 'files') renderTabFiles(id, body, t);
   else if (tab === 'props') renderTabProps(id, body, t);
+  else if (tab === 'game-backups') renderTabGameBackups(id, body, t);
   else renderTabSettings(id, body);
 
   const upd = async () => {
     try {
       const s2 = await api(`/instances/${id}/status`);
       if (t !== routeToken) return;
+      const previousStatus = currentInstanceInfo?.status;
+      currentInstanceInfo = { ...currentInstanceInfo, ...s2 };
       $('#inst-actions').innerHTML = actionButtons(id, s2.status);
+      const pill = $('#inst-status .pill');
+      if (pill) { pill.className = `pill st-${esc(s2.status)}`; pill.textContent = STATUS_TEXT[s2.status] || s2.status; }
+      const sub = $('#inst-sub');
+      if (sub) sub.textContent = instanceRuntimeText(s2);
       $('#eula-banner').innerHTML =
         (!s2.eula_accepted && (s2.status === 'stopped'))
           ? `<div class="banner warn"><span>该实例尚未同意 Minecraft EULA，直接启动会失败。</span><button class="btn small" onclick="acceptEula('${id}')">同意 EULA 并继续</button></div>`
           : '';
-      $('#inst-sub').textContent = (s2.status === 'running' || s2.status === 'starting')
-        ? `已运行 ${fmtUptime(s2.uptime_secs)} · PID ${s2.pid || '-'} · ${s2.players} 名玩家在线${s2.player_names.length ? '：' + s2.player_names.join(', ') : ''}`
-        : '';
+      if (tab === 'game-backups' && previousStatus !== s2.status) loadGameBackups(id, t);
     } catch {}
   };
   await upd();
-  every(2500, upd);
+  if (t === routeToken) every(2500, upd);
 }
 
 function actionButtons(id, status) {
@@ -941,7 +962,7 @@ function applyConsoleFilter() {
     let show = true;
     if (q && !text.includes(q)) show = false;
     if (lvl === 'err' && !div.classList.contains('err')) show = false;
-    if (lvl === 'warn' && !div.classList.contains('warn')) show = false;
+    if (lvl === 'warn' && !div.classList.contains('warn') && !div.classList.contains('err')) show = false;
     div.style.display = show ? '' : 'none';
   }
 }
@@ -980,6 +1001,28 @@ function consoleTabComplete(id) {
     input.value = parts.join(' ');
   }
 }
+function consoleLineParts(line) {
+  const m = /^(\[[^\]]+\])\s+(\[[^\]]+\])\s*(?:\[([^\]]+)\]\s*)?(.*)$/.exec(String(line));
+  return m ? [m[1], m[2], m[3] || '', m[4]] : null;
+}
+function consoleBatch(message, lastSeq = 0) {
+  if (message?.type === 'history' && Array.isArray(message.lines)) {
+    const seq = Number(message.cursor) || Math.max(0, ...message.lines.map(x => Number(x.seq) || 0));
+    return { replace: true, lines: message.lines, cursor: message.cursor ?? 0, lastSeq: seq };
+  }
+  if (message?.line !== undefined && (!message.seq || message.seq > lastSeq))
+    return { replace: false, lines: [message], cursor: message.seq ?? lastSeq, lastSeq: message.seq ?? lastSeq };
+  return { replace: false, lines: [], cursor: lastSeq, lastSeq };
+}
+function consoleLineMeta(line) {
+  const classes = [];
+  if (/ERROR|FATAL|Exception|崩溃|\[ERROR\]/i.test(line)) classes.push('err');
+  else if (/WARN|警告|\[WARN\]/i.test(line)) classes.push('warn');
+  if (/\[(?:[^\]]*\/)?INFO\].*(?:Done|完成)/i.test(line)) classes.push('log-success');
+  if (/ joined the game| left the game|加入了游戏|离开了游戏/i.test(line)) classes.push('log-player');
+  const level = /(?:\/|\[)(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\]/i.exec(line)?.[1]?.toLowerCase() || '';
+  return { classes, levelClass: `log-level-${level}` };
+}
 
 function renderTabConsole(id, el, t) {
   el.innerHTML = `
@@ -1011,18 +1054,51 @@ function renderTabConsole(id, el, t) {
     </div>`;
   const logEl = $('#console-log');
   const maxLines = 800;
-  let retryTimer = null;
-
-  const append = o => {
-    const nearBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 60;
-    const div = document.createElement('div');
-    div.className = 'cline';
-    if (/ERROR|FATAL|Exception|崩溃/.test(o.line)) div.classList.add('err');
-    else if (/WARN|警告/.test(o.line)) div.classList.add('warn');
-    div.innerHTML = `<span class="ts">${esc(o.ts)}</span>${esc(o.line)}`;
-    logEl.appendChild(div);
-    while (logEl.children.length > maxLines) logEl.removeChild(logEl.firstChild);
-    if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+  let retryTimer = null, pollTimer = null, cursor = 0, lastSeq = 0, wsReady = false;
+  const stopPoll = () => { if (pollTimer) clearTimeout(pollTimer); pollTimer = null; };
+  const appendMany = (items, forceBottom = false) => {
+    const oldTop = logEl.scrollTop;
+    if (forceBottom && items.length > maxLines) items = items.slice(-maxLines);
+    const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= 60;
+    const frag = document.createDocumentFragment();
+    for (const o of items) {
+      const line = String(o.line ?? ''), meta = consoleLineMeta(line);
+      const div = document.createElement('div'); div.className = `cline ${meta.classes.join(' ')}`;
+      const match = consoleLineParts(line);
+      if (!match && o.ts) { const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = String(o.ts); div.appendChild(ts); }
+      if (match) {
+        for (const [text, cls] of [[match[1], 'log-time'], [match[2], meta.levelClass], [match[3] ? `[${match[3]}]` : '', 'log-mod'], [match[4], '']]) {
+          if (!text) continue;
+          const span = document.createElement('span'); if (cls) span.className = cls; span.textContent = text + (cls ? ' ' : ''); div.appendChild(span);
+        }
+      } else div.appendChild(document.createTextNode(line));
+      frag.appendChild(div);
+    }
+    logEl.appendChild(frag);
+    let removedHeight = 0;
+    while (logEl.children.length > maxLines) {
+      removedHeight += logEl.firstChild.offsetHeight;
+      logEl.removeChild(logEl.firstChild);
+    }
+    applyConsoleFilter();
+    logEl.scrollTop = forceBottom || nearBottom ? logEl.scrollHeight : Math.max(0, oldTop - removedHeight);
+  };
+  const pollConsole = async () => {
+    if (t !== routeToken) return;
+    try {
+      let d = await api(`/instances/${id}/console?after=${cursor}`);
+      if (t !== routeToken || wsReady) return;
+      const initial = cursor === 0;
+      if (d.cursor < cursor) {
+        cursor = 0; lastSeq = 0; logEl.replaceChildren();
+        d = await api(`/instances/${id}/console?after=0`);
+        if (t !== routeToken || wsReady) return;
+      }
+      const fresh = (d.lines || []).filter(x => !x.seq || x.seq > lastSeq);
+      if (fresh.length) { appendMany(fresh, initial || lastSeq === 0); lastSeq = Math.max(lastSeq, ...fresh.map(x => Number(x.seq) || 0)); }
+      cursor = d.cursor ?? cursor;
+    } catch {}
+    if (t === routeToken && !wsReady) { pollTimer = setTimeout(pollConsole, 2000); timers.push(pollTimer); }
   };
 
   const connect = () => {
@@ -1030,10 +1106,21 @@ function renderTabConsole(id, el, t) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/api/instances/${id}/ws?token=${encodeURIComponent(TOKEN)}`);
     activeWS = ws;
-    ws.onmessage = e => { try { append(JSON.parse(e.data)); } catch {} };
-    ws.onopen = () => { logEl.innerHTML = ''; };
+    ws.onmessage = e => {
+      if (t !== routeToken || activeWS !== ws) return;
+      try {
+        const batch = consoleBatch(JSON.parse(e.data), lastSeq);
+        if (batch.replace) { logEl.replaceChildren(); appendMany(batch.lines, true); }
+        else if (batch.lines.length) appendMany(batch.lines);
+        cursor = batch.cursor ?? cursor;
+        lastSeq = batch.lastSeq;
+      } catch {}
+    };
+    ws.onopen = () => { wsReady = true; stopPoll(); };
     ws.onclose = () => {
-      if (t === routeToken && activeWS === ws) { retryTimer = setTimeout(connect, 3000); }
+      if (t === routeToken && activeWS === ws) {
+        wsReady = false; pollConsole(); retryTimer = setTimeout(connect, 3000); timers.push(retryTimer);
+      }
     };
   };
   connect();
@@ -1049,7 +1136,7 @@ function renderTabConsole(id, el, t) {
     } catch (e) { toast(e.message, false); }
   };
   $('#cmd-send').onclick = send;
-  $('#cmd-input').onkeydown = e => { if (e.key === 'Enter') send(); };
+  $('#cmd-input').onkeydown = e => consoleKeydown(e, id);
 
   // 用户管理
   usersInstanceId = id;
@@ -1737,6 +1824,69 @@ async function downloadQueue() {
   } catch {}
 }
 /* ---------------- 备份 ---------------- */
+async function renderTabGameBackups(id, el, t) {
+  el.innerHTML = `<div class="row between"><h2>游戏内备份</h2><button class="btn" onclick="loadGameBackups('${id}',routeToken)">刷新</button></div><div id="gb-body"><div class="empty">加载中…</div></div>`;
+  await loadGameBackups(id, t);
+}
+async function loadGameBackups(id, t, resumeJob = true) {
+  try {
+    const d = await api(`/instances/${id}/game-backups`);
+    if (t !== routeToken) return;
+    const target = $('#gb-body'); if (!target) return;
+    const provider = d.provider;
+    target.innerHTML = `${provider ? `<div class="card"><b>ServerUtilities ${esc(provider.version)}</b><p class="muted small">${provider.enabled ? '已启用' : '未启用'}；自动保留最近 ${provider.keep} 份，备份目录 ${esc(provider.backup_dir)}。${provider.interval_hours ? `自动间隔 ${provider.interval_hours} 小时。` : ''}${provider.need_online_players ? '仅在线玩家数满足条件时自动备份。' : ''}${provider.only_claimed ? '仅备份已认领区域。' : ''}</p></div>` : '<div class="banner warn">当前实例未识别到支持的游戏内备份模组；目前支持 ServerUtilities。</div>'}
+      ${provider && (!provider.enabled || !provider.command_enabled) ? `<div class="banner warn">${provider.enabled ? 'backup 命令已禁用，无法立即备份。' : 'ServerUtilities 配置已禁用，无法创建游戏内备份。'}</div>` : ''}
+      <p class="muted small">立即备份需要实例完成启动；恢复需要先停止实例。恢复前会保留当前受影响的数据，完成后请手动启动。</p>
+      <div class="row between" style="margin:12px 0"><span>状态：${statusPill(d.status)}${d.active_job ? ' · 任务进行中' : ''}</span><button id="gb-create" class="btn primary" ${!provider || !provider.enabled || !provider.command_enabled || d.status !== 'running' || d.active_job ? 'disabled' : ''} onclick="startGameBackup('${id}')">立即备份</button></div>
+      <div id="gb-job"></div>${d.backups?.length ? `<table class="table"><thead><tr><th>名称</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${d.backups.map(b => {
+        const n = encodeURIComponent(b.name).replace(/'/g, '%27');
+        return `<tr><td class="mono">${esc(b.name)}${b.problem ? `<div class="muted small">${esc(b.problem)}</div>` : ''}</td><td>${fmtSize(b.size)}</td><td>${esc(b.created)}</td><td><button class="btn small" onclick="downloadGameBackup('${id}','${n}')">下载</button> <button class="btn small" ${b.problem ? 'disabled' : ''} onclick="previewGameBackup('${id}','${n}')">预览</button> <button class="btn small warn" ${b.problem || d.status !== 'stopped' || d.active_job ? 'disabled' : ''} onclick="restoreGameBackup('${id}','${n}')">恢复</button></td></tr>`;
+      }).join('')}</tbody></table>` : '<div class="empty">暂无游戏内备份</div>'}`;
+    if (resumeJob && (d.active_job || d.last_job)) watchGameBackupJob(d.active_job || d.last_job, t, id, !!d.active_job);
+  } catch (e) { if (t === routeToken && $('#gb-body')) $('#gb-body').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+async function startGameBackup(id) {
+  const t = routeToken, button = $('#gb-create');
+  if (button) button.disabled = true;
+  try {
+    const j = await api(`/instances/${id}/game-backups`, {method:'POST'});
+    if (t === routeToken) watchGameBackupJob(j.job_id, t, id);
+  } catch(e) { toast(e.message,false); if (t === routeToken) loadGameBackups(id, t); }
+}
+async function downloadGameBackup(id,name) { try { const r=await fetch(`/api/instances/${id}/game-backups/${name}`,{headers:headers()}); if(!r.ok)throw new Error(r.statusText); const a=document.createElement('a'); a.href=URL.createObjectURL(await r.blob()); a.download=decodeURIComponent(name); a.click(); URL.revokeObjectURL(a.href); } catch(e) { toast(e.message,false); } }
+async function previewGameBackup(id,name) { try { const d=await api(`/instances/${id}/game-backups/${name}/preview`),p=d.preview; showModal(`<h2>游戏内备份预览</h2><p>${p.files} 个文件 · ${fmtSize(p.total_size)}</p><p>世界：${esc(p.world||'未知')}；包含：${(p.roots||[]).map(esc).join('、')}</p><p>恢复前副本目录：${esc(p.recovery_directory)}</p><div class="banner warn">恢复会使世界回退到备份时间点。恢复前会保留现有受影响的数据。</div><div class="row right"><button class="btn" onclick="closeModal()">关闭</button><button class="btn warn" ${currentInstanceInfo?.status!=='stopped'?'disabled':''} onclick="restoreGameBackup('${id}','${name}')">继续恢复</button></div>`); } catch(e) { toast(e.message,false); } }
+async function restoreGameBackup(id,name) {
+  if(currentInstanceInfo?.status!=='stopped') return toast('恢复要求实例已停止',false);
+  const t = routeToken;
+  try {
+    const d=await api(`/instances/${id}/game-backups/${name}/preview`), p=d.preview;
+    if(t !== routeToken) return;
+    if(!await appConfirm(`备份：${decodeURIComponent(name)}。世界 ${p.world||'未知'} 将回退；原数据保留于 ${p.recovery_directory}。确认恢复？`,{title:'确认世界回退',okText:'恢复',danger:true})) return;
+    const j=await api(`/instances/${id}/game-backups/${name}/restore`,{method:'POST'});
+    closeModal();
+    if(t === routeToken) watchGameBackupJob(j.job_id,t,id);
+  } catch(e) { toast(e.message,false); }
+}
+function watchGameBackupJob(id, t, instanceId, refreshOnComplete = true) {
+  const poll = async () => {
+    if(t !== routeToken) return;
+    try {
+      const j = await api(`/jobs/${id}`);
+      if(t !== routeToken) return;
+      const logs = Array.isArray(j.logs) ? j.logs : [];
+      const terminal = ['done','error','failed','cancelled'].includes(j.status);
+      const html = `<div class="card"><b>任务：${esc(j.status)}</b><div class="job-log">${logs.map(esc).join('\n')||'暂无任务日志'}</div>${['error','failed'].includes(j.status)?'<div class="banner warn">操作失败，请检查任务日志和实例数据状态。</div>':''}</div>`;
+      if(terminal && refreshOnComplete) await loadGameBackups(instanceId,t,false);
+      if(t !== routeToken) return;
+      const box = $('#gb-job'); if(box) box.innerHTML = html;
+      if(!terminal) { const timer=setTimeout(poll,1500); timers.push(timer); }
+    } catch(e) {
+      if(t !== routeToken) return;
+      const box = $('#gb-job'); if(box) box.innerHTML = `<div class="banner warn">任务状态查询失败：${esc(e.message)}</div>`;
+    }
+  };
+  poll();
+}
 async function renderTabBackups(id, el, t) {
   el.innerHTML = `
     <div class="row between"><h2>备份</h2>
@@ -2273,8 +2423,7 @@ async function saveInstance(id) {
 }
 
 /* ---------------- 面板设置 ---------------- */
-async function renderPanelSettings() {
-  const t = ++routeToken;
+async function renderPanelSettings(t = ++routeToken) {
   const c = await api('/settings');
   if (t !== routeToken) return;
   $('#main').innerHTML = `<h1>面板设置</h1>

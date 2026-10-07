@@ -71,6 +71,10 @@ fn decode_bytes(bytes: &[u8]) -> String {
 }
 
 async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()> {
+    let id = rt.meta.read().await.id.clone();
+    let _busy = state.busy_guard(&id).ok_or_else(|| {
+        ApiError::bad_request("该实例有整体操作正在进行，请稍候再启动")
+    })?;
     {
         let mut st = rt.status.lock().await;
         if *st != Status::Stopped {

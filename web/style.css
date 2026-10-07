@@ -462,3 +462,30 @@ a { color: var(--blue); }
   .theme-select { font-size: 16px; padding: 12px; text-align: center; }
   .side-foot { display: none; }
 }
+
+/* 详情页在视口内滚动，标题与标签保持可见。 */
+body.detail-view { overflow: hidden; }
+body.detail-view #app { height: 100vh; min-height: 0; }
+#main.detail-layout { height: 100vh; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding-bottom: 18px; }
+.detail-head, .detail-tabs { flex-shrink: 0; }
+.detail-title h1 { display:flex; align-items:center; gap:10px; margin:0; }
+#inst-sub { font-weight:400; }
+.detail-tabs { position:sticky; top:0; z-index:5; background:var(--bg); overflow-x:auto; flex-wrap:nowrap; margin-bottom:10px; }
+#tab-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+.console-wrap { height:100%; min-height:0; }
+.console { min-height:0; }
+.log-time { color:var(--console-ts); }
+.log-mod { color:var(--purple); }
+.log-level-info { color:var(--accent); }
+.log-level-warn, .log-level-warning { color:var(--warn); }
+.log-level-error, .log-level-fatal { color:var(--danger); }
+.log-level-debug, .log-level-trace { color:var(--muted); }
+.cline.log-success { color:var(--accent); }
+.cline.log-player { color:var(--blue); }
+@media (max-width: 760px) {
+  body.detail-view #app { height: 100dvh; }
+  #main.detail-layout { height: 100dvh; padding: 12px 10px; }
+  .detail-tabs { gap: 0; }
+  .detail-tabs .tab { white-space: nowrap; padding: 9px 12px; }
+  .console-wrap { min-height: 280px; }
+}

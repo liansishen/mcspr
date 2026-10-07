@@ -1,4 +1,5 @@
 mod backup;
+mod game_backup;
 mod extras;
 mod console;
 mod instances;
@@ -108,6 +109,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/instances/{id}/backups/{name}/restore",
             post(backup::restore),
+        )
+        .route(
+            "/instances/{id}/game-backups",
+            get(game_backup::list).post(game_backup::create),
+        )
+        .route(
+            "/instances/{id}/game-backups/{name}",
+            get(game_backup::download),
+        )
+        .route(
+            "/instances/{id}/game-backups/{name}/preview",
+            get(game_backup::preview),
+        )
+        .route(
+            "/instances/{id}/game-backups/{name}/restore",
+            post(game_backup::restore),
         )
         .route("/java", get(java_version))
         .route("/audit", get(audit_query))
