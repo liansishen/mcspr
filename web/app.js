@@ -276,7 +276,7 @@ async function renderInstances(t = ++routeToken) {
     try {
       const { instances } = await api('/instances');
       if (t !== routeToken) return;
-      $('#inst-list').innerHTML = instances.length ? `<table class="table">
+      $('#inst-list').innerHTML = instances.length ? `<div class="table-wrap"><table class="table">
         <thead><tr><th>名称</th><th>状态</th><th>玩家</th><th>内存</th><th>操作</th></tr></thead>
         <tbody>${instances.map(i => `<tr>
           <td><a href="#/instance/${i.id}/console">${esc(i.name)}</a><div class="muted small">${i.jar ? esc(i.jar) : (i.jvm_args ? '启动参数模式' : '未配置主程序')}</div></td>
@@ -291,7 +291,7 @@ async function renderInstances(t = ++routeToken) {
             <button class="btn small ghost" onclick="openFolder('${i.id}')">目录</button>
             <button class="btn small" onclick="cloneInstance('${i.id}','${esc(i.name)}')">克隆</button>
             <button class="btn small danger" onclick="delInstance('${i.id}','${esc(i.name)}')">删除</button>
-          </td></tr>`).join('')}</tbody></table>`
+          </td></tr>`).join('')}</tbody></table></div>`
         : '<div class="empty">暂无实例。点击右上角「导入整合包」或「新建空白实例」开始。</div>';
     } catch (e) {
       if (t === routeToken) $('#inst-list').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
@@ -723,7 +723,7 @@ const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '�
 function instanceRuntimeText(s) {
   return (s.status === 'running' || s.status === 'starting')
     ? `已运行 ${fmtUptime(s.uptime_secs)} · PID ${s.pid || '-'} · ${s.players || 0} 名玩家在线`
-    : STATUS_TEXT[s.status] || s.status;
+    : '';
 }
 
 async function renderInstance(id, tab, t = ++routeToken) {
@@ -741,7 +741,7 @@ async function renderInstance(id, tab, t = ++routeToken) {
     main.dataset.instanceId = String(id);
     main.classList.add('detail-layout');
     main.innerHTML = `
-    <div class="page-head detail-head"><div class="detail-title"><h1><span id="inst-name">${esc(s.name)}</span><span id="inst-status">${statusPill(s.status)}</span><span class="muted small" id="inst-sub"></span></h1></div><div class="row" id="inst-actions"></div></div>
+    <div class="page-head detail-head"><div class="detail-title"><h1><span id="inst-name">${esc(s.name)}</span></h1></div><div class="detail-status"><span id="inst-status">${statusPill(s.status)}</span><span class="muted small" id="inst-sub"></span></div><div class="row" id="inst-actions"></div></div>
     <div id="eula-banner"></div>
     <div class="tabs detail-tabs">${INST_TABS.map(([k, label]) => `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
     <div id="tab-body"></div>`;
@@ -1175,14 +1175,14 @@ function renderUsers(id) {
       ? '在线玩家来自控制台的进出记录；快捷操作（OP / 踢出 / 封禁 / 白名单）通过控制台命令实时生效。'
       : '服务器未运行，暂无在线玩家。';
     const list = d.online || [];
-    $('#users-body').innerHTML = list.length ? `<table class="table">
+    $('#users-body').innerHTML = list.length ? `<div class="table-wrap"><table class="table">
       <thead><tr><th>玩家</th><th>快捷操作</th></tr></thead>
       <tbody>${list.map(p => `<tr><td><b>${esc(p)}</b></td><td>
         <button class="btn small primary" onclick="userAction('${id}','op','${esc(p)}')">OP</button>
         <button class="btn small" onclick="userAction('${id}','whitelist_add','${esc(p)}')">白名单</button>
         <button class="btn small warn" onclick="userAction('${id}','kick','${esc(p)}')">踢出</button>
         <button class="btn small danger" onclick="userAction('${id}','ban','${esc(p)}')">封禁</button>
-      </td></tr>`).join('')}</tbody></table>`
+      </td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty" style="padding:16px">当前没有在线玩家</div>';
     return;
   }
@@ -1208,7 +1208,7 @@ function renderUsers(id) {
       <td><button class="btn small danger" onclick="userAction('${id}','${conf.rm}','${esc(name)}')">${usersTab === 'ops' ? '移除 OP' : usersTab === 'whitelist' ? '移除' : '解封'}</button></td></tr>`;
   }).join('');
   $('#users-body').innerHTML = list.length
-    ? `<table class="table"><thead><tr>${conf.cols.map(c => `<th>${c}</th>`).join('')}<th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+    ? `<div class="table-wrap"><table class="table"><thead><tr>${conf.cols.map(c => `<th>${c}</th>`).join('')}<th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty" style="padding:16px">暂无条目</div>';
 }
 
@@ -1286,16 +1286,16 @@ async function renderTabMonitor(id, el, t) {
       renderChart(document.getElementById('mon-chart'), m.points || []);
       const pl = pt.players || [];
       document.getElementById('mon-playtime').innerHTML = pl.length
-        ? '<table class="table"><thead><tr><th>玩家</th><th>总时长</th><th>会话数</th></tr></thead><tbody>' +
+        ? '<div class="table-wrap"><table class="table"><thead><tr><th>玩家</th><th>总时长</th><th>会话数</th></tr></thead><tbody>' +
           pl.map(x => `<tr><td><b>${esc(x.name)}</b></td><td>${fmtUptime(x.total_secs)}</td><td>${x.sessions}</td></tr>`).join('') +
-          '</tbody></table>'
+          '</tbody></table></div>'
         : '<div class="empty" style="padding:14px">暂无数据（玩家进出服务器时统计）</div>';
       const files = cr.files || [];
       document.getElementById('mon-crashes').innerHTML = files.length
-        ? '<table class="table"><tbody>' +
+        ? '<div class="table-wrap"><table class="table"><tbody>' +
           files.map(f => `<tr><td class="mono small">${esc(f.name)}</td><td>${fmtSize(f.size)}</td>` +
             `<td><button class="btn small" onclick="viewCrash('${id}','${esc(f.name)}')">查看</button></td></tr>`).join('') +
-          '</tbody></table>'
+          '</tbody></table></div>'
         : '<div class="empty" style="padding:14px">无崩溃记录（异常退出时会自动归档控制台末尾与 crash-report）</div>';
     } catch (e) {
       const el = document.getElementById('mon-chart');
@@ -1324,7 +1324,7 @@ async function renderTabMods(id, el, t) {
     try {
       const { mods } = await api(`/instances/${id}/mods`);
       if (t !== routeToken) return;
-      $('#mods-body').innerHTML = mods.length ? `<table class="table">
+      $('#mods-body').innerHTML = mods.length ? `<div class="table-wrap"><table class="table">
         <thead><tr><th>状态</th><th>名称</th><th>版本</th><th>加载器</th><th>MC 版本</th><th>大小</th><th>操作</th></tr></thead>
         <tbody>${mods.map(m => `<tr>
           <td><span class="pill ${m.enabled ? 'st-running' : 'st-stopped'}">${m.enabled ? '启用' : '禁用'}</span></td>
@@ -1333,7 +1333,7 @@ async function renderTabMods(id, el, t) {
           <td>
             <button class="btn small" onclick="toggleMod('${id}','${esc(m.file)}')">${m.enabled ? '禁用' : '启用'}</button>
             <button class="btn small danger" onclick="deleteMod('${id}','${esc(m.file)}')">删除</button>
-          </td></tr>`).join('')}</tbody></table>`
+          </td></tr>`).join('')}</tbody></table></div>`
         : '<div class="empty">mods 目录为空。模组应放在实例目录的 mods 文件夹中。</div>';
     } catch (e) {
       $('#mods-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
@@ -1838,10 +1838,10 @@ async function loadGameBackups(id, t, resumeJob = true) {
       ${provider && (!provider.enabled || !provider.command_enabled) ? `<div class="banner warn">${provider.enabled ? 'backup 命令已禁用，无法立即备份。' : 'ServerUtilities 配置已禁用，无法创建游戏内备份。'}</div>` : ''}
       <p class="muted small">立即备份需要实例完成启动；恢复需要先停止实例。恢复前会保留当前受影响的数据，完成后请手动启动。</p>
       <div class="row between" style="margin:12px 0"><span>状态：${statusPill(d.status)}${d.active_job ? ' · 任务进行中' : ''}</span><button id="gb-create" class="btn primary" ${!provider || !provider.enabled || !provider.command_enabled || d.status !== 'running' || d.active_job ? 'disabled' : ''} onclick="startGameBackup('${id}')">立即备份</button></div>
-      <div id="gb-job"></div>${d.backups?.length ? `<table class="table"><thead><tr><th>名称</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${d.backups.map(b => {
+      <div id="gb-job"></div>${d.backups?.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>名称</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${d.backups.map(b => {
         const n = encodeURIComponent(b.name).replace(/'/g, '%27');
         return `<tr><td class="mono">${esc(b.name)}${b.problem ? `<div class="muted small">${esc(b.problem)}</div>` : ''}</td><td>${fmtSize(b.size)}</td><td>${esc(b.created)}</td><td><button class="btn small" onclick="downloadGameBackup('${id}','${n}')">下载</button> <button class="btn small" ${b.problem ? 'disabled' : ''} onclick="previewGameBackup('${id}','${n}')">预览</button> <button class="btn small warn" ${b.problem || d.status !== 'stopped' || d.active_job ? 'disabled' : ''} onclick="restoreGameBackup('${id}','${n}')">恢复</button></td></tr>`;
-      }).join('')}</tbody></table>` : '<div class="empty">暂无游戏内备份</div>'}`;
+      }).join('')}</tbody></table></div>` : '<div class="empty">暂无游戏内备份</div>'}`;
     if (resumeJob && (d.active_job || d.last_job)) watchGameBackupJob(d.active_job || d.last_job, t, id, !!d.active_job);
   } catch (e) { if (t === routeToken && $('#gb-body')) $('#gb-body').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
@@ -1900,7 +1900,7 @@ async function loadBackups(id, t) {
   try {
     const d = await api(`/instances/${id}/backups`);
     if (t !== undefined && t !== routeToken) return;
-    $('#bk-body').innerHTML = d.backups.length ? `<table class="table">
+    $('#bk-body').innerHTML = d.backups.length ? `<div class="table-wrap"><table class="table">
       <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
       <tbody>${d.backups.map(b => `<tr>
         <td class="mono">${esc(b.name)}</td>
@@ -1910,7 +1910,7 @@ async function loadBackups(id, t) {
           <button class="btn small" onclick="downloadBackup('${id}','${esc(b.name)}')">下载</button>
           <button class="btn small warn" onclick="restoreBackup('${id}','${esc(b.name)}')">恢复</button>
           <button class="btn small danger" onclick="deleteBackup('${id}','${esc(b.name)}')">删除</button>
-        </td></tr>`).join('')}</tbody></table>`
+        </td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty">暂无备份，点右上角「立即备份」创建</div>';
   } catch (e) {
     $('#bk-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
@@ -2004,7 +2004,7 @@ async function loadFiles(id, t, path) {
     }
     $('#files-crumb').innerHTML = crumbs;
     const full = f => (path ? path + '/' : '') + f.name;
-    $('#files-body').innerHTML = `<table class="table">
+    $('#files-body').innerHTML = `<div class="table-wrap"><table class="table">
       <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
       <tbody>${entries.map(f => `<tr>
         <td>${f.dir ? '📁' : '📄'} <a onclick="${f.dir
@@ -2016,7 +2016,7 @@ async function loadFiles(id, t, path) {
           <button class="btn small" onclick="${f.dir ? `downloadArchive('${id}','${esc(full(f))}')` : `downloadFile('${id}','${esc(full(f))}')`}">下载</button>
           <button class="btn small" onclick="renameFile('${id}','${esc(full(f))}','${esc(f.name)}')">重命名</button>
           <button class="btn small danger" onclick="deleteFile('${id}','${esc(full(f))}')">删除</button>
-        </td></tr>`).join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>'}</tbody></table>`;
+        </td></tr>`).join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>'}</tbody></table></div>`;
   } catch (e) {
     $('#files-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
@@ -2234,7 +2234,7 @@ function renderPropsTable() {
     });
   const cnt = $('#prop-count');
   if (cnt) cnt.textContent = propEntries.filter(x => x.key).length;
-  $('#props-body').innerHTML = rows.length ? `<table class="table props">
+  $('#props-body').innerHTML = rows.length ? `<div class="table-wrap"><table class="table props">
     <thead><tr><th>配置项</th><th>值</th></tr></thead>
     <tbody>${rows.map(({ e, i }) => {
       const meta = propMetaFor(e.key, e.value);
@@ -2242,7 +2242,7 @@ function renderPropsTable() {
         <td class="mono"><span class="tag t-${meta.cat}">${PROP_CATS[meta.cat]}</span>${esc(e.key)}
           <div class="muted small">${esc(meta.desc)}</div></td>
         <td>${propControl(e, i)}</td></tr>`;
-    }).join('')}</tbody></table>`
+    }).join('')}</tbody></table></div>`
     : '<div class="empty">没有匹配的配置项</div>';
 }
 async function saveProps(id) {
@@ -2471,13 +2471,13 @@ async function loadAudit() {
     const q = $('#audit-q')?.value.trim() || '';
     const d = await api(`/audit?limit=200&q=${encodeURIComponent(q)}`);
     const list = d.entries || [];
-    el.innerHTML = list.length ? `<table class="table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态码</th></tr></thead><tbody>` +
+    el.innerHTML = list.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态码</th></tr></thead><tbody>` +
       list.map(e => `<tr>
         <td class="muted mono small">${esc(e.ts)}</td>
         <td class="mono small">${esc(e.method)}</td>
         <td class="mono small">${esc(e.path)}</td>
         <td>${e.status < 400 ? '<span class="pill st-running">OK</span>' : `<span class="pill st-stopped">${e.status}</span>`}</td>
-      </tr>`).join('') + '</tbody></table>'
+      </tr>`).join('') + '</tbody></table></div>'
       : '<div class="empty" style="padding:14px">暂无记录</div>';
   } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
@@ -2547,7 +2547,7 @@ async function loadWorlds(id, t) {
   try {
     const d = await api(`/instances/${id}/worlds`);
     if (t !== routeToken) return;
-    $('#worlds-body').innerHTML = d.worlds.length ? `<table class="table">
+    $('#worlds-body').innerHTML = d.worlds.length ? `<div class="table-wrap"><table class="table">
       <thead><tr><th>世界</th><th>大小</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>${d.worlds.map(w => `<tr>
         <td><b>${esc(w.name)}</b></td><td>${fmtSize(w.size)}</td>
@@ -2555,7 +2555,7 @@ async function loadWorlds(id, t) {
         <td>${w.current ? '<span class="muted small">使用中</span>' :
           `<button class="btn small" onclick="switchWorld('${id}','${esc(w.name)}')">切换</button>
            <button class="btn small danger" onclick="deleteWorld('${id}','${esc(w.name)}')">删除</button>`}</td>
-      </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无世界存档</div>';
+      </tr>`).join('')}</tbody></table></div>` : '<div class="empty">暂无世界存档</div>';
   } catch (e) { $('#worlds-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 async function switchWorld(id, name) {
@@ -2586,7 +2586,7 @@ async function loadTasks(id, t) {
     const d = await api(`/instances/${id}/tasks`);
     if (t !== routeToken) return;
     const tasks = d.tasks || [];
-    $('#tasks-body').innerHTML = tasks.length ? `<table class="table">
+    $('#tasks-body').innerHTML = tasks.length ? `<div class="table-wrap"><table class="table">
       <thead><tr><th>任务</th><th>类型</th><th>间隔</th><th>状态</th><th>上次结果</th><th>操作</th></tr></thead>
       <tbody>${tasks.map(x => `<tr>
         <td><b>${esc(x.name)}</b>${x.value ? `<div class="muted small mono">${esc(x.value)}</div>` : ''}</td>
@@ -2599,7 +2599,7 @@ async function loadTasks(id, t) {
           <button class="btn small" onclick="taskOp('${id}','${x.id}','run')">立即运行</button>
           <button class="btn small ${x.enabled ? 'warn' : 'primary'}" onclick="taskOp('${id}','${x.id}','${x.enabled ? 'disable' : 'enable'}')">${x.enabled ? '停用' : '启用'}</button>
           <button class="btn small danger" onclick="taskOp('${id}','${x.id}','delete')">删除</button>
-        </td></tr>`).join('')}</tbody></table>`
+        </td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty">暂无计划任务，点右上角「新建任务」创建</div>';
   } catch (e) { $('#tasks-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
@@ -2728,9 +2728,9 @@ async function loadPanelJavas() {
     if (!el) return;
     var javas = d.javas || [];
     el.innerHTML = javas.length
-      ? '<table class="table"><thead><tr><th>版本</th><th>来源</th><th>路径</th></tr></thead><tbody>' +
+      ? '<div class="table-wrap"><table class="table"><thead><tr><th>版本</th><th>来源</th><th>路径</th></tr></thead><tbody>' +
         javas.map(function(j) { return '<tr><td>Java ' + j.major + '</td><td>' + esc(j.source) + '</td><td class="mono small">' + esc(j.path) + '</td></tr>'; }).join('') +
-        '</tbody></table>'
+        '</tbody></table></div>'
       : '<div class="empty" style="padding:14px">尚未扫描，点击上方「扫描本机 Java」</div>';
   } catch (e) {
     var el2 = document.getElementById('java-panel-list');
