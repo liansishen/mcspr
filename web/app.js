@@ -1499,34 +1499,67 @@ async function viewCrash(id, name) {
   } catch (e) { toast(e.message, false); }
 }
 
+let modsCache = null;
 async function renderTabMods(id, el, t) {
   const isPlugin = ['paper', 'purpur', 'folia', 'velocity', 'waterfall', 'bungeecord'].includes(currentInstanceInfo?.mod_loader);
   const noun = isPlugin ? '插件' : '模组';
   el.innerHTML = `
     <div class="row between"><h2>${noun}</h2>
-      <div class="row"><button class="btn primary" onclick="showModDownload('${id}')">⬇ 下载${noun}</button><button class="btn" onclick="uploadMod('${id}')">上传${noun}</button></div></div>
+      <div class="row">
+        <input id="mods-search" placeholder="搜索${noun}…" oninput="filterMods()" style="width:200px">
+        <button class="btn primary" onclick="showModDownload('${id}')">⬇ 下载${noun}</button>
+        <button class="btn" onclick="uploadMod('${id}')">上传${noun}</button>
+      </div>
+    </div>
     <div id="mods-body"><div class="empty">加载中…</div></div>`;
   const load = async () => {
     try {
       const { mods } = await api(`/instances/${id}/mods`);
       if (t !== routeToken) return;
-      $('#mods-body').innerHTML = mods.length ? `<div class="table-wrap"><table class="table">
-        <thead><tr><th>状态</th><th>名称</th><th>版本</th><th>加载器</th><th>MC 版本</th><th>大小</th><th>操作</th></tr></thead>
-        <tbody>${mods.map(m => `<tr>
-          <td><span class="pill ${m.enabled ? 'st-running' : 'st-stopped'}">${m.enabled ? '启用' : '禁用'}</span></td>
-          <td title="${esc(m.description)}">${esc(m.display_name)}${m.authors ? `<div class="muted small">by ${esc(m.authors)}</div>` : ''}<div class="muted small">${esc(m.file)}</div></td>
-          <td>${esc(m.version)}</td><td>${esc(m.loader)}</td><td>${esc(m.mc_version || '-')}</td><td>${fmtSize(m.size)}</td>
-          <td>
-            <button class="btn small" onclick="toggleMod('${id}','${esc(m.file)}')">${m.enabled ? '禁用' : '启用'}</button>
-            <button class="btn small danger" onclick="deleteMod('${id}','${esc(m.file)}')">删除</button>
-          </td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">mods 目录为空。模组应放在实例目录的 mods 文件夹中。</div>';
+      modsCache = { id, t, noun, mods: mods || [] };
+      filterMods();
     } catch (e) {
-      $('#mods-body').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      const bodyEl = $('#mods-body');
+      if (bodyEl) bodyEl.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     }
   };
   modsTabReload = load;
   await load();
+}
+
+function filterMods() {
+  if (!modsCache) return;
+  const q = ($('#mods-search')?.value || '').trim().toLowerCase();
+  const list = q ? modsCache.mods.filter(m => {
+    const name = (m.display_name || '').toLowerCase();
+    const file = (m.file || '').toLowerCase();
+    const desc = (m.description || '').toLowerCase();
+    const authors = (m.authors || '').toLowerCase();
+    return name.includes(q) || file.includes(q) || desc.includes(q) || authors.includes(q);
+  }) : modsCache.mods;
+  renderModsList(list, q);
+}
+
+function renderModsList(mods, q = '') {
+  const bodyEl = $('#mods-body');
+  if (!bodyEl || !modsCache) return;
+  const { id, noun } = modsCache;
+  if (!modsCache.mods.length) {
+    bodyEl.innerHTML = `<div class="empty">mods 目录为空。${noun}应放在实例目录的 mods 文件夹中。</div>`;
+    return;
+  }
+  const rows = mods.map(m => `<tr>
+    <td><span class="pill ${m.enabled ? 'st-running' : 'st-stopped'}">${m.enabled ? '启用' : '禁用'}</span></td>
+    <td title="${esc(m.description)}">${esc(m.display_name)}${m.authors ? `<div class="muted small">by ${esc(m.authors)}</div>` : ''}<div class="muted small">${esc(m.file)}</div></td>
+    <td>${esc(m.version)}</td><td>${esc(m.loader)}</td><td>${esc(m.mc_version || '-')}</td><td>${fmtSize(m.size)}</td>
+    <td>
+      <button class="btn small" onclick="toggleMod('${id}','${esc(m.file)}')">${m.enabled ? '禁用' : '启用'}</button>
+      <button class="btn small danger" onclick="deleteMod('${id}','${esc(m.file)}')">删除</button>
+    </td></tr>`).join('');
+  const emptyText = q ? `未找到匹配的${noun}` : `mods 目录为空。${noun}应放在实例目录的 mods 文件夹中。`;
+  bodyEl.innerHTML = `<div class="table-wrap"><table class="table">
+    <thead><tr><th>状态</th><th>名称</th><th>版本</th><th>加载器</th><th>MC 版本</th><th>大小</th><th>操作</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="7" class="muted">${emptyText}</td></tr>`}</tbody></table></div>`;
 }
 async function toggleMod(id, file) {
   try { await api(`/instances/${id}/mods/toggle`, { method: 'POST', body: { file } }); toast('已切换'); refresh(); }
