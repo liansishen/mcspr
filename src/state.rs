@@ -70,7 +70,7 @@ impl AppState {
     }
     pub async fn new(cfg: PanelConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.instances_dir())?;
-        let instances = crate::instance::scan_instances(&cfg.instances_dir());
+        let instances = crate::instance::scan_instances(&cfg.instances_dir(), cfg.console_buffer_lines);
         tracing::info!("已加载 {} 个实例", instances.len());
         let http = reqwest::Client::builder()
             .user_agent("MCS-Panel/0.1")

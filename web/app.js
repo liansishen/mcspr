@@ -951,6 +951,8 @@ let consoleLines = [];
 let cmdHistory = [];
 let cmdHistIdx = -1;
 let consoleFilter = '';
+// 控制台页面渲染的最大行数（面板设置中的「控制台显示行数」，启动时从 /api/settings 读取）
+let consoleMaxLines = 800;
 
 function applyConsoleFilter() {
   const logEl = document.getElementById('console-log');
@@ -1093,7 +1095,7 @@ function renderTabConsole(id, el, t) {
       <div class="muted small" id="users-hint" style="margin-top:10px"></div>
     </div>`;
   const logEl = $('#console-log');
-  const maxLines = 800;
+  const maxLines = consoleMaxLines;
   let retryTimer = null, pollTimer = null, cursor = 0, lastSeq = 0, wsReady = false;
   const stopPoll = () => { if (pollTimer) clearTimeout(pollTimer); pollTimer = null; };
   const appendMany = (items, forceBottom = false) => {
@@ -2730,6 +2732,8 @@ async function saveInstance(id) {
 async function renderPanelSettings(t = ++routeToken) {
   const c = await api('/settings');
   if (t !== routeToken) return;
+  const [linesMin, linesMax] = c.console_lines_range || [100, 20000];
+  const [bufMin, bufMax] = c.console_buffer_range || [500, 200000];
   $('#main').innerHTML = `<h1>面板设置</h1>
     <div class="form card">
       <label>监听地址<input id="ps-listen" value="${esc(c.listen)}" placeholder="127.0.0.1:8080">
@@ -2740,6 +2744,10 @@ async function renderPanelSettings(t = ++routeToken) {
         <div class="muted small">用于「模组下载」中 CurseForge 的搜索与文件列表；在 console.curseforge.com 可免费创建。已保存的 Key 不回显，留空保存即保持不变。</div></label>
       <label class="full">数据目录<input id="ps-dir" value="${esc(c.data_dir)}">
         <div class="muted small">实例存放的根目录（相对路径基于面板工作目录），重启面板后生效。</div></label>
+      <label>控制台显示行数<input id="ps-console-lines" type="number" min="${linesMin}" max="${linesMax}" value="${c.console_max_lines}">
+        <div class="muted small">控制台页面最多渲染的日志行数，超出后自动移除最早的日志，避免浏览器长时间运行卡顿（${linesMin} ~ ${linesMax}，建议 300 ~ 3000）。</div></label>
+      <label>控制台缓存行数<input id="ps-console-buffer" type="number" min="${bufMin}" max="${bufMax}" value="${c.console_buffer_lines}">
+        <div class="muted small">面板在内存中保留的日志行数，也是历史日志回放与「下载日志」的上限（${bufMin} ~ ${bufMax}）；保存后立即对运行中的实例生效。</div></label>
       <div class="row right"><button class="btn primary" onclick="savePanelSettings()">保存</button></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -2794,14 +2802,26 @@ async function savePanelSettings() {
         token: $('#ps-token').value,
         data_dir: $('#ps-dir').value,
         curseforge_api_key: $('#ps-cfkey').value,
+        console_max_lines: +$('#ps-console-lines').value || undefined,
+        console_buffer_lines: +$('#ps-console-buffer').value || undefined,
       },
     });
+    const n = Number($('#ps-console-lines').value);
+    if (Number.isFinite(n) && n > 0) consoleMaxLines = n;
     toast('已保存');
   } catch (e) { toast(e.message, false); }
 }
 
 /* ---------------- 启动 ---------------- */
-route();
+async function bootstrap() {
+  try {
+    const c = await api('/settings');
+    const n = Number(c.console_max_lines);
+    if (Number.isFinite(n) && n > 0) consoleMaxLines = n;
+  } catch {}
+  route();
+}
+bootstrap();
 
 function consoleKeydown(e, id) {
   const input = document.getElementById('cmd-input');

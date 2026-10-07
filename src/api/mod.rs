@@ -217,6 +217,8 @@ struct SettingsUpdate {
     data_dir: Option<String>,
     curseforge_api_key: Option<String>,
     telegram_bot_token: Option<String>,
+    console_max_lines: Option<usize>,
+    console_buffer_lines: Option<usize>,
 }
 
 /// 设置读取：机密字段（token / CurseForge Key / Telegram Token）脱敏返回，
@@ -237,6 +239,10 @@ async fn get_settings(State(state): State<AppState>) -> Json<serde_json::Value> 
         "curseforge_api_key_set": !c.curseforge_api_key.is_empty(),
         "telegram_bot_token": "",
         "telegram_bot_token_set": !c.telegram_bot_token.is_empty(),
+        "console_max_lines": c.console_max_lines,
+        "console_buffer_lines": c.console_buffer_lines,
+        "console_lines_range": [*config::CONSOLE_LINES_RANGE.start(), *config::CONSOLE_LINES_RANGE.end()],
+        "console_buffer_range": [*config::CONSOLE_BUFFER_RANGE.start(), *config::CONSOLE_BUFFER_RANGE.end()],
     }))
 }
 
@@ -269,6 +275,26 @@ async fn put_settings(
                 cfg.curseforge_api_key = k;
             }
         }
+        if let Some(n) = u.console_max_lines {
+            if !config::CONSOLE_LINES_RANGE.contains(&n) {
+                return Err(ApiError::bad_request(format!(
+                    "控制台显示行数需在 {}~{} 之间",
+                    config::CONSOLE_LINES_RANGE.start(),
+                    config::CONSOLE_LINES_RANGE.end()
+                )));
+            }
+            cfg.console_max_lines = n;
+        }
+        if let Some(n) = u.console_buffer_lines {
+            if !config::CONSOLE_BUFFER_RANGE.contains(&n) {
+                return Err(ApiError::bad_request(format!(
+                    "控制台缓存行数需在 {}~{} 之间",
+                    config::CONSOLE_BUFFER_RANGE.start(),
+                    config::CONSOLE_BUFFER_RANGE.end()
+                )));
+            }
+            cfg.console_buffer_lines = n;
+        }
         if let Some(k) = u.telegram_bot_token {
             let k = k.trim().to_string();
             if !k.is_empty() {
@@ -276,6 +302,14 @@ async fn put_settings(
             }
         }
         config::save(&cfg)?;
+    }
+    // 控制台缓存上限对运行中的实例立即生效
+    {
+        let limit = state.config.read().await.console_buffer_lines;
+        for rt in state.instances.read().await.values() {
+            rt.log_limit
+                .store(limit.max(1), std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(Json(json!({
         "ok": true,
@@ -464,8 +498,11 @@ async fn config_import(
         note.push_str("设置已写入（listen/data_dir 需重启面板生效）；");
     }
     {
-        let dir = state.config.read().await.instances_dir();
-        let instances = crate::instance::scan_instances(&dir);
+        let (dir, buffer_lines) = {
+            let c = state.config.read().await;
+            (c.instances_dir(), c.console_buffer_lines)
+        };
+        let instances = crate::instance::scan_instances(&dir, buffer_lines);
         *state.instances.write().await = instances;
     }
     Ok(Json(json!({ "ok": true, "instances": imported, "note": note })))

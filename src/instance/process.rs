@@ -375,9 +375,10 @@ async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
         line: line.clone(),
     };
     {
+        let limit = rt.log_limit.load(Ordering::Relaxed).max(1);
         let mut buf = rt.log_buf.lock().await;
         buf.push_back(ll.clone());
-        while buf.len() > 5000 {
+        while buf.len() > limit {
             buf.pop_front();
         }
     }
@@ -565,5 +566,29 @@ pub async fn shutdown_all(state: &AppState) {
             tracing::warn!("实例 {id} 未能优雅退出，强制结束");
             force_kill(rt.pid.load(Ordering::SeqCst));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn log_buffer_respects_configured_limit() {
+        let dir = std::env::temp_dir().join(format!("mcspr-loglimit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        rt.log_limit.store(3, Ordering::Relaxed);
+        for i in 0..6 {
+            push_raw(&rt, format!("line {i}")).await;
+        }
+        let buf = rt.log_buf.lock().await;
+        assert_eq!(buf.len(), 3);
+        assert_eq!(
+            buf.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
+            vec!["line 3", "line 4", "line 5"]
+        );
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

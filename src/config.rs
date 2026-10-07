@@ -58,7 +58,20 @@ pub struct PanelConfig {
     pub telegram_bot_token: String,
     #[serde(default)]
     pub telegram_chat_id: String,
+    /// 控制台页面渲染的最大日志行数
+    #[serde(default = "d_console_max_lines")]
+    pub console_max_lines: usize,
+    /// 控制台内存保留的最大日志行数（历史回放与日志下载上限）
+    #[serde(default = "d_console_buffer_lines")]
+    pub console_buffer_lines: usize,
 }
+
+/// 控制台显示行数的取值范围
+pub const CONSOLE_LINES_RANGE: std::ops::RangeInclusive<usize> = 100..=20_000;
+/// 控制台内存缓冲行数的取值范围
+pub const CONSOLE_BUFFER_RANGE: std::ops::RangeInclusive<usize> = 500..=200_000;
+fn d_console_max_lines() -> usize { 800 }
+fn d_console_buffer_lines() -> usize { 5000 }
 fn d_backup_keep() -> u32 { 10 }
 fn d_alert_type() -> String { "none".into() }
 
@@ -76,6 +89,8 @@ impl Default for PanelConfig {
             alert_webhook_url: String::new(),
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
+            console_max_lines: d_console_max_lines(),
+            console_buffer_lines: d_console_buffer_lines(),
         }
     }
 }

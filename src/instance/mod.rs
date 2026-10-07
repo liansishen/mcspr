@@ -110,6 +110,8 @@ pub struct InstanceRuntime {
     pub tps: Mutex<Option<Value>>,
     /// 复用的 RCON 连接（TPS 采样与远程命令）；服务端会为每次新建连接打一行日志
     pub rcon: std::sync::Mutex<Option<crate::rcon::Session>>,
+    /// 控制台内存保留的最大日志行数（面板设置可调）
+    pub log_limit: std::sync::atomic::AtomicUsize,
     pub log_buf: Mutex<VecDeque<LogLine>>,
     pub log_tx: broadcast::Sender<LogLine>,
     pub next_seq: AtomicU64,
@@ -176,6 +178,7 @@ impl InstanceRuntime {
             metrics: Mutex::new(VecDeque::new()),
             tps: Mutex::new(None),
             rcon: std::sync::Mutex::new(None),
+            log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_LOG_LIMIT),
             log_buf: Mutex::new(buf),
             log_tx: tx,
             next_seq: AtomicU64::new(next_seq),
@@ -277,7 +280,10 @@ pub async fn get_instance(state: &AppState, id: &str) -> ApiResult<Arc<InstanceR
         .ok_or_else(|| ApiError::not_found("实例不存在"))
 }
 
-pub fn scan_instances(dir: &Path) -> HashMap<String, Arc<InstanceRuntime>> {
+/// 控制台内存保留日志行的默认上限
+pub const DEFAULT_LOG_LIMIT: usize = 5000;
+
+pub fn scan_instances(dir: &Path, log_limit: usize) -> HashMap<String, Arc<InstanceRuntime>> {
     let mut map = HashMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return map;
@@ -298,7 +304,10 @@ pub fn scan_instances(dir: &Path) -> HashMap<String, Arc<InstanceRuntime>> {
         {
             Some(meta) => {
                 let id = meta.id.clone();
-                map.insert(id, InstanceRuntime::new(meta, p));
+                let rt = InstanceRuntime::new(meta, p);
+                rt.log_limit
+                    .store(log_limit.max(1), std::sync::atomic::Ordering::Relaxed);
+                map.insert(id, rt);
             }
             None => tracing::warn!("instance.json 解析失败: {}", meta_path.display()),
         }
