@@ -1027,18 +1027,18 @@ function consoleLineMeta(line) {
 function renderTabConsole(id, el, t) {
   el.innerHTML = `
     <div class="console-wrap">
-      <div id="console-log" class="console"></div>
-      <div class="row console-input">
-        <input id="cmd-input" placeholder="输入命令（↑↓ 历史，Tab 补全）" autocomplete="off"
-          onkeydown="consoleKeydown(event, '${id}')">
-        <button class="btn" id="cmd-send">发送</button>
-      </div>
-      <div class="row" style="margin-top:8px">
+      <div class="row console-toolbar" style="margin-bottom:4px">
         <input id="console-search" placeholder="搜索日志…" style="width:200px" oninput="applyConsoleFilter()">
         <select id="console-level" style="width:auto" onchange="applyConsoleFilter()">
           <option value="">全部级别</option><option value="warn">仅警告+</option><option value="err">仅错误</option>
         </select>
         <button class="btn small ghost" onclick="downloadConsole('${id}')">⬇ 下载日志</button>
+      </div>
+      <div id="console-log" class="console"></div>
+      <div class="row console-input">
+        <input id="cmd-input" placeholder="输入命令（↑↓ 历史，Tab 补全）" autocomplete="off"
+          onkeydown="consoleKeydown(event, '${id}')">
+        <button class="btn primary" id="cmd-send">发送</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
