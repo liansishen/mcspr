@@ -80,41 +80,64 @@ impl RconClient {
                 "RCON 密码错误",
             ));
         }
-        client.drain_pending();
+        // 较新实现会先回一个空包、再回真正的鉴权结果，这里补读一次以识别其中的失败结果
+        if let Some(id) = client.drain_pending() {
+            if id == -1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "RCON 密码错误",
+                ));
+            }
+        }
         Ok(client)
     }
 
-    /// 排干紧随鉴权响应之后可能存在的空包（最多等 120ms）
-    fn drain_pending(&mut self) {
+    /// 读取已到达的后续包；返回其中出现的负数 id（-1 表示鉴权失败）
+    fn drain_pending(&mut self) -> Option<i32> {
+        let _ = self
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(120)));
+        let mut auth_failure = None;
+        loop {
+            match read_packet(&mut self.stream) {
+                Ok((id, _, _)) => {
+                    if id < 0 {
+                        auth_failure = Some(id);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(3)));
+        auth_failure
+    }
+
+    /// 执行命令并返回输出。
+    ///
+    /// 只发送命令包并读取响应：不能用“追加一个空命令包、读到它的响应为止”的经典做法，
+    /// 1.7.10 执行空命令后会把连接关掉，导致每次采样都得重连（服务端日志被连接记录刷屏）。
+    pub fn command(&mut self, cmd: &str) -> std::io::Result<String> {
+        write_packet(&mut self.stream, 2, SERVERDATA_EXECCOMMAND, cmd.as_bytes())?;
+        let mut out = String::new();
+        let (_, ptype, body) = read_packet(&mut self.stream)?;
+        if ptype == SERVERDATA_RESPONSE_VALUE && !body.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&body));
+        }
+        // 响应可能在 4096 字节处分包，短期内继续读取并拼接
         let _ = self
             .stream
             .set_read_timeout(Some(Duration::from_millis(120)));
         loop {
             match read_packet(&mut self.stream) {
-                Ok(_) => continue,
+                Ok((_, ptype, body)) => {
+                    if ptype == SERVERDATA_RESPONSE_VALUE && !body.is_empty() {
+                        out.push_str(&String::from_utf8_lossy(&body));
+                    }
+                }
                 Err(_) => break,
             }
         }
         let _ = self.stream.set_read_timeout(Some(Duration::from_secs(3)));
-    }
-
-    /// 执行命令并返回输出。经典技巧：追加一个 id=99 的哑包，读到它为止
-    pub fn command(&mut self, cmd: &str) -> std::io::Result<String> {
-        write_packet(&mut self.stream, 2, SERVERDATA_EXECCOMMAND, cmd.as_bytes())?;
-        write_packet(&mut self.stream, 99, SERVERDATA_EXECCOMMAND, b"")?;
-        let mut out = String::new();
-        loop {
-            let (id, ptype, body) = read_packet(&mut self.stream)?;
-            if id == 99 {
-                break;
-            }
-            if ptype == SERVERDATA_RESPONSE_VALUE && !body.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&String::from_utf8_lossy(&body));
-            }
-        }
         Ok(out)
     }
 }
@@ -264,103 +287,195 @@ pub fn parse_tps(out: &str) -> Option<(f64, Option<f64>)> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
 
-    /// 最小 RCON 服务端：`two_packets` 为真时模拟较新实现（先回空包再回鉴权结果）
-    fn fake_server(two_packets: bool) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut commands = Vec::new();
-            let read_packet = |sock: &mut TcpStream| -> std::io::Result<(i32, i32, String)> {
-                let mut len = [0u8; 4];
-                sock.read_exact(&mut len)?;
-                let len = i32::from_le_bytes(len) as usize;
-                let mut body = vec![0u8; len];
-                sock.read_exact(&mut body)?;
-                let id = i32::from_le_bytes(body[0..4].try_into().unwrap());
-                let ptype = i32::from_le_bytes(body[4..8].try_into().unwrap());
-                Ok((
-                    id,
-                    ptype,
-                    String::from_utf8_lossy(&body[8..len - 2]).to_string(),
-                ))
-            };
-            let send = |sock: &mut TcpStream, id: i32, body: &str| {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&id.to_le_bytes());
-                payload.extend_from_slice(&SERVERDATA_RESPONSE_VALUE.to_le_bytes());
-                payload.extend_from_slice(body.as_bytes());
-                payload.extend_from_slice(&[0, 0]);
-                let mut out = ((payload.len()) as i32).to_le_bytes().to_vec();
-                out.extend_from_slice(&payload);
-                sock.write_all(&out).unwrap();
-            };
-            loop {
-                let Ok((id, ptype, body)) = read_packet(&mut sock) else {
-                    break;
-                };
-                if ptype == SERVERDATA_AUTH {
-                    if body == "good-password" {
-                        if two_packets {
-                            // 较新实现：先回一个 id=1 的空 RESPONSE_VALUE
-                            send(&mut sock, 1, "");
+    const TPS_TEXT: &str = "Dim 0 : Mean tick time: 1.250 ms. Mean TPS: 19.980";
+
+    #[derive(Clone, Copy)]
+    struct ServerStyle {
+        /// 较新实现：鉴权时先回一个空包，再回真正的结果
+        two_packet_auth: bool,
+        auth_ok: bool,
+        /// 把一条响应拆成几个分片（真实协议会在 4096 字节处分片）
+        fragments: usize,
+    }
+
+    fn style(two_packet_auth: bool, auth_ok: bool, fragments: usize) -> ServerStyle {
+        ServerStyle {
+            two_packet_auth,
+            auth_ok,
+            fragments,
+        }
+    }
+
+    fn server_read(sock: &mut TcpStream) -> std::io::Result<(i32, i32, String)> {
+        let mut len = [0u8; 4];
+        sock.read_exact(&mut len)?;
+        let len = i32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body)?;
+        let id = i32::from_le_bytes(body[0..4].try_into().unwrap());
+        let ptype = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        Ok((
+            id,
+            ptype,
+            String::from_utf8_lossy(&body[8..len - 2]).to_string(),
+        ))
+    }
+
+    fn server_send(sock: &mut TcpStream, id: i32, body: &str) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&SERVERDATA_RESPONSE_VALUE.to_le_bytes());
+        payload.extend_from_slice(body.as_bytes());
+        payload.extend_from_slice(&[0, 0]);
+        let mut out = (payload.len() as i32).to_le_bytes().to_vec();
+        out.extend_from_slice(&payload);
+        sock.write_all(&out).unwrap();
+    }
+
+    /// 最小 RCON 服务端，记录每条连接上执行过的命令
+    struct Fake {
+        addr: String,
+        stop: Arc<AtomicBool>,
+        connections: Arc<StdMutex<Vec<Arc<StdMutex<Vec<String>>>>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Fake {
+        fn start(style: ServerStyle) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+            let connections: Arc<StdMutex<Vec<Arc<StdMutex<Vec<String>>>>>> =
+                Arc::new(StdMutex::new(Vec::new()));
+            let (stop2, store) = (stop.clone(), connections.clone());
+            let handle = std::thread::spawn(move || {
+                while !stop2.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut sock, _)) => {
+                            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            let executed = Arc::new(StdMutex::new(Vec::new()));
+                            store.lock().unwrap().push(executed.clone());
+                            loop {
+                                let Ok((id, ptype, body)) = server_read(&mut sock) else {
+                                    break;
+                                };
+                                if ptype == SERVERDATA_AUTH {
+                                    let ok = style.auth_ok && body == "good-password";
+                                    if style.two_packet_auth {
+                                        server_send(&mut sock, 1, "");
+                                    }
+                                    server_send(&mut sock, if ok { id } else { -1 }, "");
+                                    if !ok {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                executed.lock().unwrap().push(body.clone());
+                                let text = if body == "forge tps" {
+                                    TPS_TEXT.to_string()
+                                } else {
+                                    format!("echo:{body}")
+                                };
+                                let parts = style.fragments.max(1);
+                                let size = text.len().div_ceil(parts).max(1);
+                                for chunk in text.as_bytes().chunks(size) {
+                                    server_send(&mut sock, id, &String::from_utf8_lossy(chunk));
+                                }
+                            }
                         }
-                        send(&mut sock, id, "");
-                    } else {
-                        send(&mut sock, -1, "");
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
                     }
-                    continue;
                 }
-                commands.push(body.clone());
-                if body == "forge tps" {
-                    send(
-                        &mut sock,
-                        id,
-                        "Dim 0 : Mean tick time: 1.250 ms. Mean TPS: 19.980",
-                    );
-                } else {
-                    send(&mut sock, id, &format!("echo:{body}"));
-                }
+            });
+            Self {
+                addr,
+                stop,
+                connections,
+                handle: Some(handle),
             }
-            commands
-        });
-        (addr, handle)
+        }
+
+        fn connection_count(&self) -> usize {
+            self.connections.lock().unwrap().len()
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.connections
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|c| c.lock().unwrap().clone())
+                .collect()
+        }
+
+        fn instance_dir(&self, tag: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("mcspr-rcon-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let port = self.addr.rsplit(':').next().unwrap();
+            std::fs::write(
+                dir.join("server.properties"),
+                format!("enable-rcon=true\nrcon.password=good-password\nrcon.port={port}\n"),
+            )
+            .unwrap();
+            dir
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     #[test]
-    fn authenticates_against_single_packet_server() {
-        let (addr, handle) = fake_server(false);
-        let mut client = RconClient::connect(&addr, "good-password").unwrap();
+    fn keeps_one_connection_for_repeated_commands() {
+        let server = Fake::start(style(false, true, 1));
+        let mut client = RconClient::connect(&server.addr, "good-password").unwrap();
+        assert_eq!(client.command("list").unwrap(), "echo:list");
+        assert_eq!(client.command("forge tps").unwrap(), TPS_TEXT);
+        assert_eq!(server.connection_count(), 1);
         assert_eq!(
-            client.command("forge tps").unwrap(),
-            "Dim 0 : Mean tick time: 1.250 ms. Mean TPS: 19.980"
+            server.commands(),
+            vec!["list".to_string(), "forge tps".to_string()]
         );
-        drop(client);
-        let commands = handle.join().unwrap();
-        assert_eq!(commands.first().map(String::as_str), Some("forge tps"));
     }
 
     #[test]
     fn authenticates_against_two_packet_server() {
-        let (addr, handle) = fake_server(true);
-        let mut client = RconClient::connect(&addr, "good-password").unwrap();
+        let server = Fake::start(style(true, true, 1));
+        let mut client = RconClient::connect(&server.addr, "good-password").unwrap();
         assert_eq!(client.command("list").unwrap(), "echo:list");
-        drop(client);
-        let commands = handle.join().unwrap();
-        assert_eq!(commands.first().map(String::as_str), Some("list"));
+        assert_eq!(server.connection_count(), 1);
     }
 
     #[test]
-    fn rejects_wrong_password_without_hanging() {
-        let (addr, handle) = fake_server(false);
-        let err = match RconClient::connect(&addr, "wrong") {
-            Ok(_) => panic!("错误密码必须连接失败"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        let _ = handle.join();
+    fn rejects_wrong_password_on_both_auth_styles() {
+        for two_packet in [false, true] {
+            let server = Fake::start(style(two_packet, false, 1));
+            let err = match RconClient::connect(&server.addr, "wrong") {
+                Ok(_) => panic!("错误密码必须连接失败（two_packet={two_packet}）"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn joins_fragmented_responses() {
+        let server = Fake::start(style(false, true, 3));
+        let mut client = RconClient::connect(&server.addr, "good-password").unwrap();
+        assert_eq!(client.command("forge tps").unwrap(), TPS_TEXT);
     }
 
     #[test]
@@ -417,38 +532,23 @@ mod tests {
     }
 
     #[test]
-    fn sample_tps_reuses_the_slot_and_caches_the_working_command() {
-        let (addr, handle) = fake_server(false);
-        let dir = std::env::temp_dir().join(format!("mcspr-rcon-sample-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let port = addr.rsplit(':').next().unwrap();
-        std::fs::write(
-            dir.join("server.properties"),
-            format!("enable-rcon=true\nrcon.password=good-password\nrcon.port={port}\n"),
-        )
-        .unwrap();
+    fn sample_tps_reuses_the_connection_and_caches_the_working_command() {
+        let server = Fake::start(style(false, true, 1));
+        let dir = server.instance_dir("sample");
         let slot = Mutex::new(None);
-        // 第一次采样会试探命令，命中 forge tps；第二次直接复用缓存命令与连接
         assert_eq!(sample_tps(&slot, &dir), Ok((19.98, Some(1.25))));
         assert_eq!(sample_tps(&slot, &dir), Ok((19.98, Some(1.25))));
         assert_eq!(
             slot.lock().unwrap().as_ref().unwrap().tps_cmd,
             Some("forge tps")
         );
+        // 首个命令即可解析时不再试探其他命令，两次采样复用同一条连接
+        assert_eq!(server.connection_count(), 1);
+        assert_eq!(
+            server.commands(),
+            vec!["forge tps".to_string(), "forge tps".to_string()]
+        );
         drop(slot);
-        let commands = handle.join().unwrap();
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|c| c.as_str() == "forge tps")
-                .count(),
-            2
-        );
-        // 首个命令即可解析出 TPS 时，不再继续试探后续命令
-        assert_eq!(
-            commands.iter().filter(|c| c.as_str() == "cofh tps").count(),
-            0
-        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
