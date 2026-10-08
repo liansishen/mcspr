@@ -488,20 +488,44 @@ mod tests {
     #[tokio::test]
     async fn authenticated_http_list_preview_download_and_unsupported_state() {
         let f = Fixture::new().await;
+        f.state
+            .auth
+            .create_user("admin", "password123", crate::auth::Role::Admin, vec![])
+            .await
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!(
-            "http://{}/api/instances/test/game-backups",
-            listener.local_addr().unwrap()
-        );
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{origin}/api/instances/test/game-backups");
         let app = crate::api::router(f.state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         let client = reqwest::Client::new();
         assert_eq!(client.get(&base).send().await.unwrap().status(), 401);
+
+        // 用户名 / 密码登录，后续请求携带会话 Cookie（写操作附带 CSRF）
+        let login = client
+            .post(format!("{origin}/api/auth/login"))
+            .json(&serde_json::json!({ "username": "admin", "password": "password123" }))
+            .send()
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let login_body: serde_json::Value = login.json().await.unwrap();
+        let csrf = login_body["csrf_token"].as_str().unwrap().to_string();
+
         let response: serde_json::Value = client
             .get(&base)
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .unwrap()
@@ -512,7 +536,7 @@ mod tests {
         assert_eq!(response["backups"][0]["name"], "old.zip");
         let response: serde_json::Value = client
             .get(format!("{base}/old.zip/preview"))
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .unwrap()
@@ -522,7 +546,7 @@ mod tests {
         assert_eq!(response["preview"]["world"], "World");
         let response = client
             .get(format!("{base}/old.zip"))
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .unwrap();
@@ -533,7 +557,8 @@ mod tests {
         );
         let response = client
             .delete(format!("{base}/old.zip"))
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
             .send()
             .await
             .unwrap();
@@ -541,7 +566,8 @@ mod tests {
         assert!(!f.rt.dir.join("backups/old.zip").exists());
         let update_res: serde_json::Value = client
             .post(format!("{base}/config"))
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
             .json(&serde_json::json!({
                 "enabled": false,
                 "interval_hours": 2.5,
@@ -563,7 +589,7 @@ mod tests {
         .unwrap();
         let response: serde_json::Value = client
             .get(&base)
-            .bearer_auth("unit-test-secret")
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .unwrap()

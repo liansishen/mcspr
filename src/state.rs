@@ -8,6 +8,8 @@ use tokio::sync::{Mutex, RwLock};
 
 pub struct AppStateInner {
     pub config: RwLock<PanelConfig>,
+    /// 账户 / 会话存储：路径在启动时由数据目录确定，不随运行时设置变化
+    pub auth: crate::auth::AuthStore,
     pub instances: RwLock<HashMap<String, Arc<InstanceRuntime>>>,
     pub jobs: std::sync::Mutex<HashMap<String, Job>>,
     pub sys: std::sync::Mutex<sysinfo::System>,
@@ -70,6 +72,7 @@ impl AppState {
     }
     pub async fn new(cfg: PanelConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.instances_dir())?;
+        let auth = crate::auth::AuthStore::load(&cfg.data_dir)?;
         let instances = crate::instance::scan_instances(&cfg.instances_dir(), cfg.console_buffer_lines);
         tracing::info!("已加载 {} 个实例", instances.len());
         let http = reqwest::Client::builder()
@@ -77,6 +80,7 @@ impl AppState {
             .build()?;
         Ok(Self(Arc::new(AppStateInner {
             config: RwLock::new(cfg),
+            auth,
             instances: RwLock::new(instances),
             jobs: std::sync::Mutex::new(HashMap::new()),
             sys: std::sync::Mutex::new(sysinfo::System::new()),

@@ -1,5 +1,6 @@
 mod alerts;
 mod api;
+mod auth;
 mod audit;
 mod config;
 mod error;
@@ -25,6 +26,35 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // 本地交互式账户初始化 / 恢复：处理完即退出，不启动 HTTP 服务
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .iter()
+        .any(|a| a == "--init-admin" || a == "--reset-admin-password")
+    {
+        let wants_init = args.iter().any(|a| a == "--init-admin");
+        let cfg_path = config::config_path();
+        // 恢复场景必须已存在 config.toml：避免在错误工作目录生成默认配置造成“幽灵初始化”
+        if !wants_init && !cfg_path.exists() {
+            anyhow::bail!(
+                "未找到 {}；请在面板安装目录（config.toml 所在目录）执行 --reset-admin-password",
+                cfg_path.display()
+            );
+        }
+        let cfg = config::load_or_create()?;
+        println!(
+            "使用配置文件：{}（数据目录：{}）",
+            cfg_path.display(),
+            cfg.data_dir
+        );
+        if wants_init {
+            auth::cli_init_admin(&cfg.data_dir).await?;
+        } else {
+            auth::cli_reset_admin_password(&cfg.data_dir).await?;
+        }
+        return Ok(());
+    }
 
     let cfg = config::load_or_create()?;
     let app_state = state::AppState::new(cfg.clone()).await?;
@@ -114,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                     if *rt.status.lock().await == instance::Status::Stopped {
                         continue;
                     }
+                    let generation = rt.tps_generation.load(std::sync::atomic::Ordering::SeqCst);
                     let dir = rt.dir.clone();
                     let runtime = rt.clone();
                     let res = tokio::task::spawn_blocking(move || {
@@ -127,8 +158,15 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .await
                     .ok();
-                    if let Some(v) = res {
-                        *rt.tps.lock().await = Some(v);
+                    if let Some(mut v) = res {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "sampled_at".into(),
+                                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                            );
+                        }
+                        // 停止 / 重启后代号变化，迟到的旧样本会被丢弃
+                        crate::instance::publish_tps_sample(&rt, generation, v).await;
                     }
                 }
             }
@@ -217,7 +255,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("按 Ctrl+C 停止面板时会自动保存并停止所有运行中的服务器");
     let shutdown = instance::process::shutdown_all(&app_state);
     tokio::select! {
-        r = axum::serve(listener, app) => {
+        r = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ) => {
             r.context("HTTP 服务异常退出")?;
         }
         _ = tokio::signal::ctrl_c() => {

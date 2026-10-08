@@ -203,6 +203,7 @@ fn finalize_import(state: &AppState, job_id: &str, target: &Path, name: &str) ->
         auto_start_on_boot: false,
         mc_version: None,
         mod_loader: None,
+        ..Default::default()
     };
     std::fs::write(
         target.join("instance.json"),

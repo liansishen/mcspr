@@ -1,13 +1,14 @@
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::instance::modpack;
 use crate::instance::process;
-use crate::instance::{get_instance, InstanceMeta, InstanceRuntime, Status};
+use crate::instance::{get_instance, InstanceMeta, InstanceRuntime, InstanceSummary, Status};
 use crate::jobs::{finish_job, Job};
 use crate::state::AppState;
 use crate::util::now_str;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::Json;
-use serde::Deserialize;
+use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,15 +17,77 @@ use tokio::io::AsyncWriteExt;
 
 // ---------- 实例列表 / 详情 ----------
 
-pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Json<serde_json::Value> {
     let map = state.instances.read().await;
-    let mut items = Vec::new();
+    let admin = identity.is_admin();
+    let mut items: Vec<InstanceSummary> = Vec::new();
     for rt in map.values() {
-        items.push(rt.summary().await);
+        let s = rt.summary().await;
+        // 普通用户仅在授权实例范围内可见
+        if admin || identity.can_view(&s.id) {
+            items.push(s);
+        }
     }
     drop(map);
     items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
-    Json(json!({ "instances": items }))
+    let out: Vec<serde_json::Value> = if admin {
+        items
+            .into_iter()
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .collect()
+    } else {
+        items
+            .iter()
+            .map(|s| serde_json::to_value(SafeSummary::from(s)).unwrap_or_default())
+            .collect()
+    };
+    Json(json!({ "instances": out }))
+}
+
+/// 普通用户可见的精简实例信息：去除 PID / Java 路径 / JVM 参数等管理字段。
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeSummary {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub status: String,
+    pub uptime_secs: u64,
+    pub players: usize,
+    pub player_names: Vec<String>,
+    pub tps: Option<serde_json::Value>,
+    pub mc_version: Option<String>,
+    pub mod_loader: Option<String>,
+}
+
+impl From<&InstanceSummary> for SafeSummary {
+    fn from(s: &InstanceSummary) -> Self {
+        Self {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            created_at: s.created_at.clone(),
+            status: s.status.clone(),
+            uptime_secs: s.uptime_secs,
+            players: s.players,
+            player_names: s.player_names.clone(),
+            tps: sanitize_tps(s.tps.clone()),
+            mc_version: s.mc_version.clone(),
+            mod_loader: s.mod_loader.clone(),
+        }
+    }
+}
+
+/// 普通用户接口不暴露原始 RCON 错误，仅给安全提示。
+fn sanitize_tps(tps: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut v = tps?;
+    if v.get("state").and_then(|s| s.as_str()) == Some("error") {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("error".to_string(), json!("TPS 采样失败，请稍后重试"));
+        }
+    }
+    Some(v)
 }
 
 #[derive(Deserialize)]
@@ -77,6 +140,7 @@ pub async fn create(
         auto_start_on_boot: false,
         mc_version: mc_version.clone(),
         mod_loader: mod_loader.clone(),
+        ..Default::default()
     };
     tokio::fs::write(dir.join("instance.json"), serde_json::to_string_pretty(&meta)?).await?;
     let rt = InstanceRuntime::new(meta, dir);
@@ -162,9 +226,19 @@ pub async fn loader_versions(
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    Ok(Json(serde_json::to_value(rt.summary().await)?))
+    if !identity.can_view(&id) {
+        return Err(ApiError::not_found("实例不存在"));
+    }
+    let s = rt.summary().await;
+    let value = if identity.is_admin() {
+        serde_json::to_value(s)?
+    } else {
+        serde_json::to_value(SafeSummary::from(&s))?
+    };
+    Ok(Json(value))
 }
 
 #[derive(Deserialize)]
@@ -305,9 +379,19 @@ pub async fn command(
 pub async fn status(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    Ok(Json(serde_json::to_value(rt.summary().await)?))
+    if !identity.can_view(&id) {
+        return Err(ApiError::not_found("实例不存在"));
+    }
+    let s = rt.summary().await;
+    let value = if identity.is_admin() {
+        serde_json::to_value(s)?
+    } else {
+        serde_json::to_value(SafeSummary::from(&s))?
+    };
+    Ok(Json(value))
 }
 
 pub async fn accept_eula(

@@ -74,7 +74,7 @@ function setup({ api = async () => ({ lines: [], cursor: 0 }) } = {}) {
     $$: () => [],
     setTimeout: fn => { timers.push(fn); return timers.length; },
     clearTimeout: () => {},
-    timers: [], routeToken: 1, TOKEN: 'test', consoleMaxLines: 800,
+    timers: [], routeToken: 1, consoleMaxLines: 800,
     loadUsers: () => {}, every: () => {},
   });
   const helpers = extract('function consoleLineParts', 'function renderTabConsole');

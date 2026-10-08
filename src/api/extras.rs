@@ -137,6 +137,9 @@ pub async fn clone_instance(
         auto_start_on_boot: false,
         mc_version: m.mc_version,
         mod_loader: m.mod_loader,
+        announcement_markdown: m.announcement_markdown,
+        announcement_updated_at: crate::util::now_str(),
+        announcement_updated_by: m.announcement_updated_by,
     };
     tokio::fs::write(
         new_dir.join("instance.json"),

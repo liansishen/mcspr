@@ -46,9 +46,7 @@
 <rect x='7' y='10' width='1' height='1' fill='#5d421f'/>
 </svg> <span>MCS Panel</span></div>
     <nav id="nav">
-      <a href="#/dashboard" data-nav="dashboard">📊 仪表盘</a>
-      <a href="#/instances" data-nav="instances">🗂 实例管理</a>
-      <a href="#/settings" data-nav="settings">⚙️ 面板设置</a>
+      <div id="nav-links" class="nav-links"></div>
       <select id="theme-select" class="theme-select" onchange="applyTheme(this.value)" aria-label="主题选择">
         <option value="dark">🎨 深色</option>
         <option value="light">☀️ 亮色</option>
@@ -57,6 +55,7 @@
       </select>
     </nav>
     <div class="side-foot">
+      <div id="account-box" class="account-box"></div>
       <div class="muted small">MCS Panel v<span id="ver"></span></div>
       <div class="muted small">Rust · Axum · Tokio ·
         <a class="gh-link" href="https://github.com/liansishen/mcspr" target="_blank" rel="noopener" title="GitHub 仓库">
@@ -74,7 +73,6 @@
 <script>
 fetch('/api/ping').then(r => r.json()).then(j => {
   document.getElementById('ver').textContent = j.version;
-  if (j.auth_required && !TOKEN) showTokenModal();
 }).catch(() => {});
 </script>
 </body>

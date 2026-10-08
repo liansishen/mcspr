@@ -18,9 +18,14 @@ const fmtUptime = s => {
   return `${m}分${s % 60}秒`;
 };
 
-let TOKEN = localStorage.getItem('mcspr.token') || '';
+let csrfToken = '';
+let currentUser = null;
 let currentInstanceInfo = null;
 let routeToken = 0;
+// 会话代际：登出 / 登录成功时递增，用于丢弃过期的 401（见 api / rawFetch）。
+let sessionGeneration = 0;
+// 登录尝试序号：后发的登录会让先发的异步结果作废。
+let loginAttempt = 0;
 let timers = [];
 let activeWS = null;
 let curPath = '';
@@ -34,28 +39,70 @@ function clearTimers() {
   if (activeWS) { try { activeWS.onclose = null; activeWS.close(); } catch {} activeWS = null; }
 }
 
-function headers(extra = {}) {
-  const h = { ...extra };
-  if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
-  return h;
+// 使当前视图失效：递增 routeToken 让所有在途 load 的 t 失配，
+// 从而不再重新装载定时器；并清理实例缓存与 DOM 数据集。
+function invalidateView() {
+  routeToken++;
+  currentInstanceInfo = null;
+  const main = $('#main');
+  if (main) { delete main.dataset.instanceId; delete main.dataset.viewRole; }
 }
 
+// 会话代际：请求在发起时捕获当前值，只有返回时仍是最新代际才允许触发
+// 「会话失效」，避免旧请求的 401 把刚建立的新登录顶掉。
 async function api(path, opts = {}) {
-  const h = headers(opts.headers || {});
+  const method = (opts.method || 'GET').toUpperCase();
+  const gen = sessionGeneration;
+  const h = { ...(opts.headers || {}) };
   let body = opts.body;
   if (body !== undefined && !(body instanceof FormData) && typeof body !== 'string') {
     h['Content-Type'] = 'application/json';
     body = JSON.stringify(body);
   }
-  const r = await fetch('/api' + path, { method: opts.method || 'GET', headers: h, body });
-  if (r.status === 401) { showTokenModal(); throw new Error('需要访问令牌'); }
+  // 写请求携带 CSRF 令牌；登录接口在会话建立前没有令牌，显式豁免
+  if (method !== 'GET' && method !== 'HEAD' && csrfToken && !opts.noCsrf) {
+    h['X-CSRF-Token'] = csrfToken;
+  }
+  const r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
+  if (r.status === 401 && !opts.skipAuthRedirect && gen === sessionGeneration) onSessionExpired();
   if (!r.ok) {
     let msg = r.statusText;
     try { const j = await r.json(); msg = j.error || msg; } catch {}
-    throw new Error(msg);
+    const err = new Error(msg || `请求失败 (${r.status})`);
+    err.status = r.status;
+    throw err;
   }
   const ct = r.headers.get('content-type') || '';
   return ct.includes('application/json') ? r.json() : r.text();
+}
+
+// 原始下载 / 辅助请求的统一入口：同源 Cookie + 代际感知的 401 处理。
+async function rawFetch(url, opts = {}) {
+  const gen = sessionGeneration;
+  const r = await fetch(url, { credentials: 'same-origin', ...opts });
+  if (r.status === 401 && gen === sessionGeneration) onSessionExpired();
+  return r;
+}
+
+async function downloadUrl(url, name) {
+  const gen = sessionGeneration;
+  // 原生下载前校验会话，文件内容由浏览器流式接收。
+  const response = await rawFetch(url, { method: 'HEAD' });
+  if (!response.ok) throw new Error(response.statusText || '下载失败');
+  if (gen !== sessionGeneration) return;
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+}
+
+function stopViewOnAccessError(error, token) {
+  if (token !== routeToken) return true;
+  if (![401, 403, 404].includes(error.status)) return false;
+  clearTimers();
+  invalidateView();
+  if (error.status !== 401) showInstanceError(error);
+  return true;
 }
 
 function toast(msg, ok = true) {
@@ -142,17 +189,164 @@ function appPrompt(msg, def = '', { title = '输入', placeholder = '' } = {}) {
   });
 }
 
-function showTokenModal() {
-  showModal(`<h2>需要访问令牌</h2>
-    <p class="muted small" style="margin-bottom:12px">此面板启用了鉴权，请输入 config.toml 中配置的 token。</p>
-    <input id="tok-input" placeholder="访问令牌" style="margin-bottom:14px">
-    <div class="row right"><button class="btn primary" onclick="saveToken()">确定</button></div>`);
+/* ---------------- 认证与会话 ---------------- */
+// 退出、401 或切换账户时清理计时器、WebSocket、实例缓存与已渲染 DOM，
+// 避免旧角色的导航、数据或轮询泄漏到新账户。
+function teardownSession() {
+  // 递增代际并失效当前视图：让在途请求的 401 失效、让在途轮询不再重新装载
+  sessionGeneration++;
+  loginAttempt++;
+  routeToken++;
+  clearTimers();
+  currentInstanceInfo = null;
+  currentUser = null;
+  csrfToken = '';
+  usersData = null;
+  usersInstanceId = null;
+  modsCache = null;
+  modDL = null;
+  mpUp = null;
+  filesEntriesCache = null;
+  currentGameBackupProvider = null;
+  accountsData = null;
+  const main = $('#main');
+  if (main) {
+    main.innerHTML = '';
+    delete main.dataset.instanceId;
+    delete main.dataset.viewRole;
+    main.classList.remove('detail-layout');
+  }
+  document.body.classList.remove('detail-view');
+  const mr = $('#modal-root');
+  if (mr) mr.innerHTML = '';
 }
-function saveToken() {
-  TOKEN = $('#tok-input').value.trim();
-  localStorage.setItem('mcspr.token', TOKEN);
-  closeModal();
-  route();
+
+function onSessionExpired() {
+  if (!currentUser) return;
+  teardownSession();
+  renderNav();
+  renderAccountBox();
+  renderLogin('登录已失效，请重新登录');
+}
+
+function navItems() {
+  if (currentUser && currentUser.role === 'admin') {
+    return [['dashboard', '📊 仪表盘'], ['instances', '🗂 实例管理'], ['accounts', '👥 账户管理'], ['settings', '⚙️ 面板设置']];
+  }
+  return [['my-instances', '🗂 我的实例']];
+}
+
+function renderNav() {
+  const box = $('#nav-links');
+  if (!box) return;
+  box.innerHTML = navItems().map(([k, label]) => `<a href="#/${k}" data-nav="${k}">${label}</a>`).join('');
+}
+
+function navActiveKey(parts) {
+  if (currentUser && currentUser.role === 'admin') return parts[0] === 'instance' ? 'instances' : parts[0];
+  return parts[0] === 'instance' ? 'my-instances' : parts[0];
+}
+
+function renderAccountBox() {
+  const box = $('#account-box');
+  if (!box) return;
+  if (!currentUser) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="acct-name" title="${esc(currentUser.username)}">${esc(currentUser.username)}</div>
+    <div class="muted small">${currentUser.role === 'admin' ? '管理员' : '普通用户'}</div>
+    <div class="row" style="margin-top:8px;gap:6px">
+      <button class="btn small ghost" onclick="showChangePassword()">修改密码</button>
+      <button class="btn small" onclick="doLogout()">退出</button>
+    </div>`;
+}
+
+function renderLogin(err = '') {
+  teardownSession();
+  document.body.classList.add('auth-view');
+  $('#main').innerHTML = `<div class="login-wrap"><div class="login-card card">
+    <h1>登录 MCS Panel</h1>
+    <p class="muted small" style="margin-bottom:14px">使用面板账户的用户名与密码登录。</p>
+    <label>用户名<input id="login-user" autocomplete="username" autocapitalize="off" autocorrect="off"></label>
+    <label>密码<input id="login-pass" type="password" autocomplete="current-password"></label>
+    <div id="login-err" class="login-err" role="alert">${esc(err)}</div>
+    <button class="btn primary" id="login-btn" style="width:100%">登录</button>
+  </div></div>`;
+  const btn = $('#login-btn');
+  if (btn) btn.onclick = doLogin;
+  const pass = $('#login-pass');
+  if (pass) pass.onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+  const user = $('#login-user');
+  if (user) user.focus();
+}
+
+async function doLogin() {
+  const username = ($('#login-user')?.value || '').trim();
+  const password = $('#login-pass')?.value || '';
+  const errEl = $('#login-err');
+  if (!username || !password) { if (errEl) errEl.textContent = '请输入用户名和密码'; return; }
+  const btn = $('#login-btn');
+  if (btn?.disabled) return;
+  if (btn) btn.disabled = true;
+  const attempt = ++loginAttempt;
+  try {
+    const me = await api('/auth/login', { method: 'POST', body: { username, password }, skipAuthRedirect: true, noCsrf: true });
+    // 期间又发起了新的登录（或已退出），本次结果作废
+    if (attempt !== loginAttempt) return;
+    sessionGeneration++;
+    currentUser = me.user;
+    csrfToken = me.csrf_token || '';
+    document.body.classList.remove('auth-view');
+    renderNav();
+    renderAccountBox();
+    const home = currentUser.role === 'admin' ? '#/dashboard' : '#/my-instances';
+    if (location.hash === home) route(); else location.hash = home;
+  } catch (e) {
+    if (attempt !== loginAttempt) return;
+    if (errEl) errEl.textContent = e.message || '登录失败';
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  const gen = sessionGeneration;
+  try { await api('/auth/logout', { method: 'POST' }); } catch {}
+  if (gen !== sessionGeneration) return;
+  teardownSession();
+  renderNav();
+  renderAccountBox();
+  renderLogin();
+}
+
+function showChangePassword() {
+  showModal(`<h2>修改密码</h2>
+    <label>当前密码<input id="pw-old" type="password" autocomplete="current-password"></label>
+    <label>新密码<input id="pw-new" type="password" autocomplete="new-password"></label>
+    <label>确认新密码<input id="pw-confirm" type="password" autocomplete="new-password"></label>
+    <div id="pw-err" class="login-err" role="alert"></div>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" id="pw-go" onclick="doChangePassword()">保存</button></div>`);
+}
+
+async function doChangePassword() {
+  const oldPw = $('#pw-old')?.value || '', newPw = $('#pw-new')?.value || '', confirm = $('#pw-confirm')?.value || '';
+  const err = $('#pw-err');
+  const btn = $('#pw-go');
+  if (!oldPw || !newPw) { if (err) err.textContent = '请填写当前密码与新密码'; return; }
+  if (newPw !== confirm) { if (err) err.textContent = '两次输入的新密码不一致'; return; }
+  if (btn) btn.disabled = true;
+  const gen = sessionGeneration;
+  try {
+    await api('/auth/password', { method: 'PUT', body: { old_password: oldPw, password: newPw } });
+    if (gen !== sessionGeneration) return;
+    closeModal();
+    toast('密码已修改，请重新登录');
+    teardownSession();
+    renderNav();
+    renderAccountBox();
+    renderLogin();
+  } catch (e) {
+    // 401 后弹窗可能已被 teardown 清除，按钮引用可能已脱离文档
+    if (err) err.textContent = e.message || '修改失败';
+    if (btn && btn.disabled) btn.disabled = false;
+  }
 }
 
 const STATUS_TEXT = { stopped: '已停止', starting: '启动中', running: '运行中', stopping: '停止中' };
@@ -187,23 +381,47 @@ window.addEventListener('hashchange', route);
 async function route() {
   const t = ++routeToken;
   clearTimers();
-  const hash = location.hash.replace(/^#/, '') || '/dashboard';
+  if (!currentUser) { renderLogin(); return; }
+  const isAdmin = currentUser.role === 'admin';
+  const hash = location.hash.replace(/^#/, '');
   const parts = hash.split('/').filter(Boolean);
-  document.body.classList.toggle('detail-view', parts[0] === 'instance' && !!parts[1]);
-  $('#main').classList.toggle('detail-layout', parts[0] === 'instance' && !!parts[1]);
-  $$('#nav a').forEach(a => {
-    const nav = a.dataset.nav;
-    const active = (nav === 'instances' && parts[0] === 'instance') || nav === parts[0];
-    a.classList.toggle('active', active);
-  });
+  const detail = parts[0] === 'instance' && !!parts[1];
+  document.body.classList.toggle('detail-view', detail);
+  $('#main').classList.toggle('detail-layout', detail);
+  const activeKey = navActiveKey(parts);
+  $$('#nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === activeKey));
   try {
-    if (parts[0] === 'dashboard') await renderDashboard(t);
-    else if (parts[0] === 'instances') await renderInstances(t);
-    else if (parts[0] === 'instance' && parts[1]) await renderInstance(parts[1], parts[2] || 'console', t);
-    else if (parts[0] === 'settings') await renderPanelSettings(t);
-    else location.hash = '#/dashboard';
+    if (parts[0] === 'instance' && parts[1]) {
+      if (isAdmin) {
+        const allowed = ADMIN_TABS.map(x => x[0]);
+        const tab = parts[2] || 'console';
+        await renderInstance(parts[1], allowed.includes(tab) ? tab : 'console', t);
+      } else {
+        // 普通用户仅开放「公告」「运行信息」，其他标签页一律回退到公告
+        const allowed = USER_VIEW_TABS.map(x => x[0]);
+        const tab = parts[2] || 'announcement';
+        if (!allowed.includes(tab)) { location.hash = `#/instance/${parts[1]}/announcement`; return; }
+        await renderUserInstance(parts[1], tab, t);
+      }
+    } else if (isAdmin) {
+      if (parts[0] === 'dashboard') await renderDashboard(t);
+      else if (parts[0] === 'instances') await renderInstances(t);
+      else if (parts[0] === 'accounts') await renderAccounts(t);
+      else if (parts[0] === 'settings') await renderPanelSettings(t);
+      else location.hash = '#/dashboard';
+    } else {
+      // 普通用户不能访问管理员页面，非法路径回到安全的默认页
+      if (parts[0] === 'my-instances') await renderMyInstances(t);
+      else location.hash = '#/my-instances';
+    }
   } catch (e) {
-    if (t === routeToken) $('#main').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+    if (t !== routeToken) return;
+    if (e.status === 403 || e.status === 404) {
+      clearTimers();
+      $('#main').innerHTML = `<div class="empty">${esc(e.status === 403 ? '没有访问权限' : '实例不存在或未授权')}</div>`;
+    } else {
+      $('#main').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+    }
   }
 }
 
@@ -256,6 +474,7 @@ async function renderDashboard(t = ++routeToken) {
           </div>`;
         }).join('') || '<div class="empty">还没有实例，去 <a href="#/instances">实例管理</a> 创建或导入</div>'}</div>`;
     } catch (e) {
+      if (stopViewOnAccessError(e, t)) return;
       if (t === routeToken) $('#dash').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
     }
   };
@@ -294,6 +513,7 @@ async function renderInstances(t = ++routeToken) {
           </td></tr>`).join('')}</tbody></table></div>`
         : '<div class="empty">暂无实例。点击右上角「导入整合包」或「新建空白实例」开始。</div>';
     } catch (e) {
+      if (stopViewOnAccessError(e, t)) return;
       if (t === routeToken) $('#inst-list').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
     }
   };
@@ -673,13 +893,14 @@ function uploadWithProgress(path, fd, onProg) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api' + path);
-    if (TOKEN) xhr.setRequestHeader('Authorization', 'Bearer ' + TOKEN);
+    xhr.withCredentials = true;
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
     xhr.upload.onprogress = e => { if (e.lengthComputable) onProg(Math.round(e.loaded / e.total * 100)); };
     xhr.onload = () => {
-      if (xhr.status === 401) { showTokenModal(); return reject(new Error('需要访问令牌')); }
       try {
         const j = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300) resolve(j); else reject(new Error(j.error || xhr.statusText));
+        if (xhr.status >= 200 && xhr.status < 300) resolve(j);
+        else { if (xhr.status === 401) onSessionExpired(); reject(new Error(j.error || xhr.statusText)); }
       } catch { reject(new Error('响应解析失败')); }
     };
     xhr.onerror = () => reject(new Error('网络错误'));
@@ -718,7 +939,8 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const INST_TABS = [['console', '控制台'], ['monitor', '监控'], ['mods', '模组'], ['backups', '备份'], ['game-backups', '游戏内备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const ADMIN_TABS = [['console', '控制台'], ['monitor', '监控'], ['announcement', '公告'], ['mods', '模组'], ['backups', '备份'], ['game-backups', '游戏内备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const USER_VIEW_TABS = [['announcement', '公告'], ['overview', '运行信息']];
 
 function instanceRuntimeText(s) {
   return (s.status === 'running' || s.status === 'starting')
@@ -733,17 +955,18 @@ async function renderInstance(id, tab, t = ++routeToken) {
   if (t !== routeToken) return;
   currentInstanceInfo = s;
   const main = $('#main');
-  if (main.dataset.instanceId === String(id) && $('#tab-body')) {
+  if (main.dataset.instanceId === String(id) && main.dataset.viewRole === 'admin' && $('#tab-body')) {
     $$('#main > .detail-tabs .tab').forEach(a => a.classList.toggle('active', a.getAttribute('href') === `#/instance/${id}/${tab}`));
     $('#tab-body').replaceChildren();
     $('#tab-body').scrollTop = 0;
   } else {
     main.dataset.instanceId = String(id);
+    main.dataset.viewRole = 'admin';
     main.classList.add('detail-layout');
     main.innerHTML = `
     <div class="page-head detail-head"><div class="detail-title"><h1><span id="inst-name">${esc(s.name)}</span></h1></div><div class="detail-status"><span id="inst-status">${statusPill(s.status)}</span><span class="muted small" id="inst-sub"></span></div><div class="row" id="inst-actions"></div></div>
     <div id="eula-banner"></div>
-    <div class="tabs detail-tabs">${INST_TABS.map(([k, label]) => `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
+    <div class="tabs detail-tabs">${ADMIN_TABS.map(([k, label]) => `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
     <div id="tab-body"></div>`;
   }
   $('#inst-name').textContent = s.name;
@@ -753,6 +976,7 @@ async function renderInstance(id, tab, t = ++routeToken) {
   const body = $('#tab-body');
   if (tab === 'console') renderTabConsole(id, body, t);
   else if (tab === 'monitor') renderTabMonitor(id, body, t);
+  else if (tab === 'announcement') renderTabAnnouncement(id, body, t);
   else if (tab === 'mods') renderTabMods(id, body, t);
   else if (tab === 'backups') renderTabBackups(id, body, t);
   else if (tab === 'worlds') renderTabWorlds(id, body, t);
@@ -778,7 +1002,9 @@ async function renderInstance(id, tab, t = ++routeToken) {
           ? `<div class="banner warn"><span>该实例尚未同意 Minecraft EULA，直接启动会失败。</span><button class="btn small" onclick="acceptEula('${id}')">同意 EULA 并继续</button></div>`
           : '';
       if (tab === 'game-backups' && previousStatus !== s2.status) loadGameBackups(id, t);
-    } catch {}
+    } catch (e) {
+      stopViewOnAccessError(e, t);
+    }
   };
   await upd();
   if (t === routeToken) every(2500, upd);
@@ -794,6 +1020,421 @@ function actionButtons(id, status) {
   parts.push(`<button class="btn ghost" onclick="openFolder('${id}')">打开目录</button>`);
   parts.push(`<button class="btn ghost" onclick="showModpackUpdate('${id}')">⤒ 更新整合包</button>`);
   return parts.join('');
+}
+
+/* ---------------- 管理员：账户管理 ---------------- */
+let accountsData = null;
+
+async function renderAccounts(t = ++routeToken) {
+  $('#main').innerHTML = `<div class="page-head"><h1>账户管理</h1><div class="row"><button class="btn primary" onclick="showCreateAccount()">＋ 新建账户</button></div></div>
+    <p class="muted small">管理员可创建账户、启用 / 禁用、重置密码、删除账户，并为普通用户分配可查看的实例。</p>
+    <div id="accounts-body"><div class="empty">加载中…</div></div>`;
+  await loadAccounts(t);
+}
+
+async function loadAccounts(t = routeToken) {
+  try {
+    const [a, inst] = await Promise.all([api('/accounts'), api('/instances')]);
+    if (t !== routeToken) return;
+    accountsData = { accounts: a.accounts || [], instances: inst.instances || [] };
+    renderAccountsTable();
+  } catch (e) {
+    if (t !== routeToken) return;
+    const el = $('#accounts-body');
+    if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function accountById(id) { return accountsData && accountsData.accounts.find(a => a.id === id); }
+
+function renderAccountsTable() {
+  const el = $('#accounts-body');
+  if (!el || !accountsData) return;
+  const names = Object.fromEntries(accountsData.instances.map(i => [i.id, i.name]));
+  const list = accountsData.accounts;
+  el.innerHTML = list.length ? `<div class="table-wrap"><table class="table">
+    <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>授权实例</th><th>操作</th></tr></thead>
+    <tbody>${list.map(a => `<tr>
+      <td><b>${esc(a.username)}</b></td>
+      <td>${a.role === 'admin' ? '管理员' : '普通用户'}</td>
+      <td>${a.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">禁用</span>'}</td>
+      <td class="muted small">${a.role === 'admin' ? '全部实例' : ((a.instance_ids || []).map(x => esc(names[x] || x)).join('、') || '未分配')}</td>
+      <td><div class="row">
+        <button class="btn small" onclick="showEditAccount('${a.id}')">授权 / 角色</button>
+        <button class="btn small" onclick="showResetPassword('${a.id}','${esc(a.username)}')">重置密码</button>
+        <button class="btn small ${a.enabled ? 'warn' : 'primary'}" onclick="toggleAccount('${a.id}',${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
+        <button class="btn small danger" onclick="deleteAccount('${a.id}','${esc(a.username)}')">删除</button>
+      </div></td></tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty">还没有账户，点击右上角「新建账户」创建。</div>';
+}
+
+function instanceCheckboxes(selected = []) {
+  const inst = (accountsData && accountsData.instances) || [];
+  if (!inst.length) return '<div class="muted small">暂无实例可分配</div>';
+  return inst.map(i => `<label class="check"><input type="checkbox" class="acct-inst" value="${esc(i.id)}" ${selected.includes(i.id) ? 'checked' : ''}> ${esc(i.name)}</label>`).join('');
+}
+
+function readInstanceChecks() { return $$('.acct-inst:checked').map(c => c.value); }
+
+function toggleAcctInstances() {
+  const box = $('#acct-inst-box');
+  if (box) box.style.display = $('#acct-role').value === 'admin' ? 'none' : '';
+}
+
+function showCreateAccount() {
+  showModal(`<h2>新建账户</h2>
+    <label>用户名<input id="acct-name" autocomplete="off"></label>
+    <label>密码<input id="acct-pass" type="password" autocomplete="new-password"></label>
+    <label>角色<select id="acct-role" onchange="toggleAcctInstances()"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+    <div id="acct-inst-box"><h3>授权实例</h3>${instanceCheckboxes()}</div>
+    <div id="acct-err" class="login-err" role="alert"></div>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" id="acct-go" onclick="doCreateAccount()">创建</button></div>`);
+}
+
+async function doCreateAccount() {
+  const username = $('#acct-name').value.trim();
+  const password = $('#acct-pass').value;
+  const role = $('#acct-role').value;
+  const instance_ids = role === 'admin' ? [] : readInstanceChecks();
+  const err = $('#acct-err');
+  if (!username || !password) { err.textContent = '请填写用户名和密码'; return; }
+  const btn = $('#acct-go'), token = routeToken, gen = sessionGeneration;
+  if (btn) btn.disabled = true;
+  try {
+    await api('/accounts', { method: 'POST', body: { username, password, role, instance_ids } });
+    if (gen !== sessionGeneration || token !== routeToken || btn !== $('#acct-go')) return;
+    closeModal();
+    toast('账户已创建');
+    loadAccounts(routeToken);
+  } catch (e) { if (err) err.textContent = e.message; }
+  finally { if (btn) btn.disabled = false; }
+}
+
+function showEditAccount(id) {
+  const a = accountById(id);
+  if (!a) return;
+  showModal(`<h2>编辑账户：${esc(a.username)}</h2>
+    <label>角色<select id="acct-role" onchange="toggleAcctInstances()">
+      <option value="user" ${a.role === 'user' ? 'selected' : ''}>普通用户</option>
+      <option value="admin" ${a.role === 'admin' ? 'selected' : ''}>管理员</option></select></label>
+    <div id="acct-inst-box" style="${a.role === 'admin' ? 'display:none' : ''}"><h3>授权实例</h3>${instanceCheckboxes(a.instance_ids || [])}</div>
+    <div id="acct-err" class="login-err" role="alert"></div>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" id="acct-go" onclick="saveEditAccount('${id}')">保存</button></div>`);
+}
+
+async function saveEditAccount(id) {
+  const a = accountById(id);
+  if (!a) return;
+  const role = $('#acct-role').value;
+  const err = $('#acct-err');
+  const instance_ids = role === 'admin' ? [] : readInstanceChecks();
+  const btn = $('#acct-go'), token = routeToken, gen = sessionGeneration;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/accounts/${id}`, { method: 'PATCH', body: { enabled: a.enabled, role } });
+    if (gen !== sessionGeneration) return;
+    await api(`/accounts/${id}/instances`, { method: 'PUT', body: { instance_ids } });
+    if (gen !== sessionGeneration || token !== routeToken || btn !== $('#acct-go')) return;
+    closeModal();
+    toast('账户已更新');
+    loadAccounts(routeToken);
+  } catch (e) { if (err) err.textContent = e.message; }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function toggleAccount(id, enabled) {
+  try {
+    await api(`/accounts/${id}`, { method: 'PATCH', body: { enabled } });
+    toast(enabled ? '账户已启用' : '账户已禁用');
+    loadAccounts(routeToken);
+  } catch (e) { toast(e.message, false); }
+}
+
+function showResetPassword(id, username) {
+  showModal(`<h2>重置密码：${esc(username)}</h2>
+    <label>新密码<input id="acct-pass" type="password" autocomplete="new-password"></label>
+    <div id="acct-err" class="login-err" role="alert"></div>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" id="acct-go" onclick="doResetPassword('${id}')">重置</button></div>`);
+}
+
+async function doResetPassword(id) {
+  const password = $('#acct-pass').value;
+  const err = $('#acct-err');
+  if (!password) { err.textContent = '请输入新密码'; return; }
+  const btn = $('#acct-go'), token = routeToken, gen = sessionGeneration;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/accounts/${id}/password`, { method: 'PUT', body: { password } });
+    if (gen !== sessionGeneration || token !== routeToken || btn !== $('#acct-go')) return;
+    closeModal();
+    toast('密码已重置，该账户需重新登录');
+    loadAccounts(routeToken);
+  } catch (e) { if (err) err.textContent = e.message; }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function deleteAccount(id, username) {
+  if (!(await appConfirm(`确定删除账户「${username}」？`, { danger: true, okText: '删除' }))) return;
+  try {
+    await api(`/accounts/${id}`, { method: 'DELETE' });
+    toast('账户已删除');
+    loadAccounts(routeToken);
+  } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 普通用户：我的实例 / 公告 / 运行信息 ---------------- */
+function userRuntimeText(s) {
+  return (s.status === 'running' || s.status === 'starting')
+    ? `已运行 ${fmtUptime(s.uptime_secs)} · ${s.players || 0} 名玩家在线`
+    : '';
+}
+
+function showInstanceError(e) {
+  const main = $('#main');
+  if (e.status === 403) main.innerHTML = '<div class="empty">没有访问权限</div>';
+  else if (e.status === 404) main.innerHTML = '<div class="empty">实例不存在或未授权</div>';
+  else main.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+}
+
+async function renderMyInstances(t = ++routeToken) {
+  $('#main').innerHTML = `<div class="page-head"><h1>我的实例</h1></div><div id="my-list"><div class="empty">加载中…</div></div>`;
+  const load = async () => {
+    try {
+      const { instances } = await api('/instances');
+      if (t !== routeToken) return;
+      const list = instances || [];
+      $('#my-list').innerHTML = list.length ? `<div class="grid cards-grid">${list.map(i => `
+        <div class="card inst-card">
+          <div class="inst-head"><a href="#/instance/${i.id}/announcement">${esc(i.name)}</a>${statusPill(i.status)}</div>
+          <div class="muted">${i.status === 'running' || i.status === 'starting' ? `运行 ${fmtUptime(i.uptime_secs)} · ${i.players || 0} 名玩家在线` : '未运行'}</div>
+          <div class="row actions"><a class="btn small primary" href="#/instance/${i.id}/announcement">进入</a></div>
+        </div>`).join('')}</div>`
+        : '<div class="empty">管理员尚未分配实例</div>';
+    } catch (e) {
+      if (t !== routeToken) return;
+      if (stopViewOnAccessError(e, t)) return;
+      const el = $('#my-list');
+      if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
+  };
+  await load();
+  if (t === routeToken) every(10000, load);
+}
+
+async function renderUserInstance(id, tab, t = ++routeToken) {
+  let s;
+  try { s = await api(`/instances/${id}`); }
+  catch (e) { if (t === routeToken) showInstanceError(e); return; }
+  if (t !== routeToken) return;
+  const main = $('#main');
+  const reuse = main.dataset.instanceId === String(id) && main.dataset.viewRole === 'user' && $('#tab-body');
+  if (reuse) {
+    $$('#main > .detail-tabs .tab').forEach(a => a.classList.toggle('active', a.getAttribute('href') === `#/instance/${id}/${tab}`));
+    $('#tab-body').replaceChildren();
+    $('#tab-body').scrollTop = 0;
+  } else {
+    main.dataset.instanceId = String(id);
+    main.dataset.viewRole = 'user';
+    main.classList.add('detail-layout');
+    main.innerHTML = `
+      <div class="page-head detail-head"><div class="detail-title"><h1><span id="inst-name">${esc(s.name)}</span></h1></div><div class="detail-status"><span id="inst-status">${statusPill(s.status)}</span><span class="muted small" id="inst-sub"></span></div><div class="row" id="inst-actions"></div></div>
+      <div class="tabs detail-tabs">${USER_VIEW_TABS.map(([k, label]) => `<a class="tab ${k === tab ? 'active' : ''}" href="#/instance/${id}/${k}">${label}</a>`).join('')}</div>
+      <div id="tab-body"></div>`;
+  }
+  $('#inst-name').textContent = s.name;
+  $('#inst-status').innerHTML = statusPill(s.status);
+  $('#inst-sub').textContent = userRuntimeText(s);
+  const body = $('#tab-body');
+  if (tab === 'overview') renderTabUserOverview(id, body, t);
+  else renderTabAnnouncement(id, body, t);
+}
+
+/* ---------------- 公告 ---------------- */
+function announcementMeta(d) {
+  if (!d || !d.updated_at) return '管理员暂未发布公告';
+  return `最后更新：${esc(d.updated_at)}${d.updated_by ? ' · ' + esc(d.updated_by) : ''}`;
+}
+
+function announcementViewHtml(d) {
+  return (d && d.html) ? `<div class="announcement md">${d.html}</div>` : '<div class="empty">管理员暂未发布公告</div>';
+}
+
+async function renderTabAnnouncement(id, el, t) {
+  if (currentUser && currentUser.role === 'admin') return renderTabAnnouncementAdmin(id, el, t);
+  el.innerHTML = '<div id="ann-meta" class="muted small" style="margin-bottom:10px"></div><div id="ann-body"><div class="empty">加载中…</div></div>';
+  try {
+    const d = await api(`/instances/${id}/announcement`);
+    if (t !== routeToken) return;
+    $('#ann-meta').innerHTML = announcementMeta(d);
+    $('#ann-body').innerHTML = announcementViewHtml(d);
+  } catch (e) {
+    if (stopViewOnAccessError(e, t)) return;
+    const b = $('#ann-body');
+    if (b) b.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+let annState = { id: null, updatedAt: '', original: '' };
+
+async function renderTabAnnouncementAdmin(id, el, t) {
+  const state = annState = { id, updatedAt: '', original: '', ready: false, previewSequence: 0 };
+  el.innerHTML = `
+    <div class="row between"><h2 style="margin:0">公告</h2><span class="muted small" id="ann-meta">加载中…</span></div>
+    <p class="muted small">支持标题、列表、引用、链接、代码块与表格；原始 HTML 会被安全过滤。</p>
+    <label>Markdown 内容<textarea id="ann-input" class="editor" style="height:300px;min-height:220px" placeholder="在此输入 Markdown 公告…"></textarea></label>
+    <div class="row" style="margin-bottom:10px">
+      <button class="btn" id="ann-preview-btn" disabled onclick="previewAnnouncement('${id}')">预览</button>
+      <button class="btn primary" id="ann-save-btn" disabled onclick="saveAnnouncement('${id}')">保存</button>
+      <span id="ann-msg" class="small"></span>
+    </div>
+    <h3>预览</h3>
+    <div id="ann-preview" class="announcement md"><div class="empty">点击「预览」查看渲染效果</div></div>`;
+  try {
+    const d = await api(`/instances/${id}/announcement`);
+    if (t !== routeToken) return;
+    Object.assign(state, { updatedAt: d.updated_at || '', original: d.markdown || '', ready: true });
+    $('#ann-preview-btn').disabled = false;
+    $('#ann-save-btn').disabled = false;
+    $('#ann-input').value = d.markdown || '';
+    $('#ann-meta').innerHTML = announcementMeta(d);
+  } catch (e) {
+    if (stopViewOnAccessError(e, t)) return;
+    const m = $('#ann-meta');
+    if (m) m.textContent = e.message;
+  }
+}
+
+function announcementEditorActive(id, state, token, input) {
+  return token === routeToken && state === annState && state.id === id && input === $('#ann-input');
+}
+
+async function previewAnnouncement(id) {
+  const state = annState, token = routeToken, input = $('#ann-input');
+  if (!input || state.id !== id || state.ready === false) return;
+  const md = input.value;
+  const sequence = state.previewSequence = (state.previewSequence || 0) + 1;
+  try {
+    const r = await api('/announcements/preview', { method: 'POST', body: { markdown: md } });
+    if (!announcementEditorActive(id, state, token, input) || sequence !== state.previewSequence || input.value !== md) return;
+    $('#ann-preview').innerHTML = r.html ? `<div class="md">${r.html}</div>` : '<div class="empty">预览为空</div>';
+  } catch (e) {
+    if (announcementEditorActive(id, state, token, input)) toast(e.message, false);
+  }
+}
+
+async function saveAnnouncement(id) {
+  const state = annState, token = routeToken, input = $('#ann-input');
+  const btn = $('#ann-save-btn'), msg = $('#ann-msg');
+  if (!input || state.id !== id || state.ready === false || btn?.disabled) return;
+  const md = input.value;
+  const sequence = state.previewSequence = (state.previewSequence || 0) + 1;
+  if (btn) btn.disabled = true;
+  try {
+    const d = await api(`/instances/${id}/announcement`, { method: 'PUT', body: { markdown: md, expected_updated_at: state.updatedAt } });
+    if (!announcementEditorActive(id, state, token, input)) return;
+    state.updatedAt = d.updated_at || '';
+    state.original = md;
+    $('#ann-meta').innerHTML = announcementMeta(d);
+    if (sequence === state.previewSequence && input.value === md) {
+      $('#ann-preview').innerHTML = d.html ? `<div class="md">${d.html}</div>` : '<div class="empty">公告已清空</div>';
+    }
+    if (msg) { msg.textContent = input.value === md ? '已保存' : '已保存提交时的内容，当前修改尚未保存'; msg.className = 'small'; }
+    toast('公告已保存');
+  } catch (e) {
+    if (!announcementEditorActive(id, state, token, input)) return;
+    const text = e.status === 409 ? '保存冲突：公告已被其他管理员修改，当前输入已保留。' : e.message;
+    if (msg) { msg.textContent = text; msg.className = 'small login-err'; }
+    toast(text, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ---------------- 运行信息 ---------------- */
+function tpsDisplay(tps, status) {
+  if (status === 'stopped') return { value: '已停止', hint: '实例未运行', kind: 'stopped' };
+  if (status === 'starting' || status === 'stopping') return { value: '采样中…', hint: '实例状态切换中', kind: 'pending' };
+  if (!tps) return { value: '采样中…', hint: '', kind: 'pending' };
+  if (tps.needs_rcon) return { value: '未配置采集', hint: '在服务器设置中开启 RCON 后，面板每 10 秒采样 TPS。', kind: 'warn' };
+  if (tps.error) return { value: '采样失败', hint: '暂时无法获取 TPS，请稍后重试。', kind: 'error' };
+  if (tps.stale) return { value: '采样过期', hint: 'TPS 采样已过期，实例可能未在运行。', kind: 'warn' };
+  if (tps.tps === null || tps.tps === undefined) return { value: '采样中…', hint: '', kind: 'pending' };
+  return { value: Number(tps.tps).toFixed(1), hint: tps.mspt !== null && tps.mspt !== undefined ? `MSPT ${tps.mspt}ms` : '', kind: 'ok' };
+}
+
+function formatSampleTime(value) {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? '' : time.toLocaleString();
+}
+
+function overviewPlayerRows(stats) {
+  return [...(stats || [])]
+    .sort((a, b) => (b.total_secs || 0) - (a.total_secs || 0))
+    .map(p => ({
+      name: p.name,
+      online: !!p.online,
+      total_secs: p.total_secs || 0,
+      current_session_secs: p.online ? (p.current_session_secs || 0) : 0,
+    }));
+}
+
+function playerStatsRows(stats) {
+  const rows = overviewPlayerRows(stats);
+  if (!rows.length) return '<div class="empty" style="padding:14px">暂无玩家记录</div>';
+  return '<div class="table-wrap"><table class="table"><thead><tr><th>玩家</th><th>状态</th><th>累计时长</th><th>当前会话</th></tr></thead><tbody>' +
+    rows.map(p => `<tr><td><b>${esc(p.name)}</b></td>
+      <td>${p.online ? '<span class="pill st-running">在线</span>' : '<span class="pill st-stopped">离线</span>'}</td>
+      <td data-online="${p.online ? 1 : 0}" data-base="${p.total_secs}">${fmtUptime(p.total_secs)}</td>
+      <td data-online="${p.online ? 1 : 0}" data-base="${p.current_session_secs}">${p.online ? fmtUptime(p.current_session_secs) : '-'}</td>
+    </tr>`).join('') + '</tbody></table></div>';
+}
+
+function renderUserOverview(el, d) {
+  const tp = tpsDisplay(d.tps, d.status);
+  el.innerHTML = `
+    <div class="grid stats-grid">
+      <div class="card"><h3>运行状态</h3><div class="big" id="ov-status">${esc(STATUS_TEXT[d.status] || d.status)}</div>
+        <div class="muted small">${d.status === 'running' || d.status === 'starting' ? `已运行 ${fmtUptime(d.uptime_secs)}` : ''}</div>
+        <div class="muted small">在线人数：${d.players || 0}</div></div>
+      <div class="card"><h3>TPS</h3><div class="big" id="ov-tps">${esc(tp.value)}</div>
+        <div class="muted small" id="ov-tps-hint">${esc(tp.hint)}</div>
+        <div class="muted small" id="ov-tps-time">${d.tps && d.tps.sampled_at ? '采样时间：' + esc(formatSampleTime(d.tps.sampled_at)) : ''}</div></div>
+    </div>
+    <h3>玩家在线时长</h3>
+    <div id="ov-players">${playerStatsRows(d.player_stats)}</div>`;
+}
+
+async function renderTabUserOverview(id, el, t) {
+  el.innerHTML = '<div class="empty">加载中…</div>';
+  const state = { data: null, at: 0 };
+  const load = async () => {
+    try {
+      const d = await api(`/instances/${id}/overview`);
+      if (t !== routeToken) return;
+      state.data = d;
+      state.at = Date.now();
+      renderUserOverview(el, d);
+      const pill = $('#inst-status .pill');
+      if (pill) { pill.className = `pill st-${esc(d.status)}`; pill.textContent = STATUS_TEXT[d.status] || d.status; }
+      const sub = $('#inst-sub');
+      if (sub) sub.textContent = userRuntimeText(d);
+    } catch (e) {
+      if (t !== routeToken) return;
+      if (stopViewOnAccessError(e, t)) return;
+      el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
+  };
+  await load();
+  if (t !== routeToken) return;
+  every(10000, load);
+  // 会话时长在两次采样之间本地平滑递增，下次响应校准
+  every(1000, () => {
+    if (!state.data) return;
+    const elapsed = Math.floor((Date.now() - state.at) / 1000);
+    $$('#ov-players [data-online="1"]').forEach(td => {
+      td.textContent = fmtUptime((Number(td.dataset.base) || 0) + elapsed);
+    });
+  });
 }
 
 /* ---------------- 更新整合包 ---------------- */
@@ -970,7 +1611,7 @@ function applyConsoleFilter() {
 }
 async function downloadConsole(id) {
   try {
-    const r = await fetch(`/api/instances/${id}/console/download`, { headers: headers() });
+    const r = await rawFetch(`/api/instances/${id}/console/download`);
     if (!r.ok) throw new Error(r.statusText);
     const blob = await r.blob();
     const a = document.createElement('a');
@@ -993,7 +1634,7 @@ function consoleTabComplete(id) {
     pool = TAB_COMMANDS.filter(c => !c.endsWith(' ')).concat(['help']);
     prefix = last;
   } else if (parts.length >= 2 && ['op', 'deop', 'kick', 'ban', 'pardon', 'whitelist'].includes(parts[0])) {
-    pool = (modDL ? [] : []).concat((usersData?.online || []), (playersData?.players || []));
+    pool = [...new Set([...(usersData?.online || []), ...(currentInstanceInfo?.player_names || [])])];
     prefix = last;
   }
   if (!pool) return;
@@ -1162,7 +1803,7 @@ function renderTabConsole(id, el, t) {
   const connect = () => {
     if (t !== routeToken) return;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/api/instances/${id}/ws?token=${encodeURIComponent(TOKEN)}`);
+    const ws = new WebSocket(`${proto}://${location.host}/api/instances/${id}/ws`);
     activeWS = ws;
     ws.onmessage = e => {
       if (t !== routeToken || activeWS !== ws) return;
@@ -1462,12 +2103,10 @@ async function renderTabMonitor(id, el, t) {
         api(`/instances/${id}/playtime`), api(`/instances/${id}/crashes`),
       ]);
       if (t !== routeToken) return;
-      const tps = s.tps;
-      const tEl = document.getElementById('mon-tps'), hEl = document.getElementById('mon-tps-hint');
-      if (tps && tps.tps !== undefined) { tEl.textContent = tps.tps.toFixed(1); hEl.textContent = (tps.mspt !== undefined && tps.mspt !== null) ? `MSPT ${tps.mspt}ms` : ''; }
-      else if (tps && tps.needs_rcon) { tEl.textContent = '需要 RCON'; hEl.textContent = '在服务器设置中开启 enable-rcon 并设置 rcon.password 后，面板每 10 秒采样 TPS。'; }
-      else if (tps && tps.error) { tEl.textContent = '采样失败'; hEl.textContent = `RCON 采样失败：${tps.error}`; }
-      else { tEl.textContent = '采样中…'; hEl.textContent = ''; }
+      const tp = tpsDisplay(s.tps, s.status);
+      const time = s.tps?.sampled_at ? formatSampleTime(s.tps.sampled_at) : '';
+      document.getElementById('mon-tps').textContent = tp.value;
+      document.getElementById('mon-tps-hint').textContent = [tp.hint, time ? `采样时间：${time}` : ''].filter(Boolean).join(' · ');
       document.getElementById('mon-live').innerHTML = s.status === 'running'
         ? `运行 ${fmtUptime(s.uptime_secs)} · PID ${s.pid || '-'}`
         : '未运行';
@@ -1486,12 +2125,13 @@ async function renderTabMonitor(id, el, t) {
           '</tbody></table></div>'
         : '<div class="empty" style="padding:14px">无崩溃记录（异常退出时会自动归档控制台末尾与 crash-report）</div>';
     } catch (e) {
+      if (stopViewOnAccessError(e, t)) return;
       const el = document.getElementById('mon-chart');
       if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     }
   };
   await load();
-  every(10000, load);
+  if (t === routeToken) every(10000, load);
 }
 async function viewCrash(id, name) {
   try {
@@ -2075,7 +2715,10 @@ async function startGameBackup(id) {
     if (t === routeToken) watchGameBackupJob(j.job_id, t, id);
   } catch(e) { toast(e.message,false); if (t === routeToken) loadGameBackups(id, t); }
 }
-async function downloadGameBackup(id,name) { try { const r=await fetch(`/api/instances/${id}/game-backups/${name}`,{headers:headers()}); if(!r.ok)throw new Error(r.statusText); const a=document.createElement('a'); a.href=URL.createObjectURL(await r.blob()); a.download=decodeURIComponent(name); a.click(); URL.revokeObjectURL(a.href); } catch(e) { toast(e.message,false); } }
+async function downloadGameBackup(id,name) {
+  try { await downloadUrl(`/api/instances/${id}/game-backups/${name}`, decodeURIComponent(name)); }
+  catch (e) { toast(e.message, false); }
+}
 async function previewGameBackup(id,name) { try { const d=await api(`/instances/${id}/game-backups/${name}/preview`),p=d.preview; showModal(`<h2>游戏内备份预览</h2><p>${p.files} 个文件 · ${fmtSize(p.total_size)}</p><p>世界：${esc(p.world||'未知')}；包含：${(p.roots||[]).map(esc).join('、')}</p><p>恢复前副本目录：${esc(p.recovery_directory)}</p><div class="banner warn">恢复会使世界回退到备份时间点。恢复前会保留现有受影响的数据。</div><div class="row right"><button class="btn" onclick="closeModal()">关闭</button><button class="btn warn" ${currentInstanceInfo?.status!=='stopped'?'disabled':''} onclick="restoreGameBackup('${id}','${name}')">继续恢复</button></div>`); } catch(e) { toast(e.message,false); } }
 async function restoreGameBackup(id,name) {
   if(currentInstanceInfo?.status!=='stopped') return toast('恢复要求实例已停止',false);
@@ -2205,7 +2848,7 @@ async function createBackup(id) {
 }
 async function downloadBackup(id, name) {
   try {
-    const r = await fetch(`/api/instances/${id}/backups/${encodeURIComponent(name)}/download`, { headers: headers() });
+    const r = await rawFetch(`/api/instances/${id}/backups/${encodeURIComponent(name)}`);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
     const blob = await r.blob();
     const a = document.createElement('a');
@@ -2738,8 +3381,6 @@ async function renderPanelSettings(t = ++routeToken) {
     <div class="form card">
       <label>监听地址<input id="ps-listen" value="${esc(c.listen)}" placeholder="127.0.0.1:8080">
         <div class="muted small">格式 IP:端口；127.0.0.1 仅本机访问，0.0.0.0 对局域网开放。修改后需重启面板生效。</div></label>
-      <label>访问令牌<input id="ps-token" value="" placeholder="${c.token_set ? '已设置（留空保持不变）' : '留空则无需鉴权'}">
-        <div class="muted small">设置后所有 API 与 WebSocket 控制台都需要令牌，保存后立即生效；对外暴露时建议设置。为安全起见已保存的令牌不回显，留空保存即保持不变。</div></label>
       <label>CurseForge API Key<input id="ps-cfkey" value="" placeholder="${c.curseforge_api_key_set ? '已设置（留空保持不变）' : '留空则模组下载仅支持 Modrinth'}">
         <div class="muted small">用于「模组下载」中 CurseForge 的搜索与文件列表；在 console.curseforge.com 可免费创建。已保存的 Key 不回显，留空保存即保持不变。</div></label>
       <label class="full">数据目录<input id="ps-dir" value="${esc(c.data_dir)}">
@@ -2799,7 +3440,6 @@ async function savePanelSettings() {
       method: 'PUT',
       body: {
         listen: $('#ps-listen').value,
-        token: $('#ps-token').value,
         data_dir: $('#ps-dir').value,
         curseforge_api_key: $('#ps-cfkey').value,
         console_max_lines: +$('#ps-console-lines').value || undefined,
@@ -2815,10 +3455,19 @@ async function savePanelSettings() {
 /* ---------------- 启动 ---------------- */
 async function bootstrap() {
   try {
+    const me = await api('/auth/me', { skipAuthRedirect: true });
+    currentUser = me.user;
+    csrfToken = me.csrf_token || '';
+  } catch { currentUser = null; }
+  if (!currentUser) { renderNav(); renderAccountBox(); renderLogin(); return; }
+  try {
     const c = await api('/settings');
     const n = Number(c.console_max_lines);
     if (Number.isFinite(n) && n > 0) consoleMaxLines = n;
   } catch {}
+  document.body.classList.remove('auth-view');
+  renderNav();
+  renderAccountBox();
   route();
 }
 bootstrap();
@@ -2850,7 +3499,7 @@ function consoleKeydown(e, id) {
       return;
     }
     // 玩家名补全（在线玩家）
-    fetch('/api/instances/' + id + '/users', { headers: headers() })
+    rawFetch('/api/instances/' + id + '/users')
       .then(r => r.json())
       .then(d => {
         const pool = (d.online || []).map(p => p).filter(n => n.toLowerCase().startsWith(last));
@@ -2997,17 +3646,14 @@ async function uploadIcon(id) {
   try { await api(`/instances/${id}/icon`, { method: 'POST', body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
 }
 async function downloadFile(id, path) {
-  const a = document.createElement('a');
-  a.href = `/api/instances/${id}/files/download?path=${encodeURIComponent(path)}${TOKEN ? '&token=' + encodeURIComponent(TOKEN) : ''}`;
-  a.download = path.split('/').pop(); a.click();
+  try { await downloadUrl(`/api/instances/${id}/files/download?path=${encodeURIComponent(path)}`, path.split('/').pop()); }
+  catch (e) { toast(e.message, false); }
 }
 async function downloadArchive(id, path) {
   const name = (path.split('/').pop() || 'archive') + '.tar.gz';
   try {
     await api(`/instances/${id}/files/archive`, { method: 'POST', body: { paths: [path], name } });
-    const a = document.createElement('a');
-    a.href = `/api/instances/${id}/files/archive-download?name=${encodeURIComponent(name)}`;
-    a.download = name; a.click();
+    await downloadUrl(`/api/instances/${id}/files/archive-download?name=${encodeURIComponent(name)}`, name);
   } catch (e) { toast(e.message, false); }
 }
 async function saveAlerts(id) {

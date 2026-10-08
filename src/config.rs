@@ -36,6 +36,7 @@ impl Default for Thresholds {
 pub struct PanelConfig {
     pub listen: String,
     pub data_dir: String,
+    /// 已废弃：旧版全局访问令牌。账户认证启用后仅作兼容保留，不再参与鉴权。
     #[serde(default)]
     pub token: String,
     /// CurseForge API Key（用于模组搜索下载；留空则仅支持 Modrinth）

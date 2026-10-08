@@ -18,6 +18,11 @@
 - 操作审计：写操作与失败请求自动记录，敏感参数脱敏，支持查询
 - 告警推送：实例崩溃、计划任务连续失败、磁盘水位——支持 Webhook / Discord / Telegram
 
+**面板账户与实例授权**
+- 用户名 / 密码登录，管理员拥有完整管理权限，可创建账户、重置密码、禁用账户与分配实例查看权限
+- 普通用户的「我的实例」列表仅显示被授权实例；详情提供「公告」与「运行信息」两个只读标签页
+- 实例公告支持 Markdown 编辑、预览与安全渲染；运行信息显示 TPS、运行状态、玩家累计及当前会话在线时长
+
 **模组与配置**
 - 模组在线下载：Modrinth 与 CurseForge 搜索，按游戏版本 / 加载器过滤，队列式批量安装，自动解析前置依赖，SHA1 校验
 - 换版本即替换：已安装模组下载新版本后自动清理旧文件；删除模组时自动检查多层依赖并可级联删除
@@ -65,16 +70,44 @@ cargo build --release
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `listen` | `"127.0.0.1:8080"` | 监听地址；`0.0.0.0:8080` 对局域网开放（建议配合访问令牌） |
+| `listen` | `"127.0.0.1:8080"` | 监听地址；`0.0.0.0:8080` 对局域网开放，公网部署建议配合 HTTPS |
 | `data_dir` | `"data"` | 实例数据目录 |
-| `token` | 空 | 访问令牌；设置后所有 API 与 WebSocket 均需鉴权，立即生效 |
+| `token` | 空 | 旧版本配置兼容字段；账户认证启用后使用用户名 / 密码与会话 Cookie |
 | `curseforge_api_key` | 空 | CurseForge 模组搜索下载用；留空仅支持 Modrinth |
 | `backup_keep` / `backup_keep_days` | `10` / `30` | 备份保留份数与天数 |
 | `alert_type` | `"none"` | 告警推送：`none` / `webhook` / `discord` / `telegram` |
 | `alert_webhook_url` / `telegram_bot_token` / `telegram_chat_id` | 空 | 告警推送目标 |
 | `[thresholds]` | 见下 | `crash_window_secs=600`、`crash_max=3`、`restart_delay_secs=5`、`disk_warn_percent=90` |
 
-机密字段（令牌 / API Key / Bot Token）在「面板设置」页保存后不回显，留空保存即保持不变。
+机密字段（API Key / Bot Token）在「面板设置」页保存后不回显，留空保存即保持不变。
+
+### 账户认证初始化与升级
+
+升级到此功能分支时，在面板工作目录使用本地交互命令创建首个管理员：
+
+```bash
+./mcspr --init-admin
+```
+
+按提示输入用户名和密码，再启动面板并在浏览器登录。账户和授权保存在数据目录的 `auth/users.json`；请将该文件纳入安全备份。业务接口在管理员初始化后通过登录会话访问，旧版访问令牌退出认证流程。
+
+忘记管理员密码时，在面板工作目录执行本地恢复命令：
+
+```bash
+./mcspr --reset-admin-password
+```
+
+恢复密码前须停止面板服务，再在其工作目录执行命令；服务运行时账户存储被锁定，恢复命令会拒绝执行。恢复完成后重新启动并登录。正常账户管理中的密码重置、禁用及角色变更会撤销已有会话；面板重启后所有用户重新登录。管理员撤销实例授权后，普通用户的下一次读取请求失去访问权限。
+
+密码使用 Argon2id 哈希保存。浏览器通过 HttpOnly 会话 Cookie 登录，写请求带有防跨站请求伪造的令牌。公网访问建议使用 HTTPS，局域网或本机访问按实际协议配置。
+
+### 玩家在线时长
+
+累计值包含已结算时长和正在进行的当前会话。玩家表按实例显示全体已记录玩家的在线状态、累计时长和本次在线时长。
+
+统计从面板采集到的加入日志开始；历史数据沿用实例中的 `player-stats.json`。缺少标准加入 / 离开日志的服务端可能存在统计缺口，强制结束面板可能丢失未结算时长。正常停服会结算并保存。
+
+本次浏览器验收由用户实施，步骤见 [账户与实例授权浏览器验收清单](docs/account-browser-checklist.md)。
 
 ## 🐧 Linux 部署
 
@@ -127,10 +160,12 @@ WantedBy=multi-user.target
 
 ## 📖 API 概览
 
-所有接口位于 `/api` 前缀下；设置令牌后需携带 `Authorization: Bearer <token>` 或 `?token=` 参数。
+所有接口位于 `/api` 前缀下；业务接口使用登录后设置的会话 Cookie。写请求同时携带 `X-CSRF-Token`。
 
 | 分组 | 端点 |
 | --- | --- |
+| 登录与账户 | `POST /api/auth/login` · `POST /api/auth/logout` · `GET /api/auth/me` · `PUT /api/auth/password` · 管理员：`GET/POST /api/accounts`、`PATCH/DELETE /api/accounts/{id}`、`PUT /api/accounts/{id}/password`、`PUT /api/accounts/{id}/instances` |
+| 实例只读与公告 | `GET /api/instances/{id}/overview` · `GET /api/instances/{id}/playtime` · `GET/PUT /api/instances/{id}/announcement` · 管理员：`POST /api/announcements/preview` |
 | 全局 | `GET /api/stats` · `GET /api/versions` · `GET /api/settings` · `PUT /api/settings` · `GET /api/audit` · `GET /api/config/export` · `POST /api/config/import` |
 | 实例 | `GET/POST /api/instances` · `GET/PATCH/DELETE /api/instances/{id}` · `GET /api/instances/{id}/status` |
 | 进程 | `POST .../start` `.../stop` `.../restart` `.../command` `.../eula` `.../open` · `GET .../console` · `WS .../ws` |
@@ -149,7 +184,7 @@ WantedBy=multi-user.target
 - 面板进程重启时，正在运行的服务器进程会成为孤儿进程（不会退出），建议先停止实例再重启面板
 - `server.properties` 修改在服务器运行期间不会热生效，需重启实例
 - 超过 2MB 或二进制格式的文件不允许在线编辑（可上传替换）
-- 所有路径操作都限制在实例目录内，拒绝 `..` 与绝对路径；对局域网开放时建议设置访问令牌
+- 所有路径操作都限制在实例目录内，拒绝 `..` 与绝对路径；普通用户只能读取已授权实例的公告和运行信息
 
 ## 许可证
 

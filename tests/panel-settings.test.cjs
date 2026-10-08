@@ -61,7 +61,6 @@ test('panel settings form exposes both console line settings', () => {
 test('saving panel settings sends the console limits and refreshes the cache', async () => {
   const { context, getEl, calls } = setup();
   getEl('ps-listen').value = '127.0.0.1:8080';
-  getEl('ps-token').value = '';
   getEl('ps-dir').value = 'data';
   getEl('ps-cfkey').value = '';
   getEl('ps-console-lines').value = '1500';
@@ -74,5 +73,6 @@ test('saving panel settings sends the console limits and refreshes the cache', a
   assert.equal(calls[0].options.method, 'PUT');
   assert.equal(calls[0].options.body.console_max_lines, 1500);
   assert.equal(calls[0].options.body.console_buffer_lines, 9000);
+  assert.equal('token' in calls[0].options.body, false);
   assert.equal(context.consoleMaxLines, 1500);
 });

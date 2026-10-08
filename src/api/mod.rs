@@ -1,19 +1,27 @@
+mod accounts;
+mod announcement;
+mod auth;
 mod backup;
 mod game_backup;
 mod extras;
 mod console;
 mod instances;
+mod overview;
 mod resources;
+#[cfg(test)]
+mod tests;
 
+use crate::audit::AuditActor;
+use crate::auth::Identity;
 use crate::config;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -25,12 +33,24 @@ use std::collections::HashMap;
 struct Assets;
 
 pub fn router(state: AppState) -> Router {
-    // ping 无需鉴权，前端用它获取版本并判断是否启用了令牌
+    // ping 无需鉴权，前端用它获取版本与账户初始化状态
     let ping = Router::new()
         .route("/api/ping", get(ping))
         .with_state(state.clone());
 
     let api = Router::new()
+        .route(
+            "/auth/login",
+            post(auth::login).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
+        .route("/auth/password", put(auth::password))
+        .route("/accounts", get(accounts::list).post(accounts::create))
+        .route("/accounts/{id}", patch(accounts::patch).delete(accounts::remove))
+        .route("/accounts/{id}/password", put(accounts::reset_password))
+        .route("/accounts/{id}/instances", put(accounts::set_instances))
+        .route("/announcements/preview", post(announcement::preview))
         .route("/stats", get(instances::stats))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/versions", get(instances::versions))
@@ -166,6 +186,11 @@ pub fn router(state: AppState) -> Router {
             "/instances/{id}/playtime",
             get(resources::playtime),
         )
+        .route("/instances/{id}/overview", get(overview::get))
+        .route(
+            "/instances/{id}/announcement",
+            get(announcement::get).put(announcement::put),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(middleware::from_fn_with_state(state.clone(), audit_mw))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
@@ -177,36 +202,188 @@ pub fn router(state: AppState) -> Router {
         .fallback(static_handler)
 }
 
-async fn auth_mw(state: State<AppState>, req: Request, next: Next) -> Response {
-    let token = state.config.read().await.token.clone();
-    if !token.is_empty() {
-        let header_ok = req
+const SESSION_COOKIE: &str = "mcspr_session";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// 无需登录（登录接口）
+    Public,
+    /// 任意已登录账户
+    Authenticated,
+    /// 仅管理员
+    Admin,
+}
+
+/// 按 HTTP 方法 + 路径匹配路由，返回所需权限级别与实例 ID（如有）。
+/// 除明确列入只读集合的接口外，一律要求管理员。
+fn classify(method: &Method, path: &str) -> (Access, Option<String>) {
+    let p = path.strip_prefix("/api").unwrap_or(path);
+    let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let get = method == Method::GET;
+    let post = method == Method::POST;
+    let put = method == Method::PUT;
+    match segs.as_slice() {
+        ["auth", "login"] if post => (Access::Public, None),
+        ["auth", "me"] if get => (Access::Authenticated, None),
+        ["auth", "logout"] if post => (Access::Authenticated, None),
+        ["auth", "password"] if put => (Access::Authenticated, None),
+        ["instances"] if get => (Access::Authenticated, None),
+        ["instances", id] if get => (Access::Authenticated, Some((*id).to_string())),
+        ["instances", id, sub]
+            if get && matches!(*sub, "status" | "overview" | "playtime" | "announcement") =>
+        {
+            (Access::Authenticated, Some((*id).to_string()))
+        }
+        _ => (Access::Admin, None),
+    }
+}
+
+/// 认证与授权中间件：解析会话 Cookie、校验来源与 CSRF、按路由要求授权实例。
+/// 身份以最新账户状态构建，撤销授权 / 禁用 / 改角色在下次请求即生效。
+async fn auth_mw(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let (access, instance_id) = classify(req.method(), req.uri().path());
+    if access == Access::Public {
+        return next.run(req).await;
+    }
+
+    let identity = match cookie_value(req.headers(), SESSION_COOKIE) {
+        Some(token) => state.auth.session_identity(&token).await,
+        None => None,
+    };
+    let Some(identity) = identity else {
+        return api_error(StatusCode::UNAUTHORIZED, "未登录或会话已失效");
+    };
+
+    // 同源校验：浏览器带 Origin 时须与 Host 一致；无 Origin（非浏览器客户端）放行
+    if !origin_ok(req.headers()) {
+        return deny(&identity, StatusCode::FORBIDDEN, "请求来源不受信任");
+    }
+
+    // 写请求 CSRF（登录为 Public，不需要）
+    if is_mutating(req.method()) {
+        let ok = req
             .headers()
-            .get(header::AUTHORIZATION)
+            .get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
-            .map(|v| crate::util::ct_eq(v, &format!("Bearer {token}")))
+            .map(|v| crate::util::ct_eq(v, &identity.csrf))
             .unwrap_or(false);
-        let query_ok = req.uri().query().map(|q| {
-            q.split('&').any(|pair| {
-                pair.split_once('=')
-                    .map(|(k, v)| k == "token" && crate::util::ct_eq(v, &token))
-                    .unwrap_or(false)
-            })
-        }).unwrap_or(false);
-        if !header_ok && !query_ok {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "需要访问令牌"}))).into_response();
+        if !ok {
+            return deny(&identity, StatusCode::FORBIDDEN, "CSRF 校验失败");
         }
     }
-    next.run(req).await
+
+    if access == Access::Admin && !identity.is_admin() {
+        return deny(&identity, StatusCode::FORBIDDEN, "需要管理员权限");
+    }
+
+    if let Some(id) = instance_id {
+        if !identity.can_view(&id) {
+            // 未授权实例与不存在实例统一返回 404，减少实例枚举
+            return deny(&identity, StatusCode::NOT_FOUND, "实例不存在");
+        }
+    }
+
+    req.extensions_mut().insert(identity.clone());
+    let mut resp = next.run(req).await;
+    // 供审计中间件读取当前操作者（成功与被拒请求都记录）
+    resp.extensions_mut().insert(AuditActor::from_identity(&identity));
+    resp
+}
+
+fn is_mutating(method: &Method) -> bool {
+    matches!(method, &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in raw.split(';') {
+        if let Some((k, v)) = pair.trim().split_once('=') {
+            if k.trim() == name {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn session_cookie(token: &str, secure: bool, max_age: i64) -> String {
+    let mut c = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
+    );
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// 是否 HTTPS（通过反向代理头判断）；HTTP / SSH 隧道场景不加 Secure。
+fn is_secure_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("https")
+        })
+        .unwrap_or(false)
+}
+
+/// 同源校验：浏览器带 Origin 时必须与 Host 一致，`null` 一律拒绝；
+/// 无 Origin 头（非浏览器客户端 / 自动化测试）放行。
+fn origin_ok(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if origin == "null" {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let origin_host = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    origin_host.eq_ignore_ascii_case(host)
+}
+
+pub(crate) fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// 返回错误响应并附带已知操作者，保证被拒请求的审计仍记录身份。
+fn deny(identity: &Identity, status: StatusCode, msg: impl Into<String>) -> Response {
+    let mut resp = api_error(status, msg);
+    resp.extensions_mut().insert(AuditActor::from_identity(identity));
+    resp
+}
+
+/// 返回错误响应并附带显式操作者（登录接口用尝试的用户名）。
+pub(crate) fn api_error_actor(
+    status: StatusCode,
+    msg: impl Into<String>,
+    actor: AuditActor,
+) -> Response {
+    let mut resp = api_error(status, msg);
+    resp.extensions_mut().insert(actor);
+    resp
 }
 
 async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let auth_required = !state.config.read().await.token.is_empty();
+    // 认证始终必需；`initialized` 表示是否已创建账户（未初始化时业务接口保持封闭）
+    let initialized = state.auth.has_users().await;
     Json(json!({
         "ok": true,
         "name": "MCS Panel",
         "version": env!("CARGO_PKG_VERSION"),
-        "auth_required": auth_required,
+        "auth_required": true,
+        "initialized": initialized,
     }))
 }
 
@@ -430,9 +607,25 @@ async fn audit_mw(State(state): State<AppState>, req: Request, next: Next) -> Re
     let status = resp.status().as_u16();
     let mutating = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     if mutating || status >= 400 {
-        crate::audit::record(&state, &method, &path, status).await;
+        // auth_mw / 登录接口在响应扩展中留下操作者信息
+        let actor = resp.extensions().get::<AuditActor>().cloned();
+        let target = audit_target(&path);
+        crate::audit::record(&state, &method, &path, status, actor.as_ref(), target.as_deref()).await;
     }
     resp
+}
+
+/// 从路径提取审计目标（实例 / 账户 ID）。
+fn audit_target(path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let i = if segs.first() == Some(&"api") { 1 } else { 0 };
+    let kind = *segs.get(i)?;
+    if kind == "instances" || kind == "accounts" {
+        let id = *segs.get(i + 1)?;
+        Some(format!("{kind}:{id}"))
+    } else {
+        None
+    }
 }
 
 /// 审计日志查询

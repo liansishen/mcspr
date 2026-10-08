@@ -470,7 +470,12 @@ a { color: var(--blue); }
   #nav a { font-size: 16px; padding: 12px; text-align: center; }
   #nav a.active::before { display: none; }
   .theme-select { font-size: 16px; padding: 12px; text-align: center; }
-  .side-foot { display: none; }
+  .side-foot { padding: 8px 6px; }
+  .side-foot > .muted.small { display: none; }
+  .account-box .row { flex-direction: column; gap: 4px !important; }
+  .account-box .btn { width: 100%; font-size: 11px; padding: 5px 4px; }
+  .acct-name { font-size: 11px; text-align: center; }
+  .account-box .muted.small { text-align: center; }
 }
 
 /* 详情页在视口内滚动，标题与标签保持可见。 */
@@ -627,3 +632,33 @@ body.detail-view #app { height: 100vh; min-height: 0; }
   .detail-tabs .tab { white-space: nowrap; padding: 9px 12px; }
   .console { height: 420px; min-height: 260px; }
 }
+
+/* ---------------- 认证 / 账户 / 普通用户视图 ---------------- */
+.nav-links { display: flex; flex-direction: column; gap: 4px; }
+#nav .nav-links a { display: block; }
+.account-box { margin-bottom: 10px; }
+.acct-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+body.auth-view #sidebar { display: none; }
+body.auth-view #main { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
+.login-wrap { width: 100%; max-width: 380px; }
+.login-card { padding: 26px 26px 24px; }
+.login-card h1 { font-size: 20px; margin-bottom: 6px; }
+.login-err { color: var(--danger); font-size: 12.5px; min-height: 18px; margin: 2px 0 12px; }
+:root.mc .login-err { color: #ff5555; }
+
+.announcement { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 22px; line-height: 1.7; overflow-wrap: anywhere; }
+.announcement.md h1, .announcement.md h2, .announcement.md h3 { margin: 14px 0 8px; }
+.announcement.md h1 { font-size: 20px; }
+.announcement.md h2 { font-size: 17px; }
+.announcement.md p { margin: 8px 0; }
+.announcement.md ul, .announcement.md ol { margin: 8px 0 8px 22px; }
+.announcement.md blockquote { border-left: 3px solid var(--border); padding-left: 12px; color: var(--muted); margin: 8px 0; }
+.announcement.md code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+.announcement.md pre { background: var(--console-bg); color: var(--console-text); padding: 12px 14px; border-radius: 8px; overflow-x: auto; margin: 10px 0; }
+.announcement.md pre code { background: none; padding: 0; }
+.announcement.md table { border-collapse: collapse; width: 100%; margin: 10px 0; display: block; overflow-x: auto; }
+.announcement.md th, .announcement.md td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; }
+.announcement.md img { max-width: 100%; height: auto; }
+:root.mc .announcement.md pre { border: 2px solid #000; }
+:root.mc .announcement.md table { border: 2px solid #000; }

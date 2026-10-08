@@ -600,24 +600,12 @@ pub async fn crashes_file(
     Ok(Json(json!({ "name": name, "content": content })))
 }
 
-/// 玩家在线时长排行
+/// 玩家在线时长排行（实时累计：已结算时长 + 进行中的会话）
 pub async fn playtime(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
-    let pt = rt.playtime.lock().await;
-    let mut list: Vec<(String, u64, u32)> = pt
-        .iter()
-        .map(|(n, (s, c))| (n.clone(), *s, *c))
-        .collect();
-    drop(pt);
-    list.sort_by(|a, b| b.1.cmp(&a.1));
-    let items: Vec<serde_json::Value> = list
-        .into_iter()
-        .map(|(name, secs, sessions)| {
-            json!({ "name": name, "total_secs": secs, "sessions": sessions })
-        })
-        .collect();
-    Ok(Json(json!({ "players": items })))
+    let stats = crate::instance::playtime_snapshot(&rt).await;
+    Ok(Json(json!({ "players": stats })))
 }

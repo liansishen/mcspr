@@ -1,10 +1,11 @@
+use crate::auth::Identity;
 use crate::error::ApiResult;
 use crate::instance::{get_instance, InstanceRuntime, LogLine};
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::response::Response;
-use axum::Json;
+use axum::{Extension, Json};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::collections::HashMap;
@@ -26,13 +27,19 @@ pub async fn console(
 pub async fn ws(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     let rt = get_instance(&state, &id).await?;
-    Ok(ws.on_upgrade(move |socket| ws_task(socket, rt)))
+    Ok(ws.on_upgrade(move |socket| ws_task(socket, rt, state, identity)))
 }
 
-async fn ws_task(socket: WebSocket, rt: Arc<InstanceRuntime>) {
+async fn ws_task(
+    socket: WebSocket,
+    rt: Arc<InstanceRuntime>,
+    state: AppState,
+    identity: Identity,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = rt.log_tx.subscribe();
     let history: Vec<_> = rt.log_buf.lock().await.iter().cloned().collect();
@@ -40,9 +47,18 @@ async fn ws_task(socket: WebSocket, rt: Arc<InstanceRuntime>) {
     if sender.send(history_msg(&history, last_sent)).await.is_err() {
         return;
     }
+    // 周期校验会话（1s）：撤销 / 到期 / 角色变化后快速关闭连接
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    ticker.tick().await;
 
     loop {
         tokio::select! {
+            _ = ticker.tick() => {
+                if !still_admin(&state, &identity).await {
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             line = rx.recv() => {
                 match line {
                     Ok(l) => {
@@ -68,6 +84,11 @@ async fn ws_task(socket: WebSocket, rt: Arc<InstanceRuntime>) {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
+                        // 发送命令前重新校验当前权限
+                        if !still_admin(&state, &identity).await {
+                            let _ = sender.send(Message::Close(None)).await;
+                            break;
+                        }
                         let _ = crate::instance::process::send_command(&rt, t.trim()).await;
                     }
                     Some(Ok(_)) => {}
@@ -75,6 +96,14 @@ async fn ws_task(socket: WebSocket, rt: Arc<InstanceRuntime>) {
                 }
             }
         }
+    }
+}
+
+/// 会话撤销 / 到期 / 角色变化后判定连接不再具备管理员权限。
+async fn still_admin(state: &AppState, identity: &Identity) -> bool {
+    match state.auth.session_identity_by_digest(&identity.session).await {
+        Some(current) => current.is_admin(),
+        None => false,
     }
 }
 

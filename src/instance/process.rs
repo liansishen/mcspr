@@ -83,6 +83,9 @@ async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()>
         *st = Status::Starting;
     }
 
+    // 新一轮运行：清空上一轮 TPS 缓存并推进代号，避免旧样本迟到发布
+    super::reset_tps_cache(&rt).await;
+
     let mut child = match spawn_server(&rt).await {
         Ok(c) => c,
         Err(e) => {
@@ -102,9 +105,9 @@ async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()>
     rt.crash_times.lock().await.clear();
     rt.restart_storm.store(false, Ordering::SeqCst);
 
-    if let Some(stdout) = child.stdout.take() {
+    let stdout_reader = if let Some(stdout) = child.stdout.take() {
         let rt1 = rt.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut buf = Vec::new();
             loop {
@@ -118,12 +121,14 @@ async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()>
                     push_log(&rt1, line).await;
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_reader = if let Some(stderr) = child.stderr.take() {
         let rt2 = rt.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             loop {
@@ -137,13 +142,22 @@ async fn start_inner(state: AppState, rt: Arc<InstanceRuntime>) -> ApiResult<()>
                     push_log(&rt2, format!("[stderr] {line}")).await;
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let rt3 = rt.clone();
     let st3 = state.clone();
     tokio::spawn(async move {
         let code = child.wait().await;
+        // 结算前处理完进程输出，避免迟到的加入事件重新打开已结束的会话。
+        for mut reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut reader).await.is_err() {
+                reader.abort();
+                let _ = reader.await;
+            }
+        }
         on_exit(st3, rt3, code).await;
     });
 
@@ -167,14 +181,15 @@ async fn on_exit(
     *rt.stdin.lock().await = None;
     // 服务端已退出，缓存的 RCON 连接随之失效
     *rt.rcon.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    // 服务端已退出：清空 TPS 缓存并推进代号
+    super::reset_tps_cache(&rt).await;
     rt.ready.store(false, Ordering::SeqCst);
-    rt.players.lock().await.clear();
     rt.pid.store(0, Ordering::SeqCst);
     *rt.started_at.lock().await = None;
-    *rt.status.lock().await = Status::Stopped;
 
     // 结算未闭合的玩家在线会话（可观测性）
     settle_all_sessions(&rt).await;
+    *rt.status.lock().await = Status::Stopped;
 
     // 崩溃归档（异常退出时保存控制台末尾 + crash-report）
     if !stopping {
@@ -387,23 +402,16 @@ async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
     let _ = rt.log_tx.send(ll);
 
     if let Some(p) = parse_join(&line) {
+        let _pt = rt.playtime.lock().await;
+        let mut open = rt.open_sessions.lock().await;
         let mut players = rt.players.lock().await;
         if !players.contains(&p) {
             players.push(p.clone());
         }
-        drop(players);
-        // 开始在线时长会话
-        rt.open_sessions
-            .lock()
-            .await
-            .insert(p, chrono::Utc::now());
+        open.entry(p).or_insert_with(chrono::Utc::now);
     }
     if let Some(p) = parse_leave(&line) {
-        rt.players.lock().await.retain(|x| *x != p);
-        // 结算该玩家的本次在线时长
-        if let Some(start) = rt.open_sessions.lock().await.remove(&p) {
-            settle_playtime(rt, &p, start).await;
-        }
+        settle_playtime(rt, &p).await;
     }
     if line.contains("Done (") {
         rt.ready.store(true, Ordering::SeqCst);
@@ -413,38 +421,64 @@ async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
     }
 }
 
-/// 累计在线时长并落盘 player-stats.json
-async fn settle_playtime(rt: &Arc<InstanceRuntime>, name: &str, start: chrono::DateTime<chrono::Utc>) {
-    let secs = (chrono::Utc::now() - start).num_seconds().max(0) as u64;
-    {
+/// 原子关闭玩家会话并累计时长，保持玩家快照的一致性。
+async fn settle_playtime(rt: &Arc<InstanceRuntime>, name: &str) {
+    let settled = {
         let mut pt = rt.playtime.lock().await;
-        let e = pt.entry(name.to_string()).or_insert((0, 0));
-        e.0 += secs;
-        e.1 += 1;
+        let mut open = rt.open_sessions.lock().await;
+        let mut players = rt.players.lock().await;
+        players.retain(|p| p != name);
+        if let Some(start) = open.remove(name) {
+            let secs = (chrono::Utc::now() - start).num_seconds().max(0) as u64;
+            let e = pt.entry(name.to_string()).or_insert((0, 0));
+            e.0 = e.0.saturating_add(secs);
+            e.1 = e.1.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    };
+    if settled {
+        persist_playtime(rt).await;
     }
-    persist_playtime(rt).await;
 }
 
 /// 退出时结算所有未闭合的会话（按退出时间计）
 pub async fn settle_all_sessions(rt: &Arc<InstanceRuntime>) {
     let now = chrono::Utc::now();
+    // 锁顺序固定为 playtime → open_sessions；drain 使重复结算幂等
     let mut pt = rt.playtime.lock().await;
-    let open = rt.open_sessions.lock().await;
-    for (name, start) in open.iter() {
-        let secs = (now - *start).num_seconds().max(0) as u64;
-        let e = pt.entry(name.clone()).or_insert((0, 0));
-        e.0 += secs;
-        e.1 += 1;
+    let drained: Vec<(String, chrono::DateTime<chrono::Utc>)> = {
+        let mut open = rt.open_sessions.lock().await;
+        rt.players.lock().await.clear();
+        open.drain().collect()
+    };
+    for (name, start) in drained {
+        let secs = (now - start).num_seconds().max(0) as u64;
+        let e = pt.entry(name).or_insert((0, 0));
+        e.0 = e.0.saturating_add(secs);
+        e.1 = e.1.saturating_add(1);
     }
-    drop(open);
     drop(pt);
     persist_playtime(rt).await;
 }
 
 async fn persist_playtime(rt: &Arc<InstanceRuntime>) {
+    // 串行化落盘：同一时刻只有一个任务读取快照并替换文件，
+    // 每个任务使用独立的临时文件名，避免误删或覆盖彼此的临时文件。
+    let _serialize = rt.playtime_persist.lock().await;
     let map = rt.playtime.lock().await.clone();
     let path = rt.dir.join("player-stats.json");
-    let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default()).await;
+    let json = serde_json::to_string_pretty(&map).unwrap_or_default();
+    let tmp = rt.dir.join(format!("player-stats.json.tmp-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::write(&tmp, json).await?;
+        tokio::fs::rename(&tmp, &path).await
+    }.await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::warn!(%error, "玩家时长统计保存失败");
+    }
 }
 
 /// 崩溃归档：控制台末尾 200 行 + 最新的 crash-report
@@ -505,28 +539,43 @@ async fn write_panel_log(rt: &Arc<InstanceRuntime>, ll: &LogLine) {
     }
 }
 
-fn parse_join(line: &str) -> Option<String> {
-    for marker in [" joined the game", " 加入了游戏"] {
-        if let Some(i) = line.find(marker) {
-            let name = line[..i]
-                .rsplit(|c| c == ' ' || c == ']' || c == ':')
-                .find(|s| !s.is_empty())?;
-            return Some(name.trim().to_string());
+/// 取日志中的服务端消息体：`[时间] [线程/INFO]: 消息` 之后才是真实事件。
+fn message_body(line: &str) -> &str {
+    match line.split_once("]: ") {
+        Some((_, body)) => body,
+        None => line,
+    }
+}
+
+/// 合法 Minecraft 玩家名：1-16 位字母、数字或下划线。
+fn valid_mc_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 16
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// 仅当消息体形如「<合法玩家名><marker>」时才认定为真实事件；
+/// 聊天 / 模组 / RCON 伪造的消息（如 `<Bob> Fake joined the game`）会被拒绝。
+fn parse_event(line: &str, markers: &[&str]) -> Option<String> {
+    let body = message_body(line).trim();
+    for marker in markers {
+        if let Some(name) = body.strip_suffix(marker) {
+            let name = name.trim();
+            if valid_mc_name(name) {
+                return Some(name.to_string());
+            }
         }
     }
     None
 }
 
+fn parse_join(line: &str) -> Option<String> {
+    parse_event(line, &[" joined the game", " 加入了游戏"])
+}
+
 fn parse_leave(line: &str) -> Option<String> {
-    for marker in [" left the game", " 离开了游戏"] {
-        if let Some(i) = line.find(marker) {
-            let name = line[..i]
-                .rsplit(|c| c == ' ' || c == ']' || c == ':')
-                .find(|s| !s.is_empty())?;
-            return Some(name.trim().to_string());
-        }
-    }
-    None
+    parse_event(line, &[" left the game", " 离开了游戏"])
 }
 
 /// 面板退出时：并行向所有运行中的实例发送 stop，最长等待 15 秒后强杀
@@ -590,5 +639,241 @@ mod tests {
         );
         drop(buf);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_join_keeps_first_session_start() {
+        let dir = std::env::temp_dir().join(format!("mcspr-join-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        push_raw(&rt, "Steve joined the game".into()).await;
+        let first = rt.open_sessions.lock().await.get("Steve").copied().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_raw(&rt, "Steve joined the game".into()).await;
+        let second = rt.open_sessions.lock().await.get("Steve").copied().unwrap();
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn settle_all_sessions_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("mcspr-settle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        push_raw(&rt, "Alex joined the game".into()).await;
+        settle_all_sessions(&rt).await;
+        let once = rt.playtime.lock().await.clone();
+        settle_all_sessions(&rt).await;
+        let twice = rt.playtime.lock().await.clone();
+        assert_eq!(once, twice);
+        assert_eq!(once.get("Alex").map(|v| v.1), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_join_accepts_real_messages_and_rejects_spoofing() {
+        assert_eq!(parse_join("Steve joined the game").as_deref(), Some("Steve"));
+        assert_eq!(
+            parse_join("[12:00:00] [Server thread/INFO]: Steve joined the game").as_deref(),
+            Some("Steve")
+        );
+        assert_eq!(
+            parse_join("[12:00:00] [Server thread/INFO] [minecraft/MinecraftServer]: Alex_1 加入了游戏").as_deref(),
+            Some("Alex_1")
+        );
+        // 聊天消息伪装成加入事件
+        assert_eq!(parse_join("<Bob> Fake joined the game"), None);
+        assert_eq!(
+            parse_join("[12:00:00] [Server thread/INFO]: <Bob> Fake joined the game"),
+            None
+        );
+        assert_eq!(
+            parse_join("[12:00:00] [Server thread/INFO]: [Not Secure] <Bob> Fake joined the game"),
+            None
+        );
+        assert_eq!(
+            parse_join("[12:00:00] [Server thread/INFO]: <Bob> [fake]: Alex joined the game"),
+            None
+        );
+        // 非法玩家名
+        assert_eq!(parse_join("Bad Name joined the game"), None);
+        assert_eq!(parse_join(&format!("{} joined the game", "x".repeat(17))), None);
+        assert_eq!(parse_join("Steve-1 joined the game"), None);
+    }
+
+    #[test]
+    fn parse_leave_accepts_real_messages_and_rejects_spoofing() {
+        assert_eq!(parse_leave("Steve left the game").as_deref(), Some("Steve"));
+        assert_eq!(
+            parse_leave("[12:00:00] [Server thread/INFO]: Steve 离开了游戏").as_deref(),
+            Some("Steve")
+        );
+        assert_eq!(parse_leave("<Bob> Fake left the game"), None);
+        assert_eq!(
+            parse_leave("[12:00:00] [Server thread/INFO]: <Bob> [fake]: Steve left the game"),
+            None
+        );
+        assert_eq!(parse_leave("Bad Name left the game"), None);
+    }
+
+    #[tokio::test]
+    async fn chat_join_spoof_does_not_poison_stats() {
+        let dir = std::env::temp_dir().join(format!("mcspr-spoof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        push_raw(&rt, "[12:00:00] [Server thread/INFO]: <Bob> Fake joined the game".into()).await;
+        assert!(rt.open_sessions.lock().await.is_empty());
+        assert!(rt.players.lock().await.is_empty());
+        push_raw(&rt, "[12:00:00] [Server thread/INFO]: Steve joined the game".into()).await;
+        assert_eq!(rt.open_sessions.lock().await.len(), 1);
+        assert_eq!(rt.players.lock().await.as_slice(), ["Steve".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn leave_keeps_active_session_until_total_can_be_committed() {
+        let dir = std::env::temp_dir().join(format!("mcspr-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        rt.players.lock().await.push("Alex".into());
+        rt.open_sessions.lock().await.insert(
+            "Alex".into(), chrono::Utc::now() - chrono::Duration::seconds(60),
+        );
+        let guard = rt.playtime.lock().await;
+        let leaving = {
+            let rt = rt.clone();
+            tokio::spawn(async move { settle_playtime(&rt, "Alex").await })
+        };
+        tokio::task::yield_now().await;
+        assert!(rt.open_sessions.lock().await.contains_key("Alex"));
+        assert_eq!(rt.players.lock().await.as_slice(), ["Alex".to_string()]);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), leaving).await.unwrap().unwrap();
+        let stats = crate::instance::playtime_snapshot(&rt).await;
+        assert_eq!(stats.len(), 1);
+        assert!(!stats[0].online);
+        assert!(stats[0].total_secs >= 60);
+        assert_eq!(stats[0].current_session_secs, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn concurrent_settlement_is_exactly_once_without_deadlock() {
+        let dir = std::env::temp_dir().join(format!("mcspr-conc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        push_raw(&rt, "Alex joined the game".into()).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let rt2 = rt.clone();
+            handles.push(tokio::spawn(async move {
+                push_raw(&rt2, "Alex left the game".into()).await;
+                settle_all_sessions(&rt2).await;
+            }));
+        }
+        let all = futures_util::future::join_all(handles);
+        let results = tokio::time::timeout(Duration::from_secs(10), all)
+            .await
+            .expect("并发结算不得死锁");
+        for r in results {
+            r.unwrap();
+        }
+
+        let pt = rt.playtime.lock().await.clone();
+        assert_eq!(pt.get("Alex").map(|v| v.1), Some(1), "会话只应结算一次");
+        assert!(rt.open_sessions.lock().await.is_empty());
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("player-stats.json.tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
+        let saved: std::collections::BTreeMap<String, (u64, u32)> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("player-stats.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.get("Alex").map(|v| v.1), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stopped_status_waits_for_player_stats_persistence() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let dir = std::env::temp_dir().join(format!("mcspr-stop-stats-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(crate::config::PanelConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        }).await.unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        *rt.status.lock().await = Status::Running;
+        rt.stopping.store(true, Ordering::SeqCst);
+        let persist_guard = rt.playtime_persist.lock().await;
+        let exited = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                on_exit(state, rt, Ok(std::process::ExitStatus::from_raw(0))).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_ne!(*rt.status.lock().await, Status::Stopped);
+        drop(persist_guard);
+        tokio::time::timeout(Duration::from_secs(2), exited).await.unwrap().unwrap();
+        assert_eq!(*rt.status.lock().await, Status::Stopped);
+        assert!(dir.join("player-stats.json").is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_drains_output_before_settling_player_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mcspr-exit-output-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(crate::config::PanelConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        }).await.unwrap();
+        let script = dir.join("fake-java");
+        std::fs::write(&script, "#!/bin/sh\nprintf '[12:00:00] [Server thread/INFO]: Alex joined the game\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = InstanceRuntime::new(super::super::InstanceMeta {
+            id: "test".into(),
+            java_path: Some(script.to_string_lossy().into_owned()),
+            jvm_args: "test".into(),
+            ..Default::default()
+        }, dir.clone());
+        let guard = rt.playtime.lock().await;
+        start(state, rt.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rt.log_buf.lock().await.iter().any(|line| line.line.contains("Alex joined")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(rt.tps_generation.load(Ordering::SeqCst), 1);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while *rt.status.lock().await != Status::Stopped {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let stats = crate::instance::playtime_snapshot(&rt).await;
+        assert_eq!(stats.len(), 1);
+        assert!(!stats[0].online);
+        assert_eq!(stats[0].sessions, 1);
+        assert_eq!(stats[0].current_session_secs, 0);
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("player-stats.json")).unwrap()
+        ).unwrap();
+        assert_eq!(stored["Alex"][1], 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
