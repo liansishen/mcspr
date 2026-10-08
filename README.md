@@ -1,6 +1,6 @@
 # MCS Panel — Minecraft 服务端管理面板
 
-![Version](https://img.shields.io/badge/version-0.10.0-green) ![License](https://img.shields.io/badge/license-MIT-blue) ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
+![Version](https://img.shields.io/badge/version-0.12.0-green) ![License](https://img.shields.io/badge/license-MIT-blue) ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 
 基于 Rust（Axum + Tokio）的本地 Minecraft 服务器管理面板。前端资源内嵌进二进制，构建产物为**单个可执行文件**，开箱即用，支持 Windows 与 Linux。
 
