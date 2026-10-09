@@ -27,6 +27,8 @@ pub const TEST_PASS_TOKEN: &str = "XXXX.DUMMY.TOKEN.XXXX";
 
 /// Siteverify 外部请求超时
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const VERIFY_CONCURRENCY: usize = 8;
+static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VERIFY_CONCURRENCY);
 
 /// 人机验证配置快照（从面板设置读取，避免持有配置锁跨越网络请求）。
 #[derive(Debug, Clone, Default)]
@@ -161,6 +163,9 @@ pub async fn verify(
     expected_action: &str,
 ) -> Result<(), CaptchaError> {
     let token = token.trim();
+    if token.len() > 2048 {
+        return Err(CaptchaError::Failed("人机验证令牌过长".to_string()));
+    }
     if token.is_empty() {
         return Err(CaptchaError::Failed("缺少人机验证令牌".to_string()));
     }
@@ -176,6 +181,9 @@ pub async fn verify(
         ));
     }
 
+    let _permit = VERIFY_SLOTS
+        .try_acquire()
+        .map_err(|_| CaptchaError::Unavailable("人机验证服务繁忙，请稍后重试".to_string()))?;
     let mut form: Vec<(&str, &str)> = vec![
         ("secret", settings.secret_key.as_str()),
         ("response", token),
@@ -297,5 +305,44 @@ mod tests {
         };
         let err = interpret(&expired, "register", &allowed).unwrap_err();
         assert!(err.message().contains("timeout-or-duplicate"));
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn siteverify_capacity_is_bounded_before_network_requests() {
+        let settings = TurnstileSettings {
+            site_key: "production-site".into(),
+            secret_key: "production-secret".into(),
+            allowed_hostnames: vec!["localhost".into()],
+            test_mode: false,
+        };
+        let permits: Vec<_> = (0..VERIFY_CONCURRENCY)
+            .map(|_| VERIFY_SLOTS.try_acquire().unwrap())
+            .collect();
+        let response = verify(
+            &reqwest::Client::new(),
+            &settings,
+            "valid-format-token",
+            None,
+            "register",
+        )
+        .await;
+        assert!(matches!(response, Err(CaptchaError::Unavailable(_))));
+        drop(permits);
+        assert!(matches!(
+            verify(
+                &reqwest::Client::new(),
+                &settings,
+                &"x".repeat(2049),
+                None,
+                "register"
+            )
+            .await,
+            Err(CaptchaError::Failed(_))
+        ));
     }
 }
