@@ -547,6 +547,32 @@ test('global busy counter toggles the top bar indicator', () => {
   assert.equal(bar.hidden, true);
 });
 
+test('late writes keep the next session busy indicator intact', async () => {
+  const bar = { hidden: true };
+  const releases = [];
+  const ctx = run(['api', 'beginGlobalBusy', 'endGlobalBusy', 'renderGlobalBusy'], {
+    csrfToken: 'c', FormData: class {}, onSessionExpired() {},
+    document: { getElementById: () => bar },
+    fetch: () => new Promise(resolve => releases.push(() => resolve({
+      status: 200, ok: true, headers: { get: () => 'application/json' },
+      json: async () => ({ ok: true }),
+    }))),
+  });
+  const oldWrite = ctx.api('/settings', { method: 'PUT', body: { value: 1 } });
+  ctx.sessionGeneration++;
+  ctx.apiInFlight.clear();
+  ctx.globalBusyCount = 0;
+  const newWrite = ctx.api('/settings', { method: 'PUT', body: { value: 2 } });
+  releases[0]();
+  await oldWrite;
+  assert.equal(ctx.globalBusyCount, 1);
+  assert.equal(bar.hidden, false);
+  releases[1]();
+  await newWrite;
+  assert.equal(ctx.globalBusyCount, 0);
+  assert.equal(bar.hidden, true);
+});
+
 test('turnstile uses the official test token and the register action', async () => {
   assert.match(source, /XXXX\.DUMMY\.TOKEN\.XXXX/);
   assert.match(source, /action: 'register'/);

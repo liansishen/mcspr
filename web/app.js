@@ -160,9 +160,13 @@ function renderGlobalBusy() {
   if (bar) bar.hidden = globalBusyCount <= 0;
 }
 
-function beginGlobalBusy() { globalBusyCount++; renderGlobalBusy(); }
+function beginGlobalBusy() { globalBusyCount++; renderGlobalBusy(); return sessionGeneration; }
 
-function endGlobalBusy() { globalBusyCount = Math.max(0, globalBusyCount - 1); renderGlobalBusy(); }
+function endGlobalBusy(gen = sessionGeneration) {
+  if (gen !== sessionGeneration) return;
+  globalBusyCount = Math.max(0, globalBusyCount - 1);
+  renderGlobalBusy();
+}
 
 // 同主体 + 同方法 + 同路由 + 同内容指纹：并发重复写请求合并，避免双副作用。
 // 同一路由不同 body（如控制台命令、模组开关目标）会得到不同键，互不干扰。
@@ -464,7 +468,7 @@ async function api(path, opts = {}) {
   const existing = apiInFlight.get(key);
   if (existing) return existing;
   const task = (async () => {
-    beginGlobalBusy();
+    const busyGen = beginGlobalBusy();
     try {
       let r;
       try {
@@ -507,7 +511,7 @@ async function api(path, opts = {}) {
       const ct = r.headers.get('content-type') || '';
       return ct.includes('application/json') ? r.json() : r.text();
     } finally {
-      endGlobalBusy();
+      endGlobalBusy(busyGen);
     }
   })().finally(() => {
     if (apiInFlight.get(key) === task) apiInFlight.delete(key);
@@ -4419,9 +4423,9 @@ function reportUploadResult(noun, r, onDone) {
 /* ---------------- 统一 XHR 上传（进度 + 100% 处理中 + 会话代际） ---------------- */
 function xhrUpload(opts) {
   return new Promise((resolve, reject) => {
-    beginGlobalBusy();
+    const busyGen = beginGlobalBusy();
     let settled = false;
-    const done = (fn, value) => { if (settled) return; settled = true; endGlobalBusy(); fn(value); };
+    const done = (fn, value) => { if (settled) return; settled = true; endGlobalBusy(busyGen); fn(value); };
     const xhr = new XMLHttpRequest();
     const gen = sessionGeneration;
     const operationId = opts.operationId || newOperationId();
