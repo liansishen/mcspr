@@ -10,6 +10,7 @@ mod console;
 mod instances;
 mod overview;
 mod permissions;
+mod public_operations;
 mod resources;
 #[cfg(test)]
 mod tests;
@@ -227,6 +228,7 @@ pub fn router(state: AppState) -> Router {
             get(announcement::get).put(announcement::put),
         )
         .layer(middleware::from_fn_with_state(state.clone(), jobs::operation_mw))
+        .layer(middleware::from_fn_with_state(state.clone(), public_operations::middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(middleware::from_fn_with_state(state.clone(), audit_mw))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))

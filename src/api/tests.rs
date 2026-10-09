@@ -1539,3 +1539,34 @@ async fn settings_guard_registration_and_export_redacts_secret() {
         crate::captcha::TEST_SITE_KEY
     );
 }
+
+#[tokio::test]
+async fn registration_operation_replays_before_captcha_and_checks_origin() {
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    {
+        let mut config = h.state.config.write().await;
+        config.registration_enabled = true;
+        config.turnstile_test_mode = true;
+    }
+    let body = json!({"username":"applicant", "password":"password123", "minecraft_name":"Applicant", "reason":"Registration replay test", "captcha_token":crate::captcha::TEST_PASS_TOKEN});
+    let build = |body: &Value, origin: &str| req("POST", "/api/auth/register")
+        .header("host", "localhost")
+        .header("origin", origin)
+        .header("content-type", "application/json")
+        .header("x-operation-id", "registration-replay-test")
+        .body(Body::from(body.to_string())).unwrap();
+    let (first, result) = call(&h, build(&body, "http://localhost")).await;
+    assert_eq!(first, StatusCode::OK, "{result}");
+    let (second, replay) = call(&h, build(&body, "http://localhost")).await;
+    assert_eq!(second, first);
+    assert_eq!(result, replay);
+    assert_eq!(h.state.auth.list().await.len(), 2);
+    let mut changed = body.clone();
+    changed["reason"] = json!("Changed reason");
+    assert_eq!(call(&h, build(&changed, "http://localhost")).await.0, StatusCode::CONFLICT);
+    assert_eq!(call(&h, build(&body, "http://untrusted.example")).await.0, StatusCode::FORBIDDEN);
+    let persisted = std::fs::read_to_string(h.state.tasks_dir.join("operations.json")).unwrap();
+    assert!(!persisted.contains("password123"));
+    assert!(!persisted.contains(crate::captcha::TEST_PASS_TOKEN));
+}
