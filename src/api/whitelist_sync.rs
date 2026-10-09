@@ -60,7 +60,8 @@ pub async fn retry(
         &job_id,
         format!("按当前授权（revision {}）重新协调该实例", snapshot.revision),
     );
-    let outcome = whitelist_sync::reconcile_instance(&state, &rt, &desired, snapshot.revision).await;
+    let outcome =
+        whitelist_sync::reconcile_instance(&state, &rt, &desired, snapshot.revision).await;
     let ok = is_settled(&outcome);
     log_job(&state, &job_id, outcome_summary(&outcome));
     let err = if ok {
@@ -70,13 +71,9 @@ pub async fn retry(
     };
     finish_job(&state, &job_id, err, Some(id.clone()));
     trigger_force();
-    Ok(Json(json!({ "ok": ok, "job_id": job_id, "outcome": outcome })))
-}
-
-/// 用一致账户快照协调全部实例，并确认旧游戏名移除。
-pub async fn reconcile_all(state: &AppState) -> whitelist_sync::SyncAllReport {
-    let snapshot = auth_snapshot(state).await;
-    reconcile_snapshot(state, &snapshot).await
+    Ok(Json(
+        json!({ "ok": ok, "job_id": job_id, "outcome": outcome }),
+    ))
 }
 
 async fn reconcile_snapshot(
@@ -84,7 +81,8 @@ async fn reconcile_snapshot(
     snapshot: &DesiredSnapshot,
 ) -> whitelist_sync::SyncAllReport {
     let report = whitelist_sync::sync_all(state, snapshot).await;
-    if let Err(error) = crate::instance::name_reservations::release_confirmed(state, &report).await {
+    if let Err(error) = crate::instance::name_reservations::release_confirmed(state, &report).await
+    {
         tracing::warn!(%error, "旧游戏名移除确认失败，继续保留预留");
     }
     report
@@ -141,8 +139,19 @@ async fn run_batch(state: &AppState, forced: bool) {
     let last_revision = LAST_REVISION.load(Ordering::SeqCst);
     let last_fp = LAST_INSTANCE_FP.load(Ordering::SeqCst);
     let unchanged = !forced && snapshot.revision == last_revision && fp == last_fp;
-    let unsettled = if unchanged { any_unsettled(state).await } else { false };
-    if !should_run_batch(forced, snapshot.revision, last_revision, fp, last_fp, unsettled) {
+    let unsettled = if unchanged {
+        any_unsettled(state).await
+    } else {
+        false
+    };
+    if !should_run_batch(
+        forced,
+        snapshot.revision,
+        last_revision,
+        fp,
+        last_fp,
+        unsettled,
+    ) {
         return;
     }
     LAST_REVISION.store(snapshot.revision, Ordering::SeqCst);
@@ -166,7 +175,10 @@ async fn run_batch(state: &AppState, forced: bool) {
     log_job(
         state,
         &job_id,
-        format!("开始协调 {instance_count} 个实例（revision {}）", snapshot.revision),
+        format!(
+            "开始协调 {instance_count} 个实例（revision {}）",
+            snapshot.revision
+        ),
     );
     let report = reconcile_snapshot(state, &snapshot).await;
     for o in &report.outcomes {
@@ -209,7 +221,10 @@ async fn instance_fingerprint(state: &AppState) -> u64 {
 }
 
 fn is_settled(o: &SyncOutcome) -> bool {
-    matches!(o.status, SyncStatus::Applied | SyncStatus::Idle | SyncStatus::Skipped)
+    matches!(
+        o.status,
+        SyncStatus::Applied | SyncStatus::Idle | SyncStatus::Skipped
+    )
 }
 
 fn status_label(o: &SyncOutcome) -> &'static str {
@@ -253,7 +268,8 @@ mod tests {
     static BATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     async fn setup(tag: &str) -> (AppState, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("mcspr-wlsync-api-{tag}-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mcspr-wlsync-api-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::new(PanelConfig {
             data_dir: root.join("data").to_string_lossy().into_owned(),
@@ -261,6 +277,11 @@ mod tests {
         })
         .await
         .unwrap();
+        state
+            .auth
+            .create_user("root", "password123", crate::auth::Role::Admin, vec![])
+            .await
+            .unwrap();
         (state, root)
     }
 
@@ -273,7 +294,11 @@ mod tests {
             name: format!("inst-{id}"),
             ..Default::default()
         };
-        std::fs::write(dir.join("instance.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("instance.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
         let rt = InstanceRuntime::new(meta, dir);
         state.instances.write().await.insert(id.to_string(), rt);
     }
@@ -326,8 +351,14 @@ mod tests {
         let first = whitelist_jobs(&state);
         assert_eq!(first.len(), 1, "首次批次应记录任务");
         assert_eq!(first[0].status, "done", "{:?}", first[0].error);
-        assert!(first[0].user_id.is_none(), "自动批次任务无发起人（仅管理员可见）");
-        assert!(first[0].logs.iter().any(|l| l.contains("已生效")), "应记录每实例结果");
+        assert!(
+            first[0].user_id.is_none(),
+            "自动批次任务无发起人（仅管理员可见）"
+        );
+        assert!(
+            first[0].logs.iter().any(|l| l.contains("已生效")),
+            "应记录每实例结果"
+        );
 
         // 无变化：不重复建任务
         run_batch(&state, false).await;
@@ -362,7 +393,10 @@ mod tests {
         let job = whitelist_jobs(&state).into_iter().next().unwrap();
         assert_eq!(job.status, "error", "未收敛批次应以 error 结束");
         assert!(job.error.as_deref().unwrap_or("").contains("未完全收敛"));
-        assert!(job.logs.iter().any(|l| l.contains("待重试")), "应明确记录待重试原因");
+        assert!(
+            job.logs.iter().any(|l| l.contains("待重试")),
+            "应明确记录待重试原因"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
