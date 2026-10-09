@@ -19,7 +19,9 @@
 - 告警推送：实例崩溃、计划任务连续失败、磁盘水位——支持 Webhook / Discord / Telegram
 
 **面板账户与实例授权**
-- 用户名 / 密码登录，管理员拥有完整管理权限，可创建账户、重置密码、禁用账户与分配实例查看权限
+- 用户名 / 密码登录，管理员拥有完整管理权限，可创建账户、重置密码、禁用账户与分配实例查看权限；实例详情「用户权限」页可管理当前实例授权
+- 公开注册支持 Minecraft 游戏名、申请理由与 Cloudflare Turnstile；管理员审批后可分配零个或多个实例，申请人可查询状态、修改被拒申请并重新提交
+- 游戏名变更需审批，已批准且启用账户按有效实例权限自动同步白名单；同步保留手动条目与原有白名单开关
 - 普通用户的「我的实例」列表仅显示被授权实例；详情提供「公告」与「运行信息」两个只读标签页
 - 实例公告支持 Markdown 编辑、预览与安全渲染；运行信息显示 TPS、运行状态、玩家累计及当前会话在线时长
 
@@ -37,7 +39,9 @@
 - 备份：全量 tar.gz，恢复前预览差异，按份数与天数自动清理
 - 游戏内备份：识别 ServerUtilities 模组与配置，在独立标签页触发模组备份、列出和下载 ZIP、预览及停止后恢复；恢复前保留受影响数据副本
 - Java 环境：扫描本机全部 Java（各发行版 / 启动器自带 / IDE 下载），一键安装 Temurin JRE 8 / 11 / 17 / 21 / 25
-- 四套主题：深色 / 亮色 / MC 像素（内置中文像素字体）/ Claude（暖纸色），侧边栏底部下拉切换
+- 四套主题：深色 / 亮色 / MC 像素（内置中文像素字体）/ Claude（暖纸色），右上角切换；账户菜单提供个人资料、密码修改与退出
+- 写操作立即反馈并阻止重复提交，右上角任务中心保留后台任务日志与结果
+- 桌面侧栏可收起，手机使用导航抽屉；页脚显示版本、技术栈与 GitHub 链接
 
 ### 游戏内备份
 
@@ -78,6 +82,10 @@ cargo build --release
 | `alert_type` | `"none"` | 告警推送：`none` / `webhook` / `discord` / `telegram` |
 | `alert_webhook_url` / `telegram_bot_token` / `telegram_chat_id` | 空 | 告警推送目标 |
 | `[thresholds]` | 见下 | `crash_window_secs=600`、`crash_max=3`、`restart_delay_secs=5`、`disk_warn_percent=90` |
+| `registration_enabled` | `false` | 是否开放普通用户注册；需先初始化管理员并配置人机验证 |
+| `turnstile_site_key` / `turnstile_secret_key` | 空 | Cloudflare Turnstile 站点密钥 / 服务端密钥；服务端密钥不回显 |
+| `turnstile_allowed_hostnames` | 空列表 | 允许完成注册验证的主机名 |
+| `turnstile_test_mode` | `false` | 显式使用官方测试验证配置，仅用于验收 |
 
 机密字段（API Key / Bot Token）在「面板设置」页保存后不回显，留空保存即保持不变。
 
@@ -100,6 +108,30 @@ cargo build --release
 恢复密码前须停止面板服务，再在其工作目录执行命令；服务运行时账户存储被锁定，恢复命令会拒绝执行。恢复完成后重新启动并登录。正常账户管理中的密码重置、禁用及角色变更会撤销已有会话；面板重启后所有用户重新登录。管理员撤销实例授权后，普通用户的下一次读取请求失去访问权限。
 
 密码使用 Argon2id 哈希保存。浏览器通过 HttpOnly 会话 Cookie 登录，写请求带有防跨站请求伪造的令牌。公网访问建议使用 HTTPS，局域网或本机访问按实际协议配置。
+
+### 注册、审批与游戏名
+
+公开注册需要填写用户名、密码、Minecraft 游戏名和申请理由，并完成 Cloudflare Turnstile 人机验证。注册后进入待审批状态，管理员批准后可登录业务页面；管理员可分配零个或多个实例，零授权账户会显示待分配提示。申请人可用账号密码查询自己的申请状态；被拒绝后可修改理由和游戏名重新提交。
+
+注册用户名固定，用于面板登录及右上角账户菜单。Minecraft 游戏名是独立字段，按大小写不敏感检查唯一性；修改游戏名需提交申请，等待审批期间仍使用旧游戏名并保留面板登录。填写游戏名及人工审批不构成正版账号所有权验证。
+
+管理员在「账户管理」审批申请，也可在实例详情的「用户权限」标签页配置该实例的查看权限。普通用户的详情页提供公告和运行信息。
+
+### 白名单自动同步
+
+已批准且启用账户的游戏名按有效实例权限同步到兼容游戏实例的白名单。授权、撤权、禁用、删除和批准游戏名变更会触发同步；同步结果与失败原因在界面中展示。
+
+同步保留实例原有 `white-list` 开关和管理员手动维护的条目。关闭白名单时，服务器继续按自身规则允许玩家进入。面板默认不主动踢出玩家；服务器的 `enforce-whitelist` 设置仍可能影响在线玩家。
+
+UUID 按实例的正版或离线身份模式处理，代理身份转发等特殊部署需确认覆盖配置。正版查询失败会保留待同步状态，管理员可处理并重试。
+
+游戏名变更批准后，旧名字保持预留，直到所有相关实例白名单确认已移除。手动保留的旧名条目或无法确认的同步结果会继续占用旧名，管理员可检查白名单与同步提示后重试。
+
+### 操作反馈与任务中心
+
+写操作提交后立即显示处理状态并阻止同一操作重复提交。上传分别显示传输进度和服务器处理阶段；后台任务在右上角任务中心显示日志、进度及结果，切换页面或刷新后可继续查询。
+
+请求断网或超时后，界面通过操作编号确认结果。关闭进度弹窗会隐藏进度视图，任务状态可继续在任务中心查看。原生文件下载的最终完成状态由浏览器下载管理器显示。
 
 ### 玩家在线时长
 
@@ -165,6 +197,9 @@ WantedBy=multi-user.target
 | 分组 | 端点 |
 | --- | --- |
 | 登录与账户 | `POST /api/auth/login` · `POST /api/auth/logout` · `GET /api/auth/me` · `PUT /api/auth/password` · 管理员：`GET/POST /api/accounts`、`PATCH/DELETE /api/accounts/{id}`、`PUT /api/accounts/{id}/password`、`PUT /api/accounts/{id}/instances` |
+| 注册与审批 | `GET /api/auth/registration-config` · `POST /api/auth/register` · `POST /api/auth/application/status` · `POST /api/auth/application/resubmit` · `GET /api/auth/profile` · `POST /api/auth/minecraft-name-requests` · 管理员：`GET /api/applications`、`POST /api/applications/{id}/approve`、`POST /api/applications/{id}/reject` |
+| 实例权限与白名单同步 | 管理员：`GET/PUT /api/instances/{id}/permissions` · `GET /api/instances/{id}/whitelist-sync` · `POST /api/instances/{id}/whitelist-sync/retry` |
+| 操作与任务 | `GET /api/jobs` · `GET /api/jobs/{id}` · `GET /api/operations/{id}`；写操作携带 `X-Operation-ID` 支持结果查询与幂等重放 |
 | 实例只读与公告 | `GET /api/instances/{id}/overview` · `GET /api/instances/{id}/playtime` · `GET/PUT /api/instances/{id}/announcement` · 管理员：`POST /api/announcements/preview` |
 | 全局 | `GET /api/stats` · `GET /api/versions` · `GET /api/settings` · `PUT /api/settings` · `GET /api/audit` · `GET /api/config/export` · `POST /api/config/import` |
 | 实例 | `GET/POST /api/instances` · `GET/PATCH/DELETE /api/instances/{id}` · `GET /api/instances/{id}/status` |
