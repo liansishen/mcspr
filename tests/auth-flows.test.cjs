@@ -573,6 +573,20 @@ test('late writes keep the next session busy indicator intact', async () => {
   assert.equal(bar.hidden, true);
 });
 
+test('late controls keep the next session duplicate-submit guard intact', async () => {
+  let releaseOld, releaseNew;
+  const ctx = run(['withBusy', 'beginBusy', 'endBusy'], {});
+  const oldWrite = ctx.withBusy('upload', null, () => new Promise(resolve => { releaseOld = resolve; }));
+  ctx.opInFlight = new Map();
+  const newWrite = ctx.withBusy('upload', null, () => new Promise(resolve => { releaseNew = resolve; }));
+  releaseOld();
+  await oldWrite;
+  assert.equal(ctx.opInFlight.has('upload'), true);
+  releaseNew();
+  await newWrite;
+  assert.equal(ctx.opInFlight.has('upload'), false);
+});
+
 test('turnstile uses the official test token and the register action', async () => {
   assert.match(source, /XXXX\.DUMMY\.TOKEN\.XXXX/);
   assert.match(source, /action: 'register'/);

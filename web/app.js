@@ -72,11 +72,12 @@ function beginBusy(key) {
   return true;
 }
 
-function endBusy(key) { if (key) opInFlight.delete(key); }
+function endBusy(key, map = opInFlight) { if (key) map.delete(key); }
 
 // 统一忙碌登记：立即禁用触发控件，完成后恢复；重复点击 / 回车直接忽略。
 async function withBusy(key, control, fn) {
   if (!beginBusy(key)) return undefined;
+  const busyMap = opInFlight;
   let prevDisabled = null, hadAria = false, prevAria = null;
   if (control) {
     try {
@@ -87,7 +88,7 @@ async function withBusy(key, control, fn) {
   try {
     return await fn();
   } finally {
-    endBusy(key);
+    endBusy(key, busyMap);
     if (control) {
       try {
         if (prevDisabled !== null && 'disabled' in control) control.disabled = prevDisabled;
@@ -658,6 +659,7 @@ function teardownSession() {
   profileData = null;
   statusCredentials = null;
   apiInFlight.clear();
+  opInFlight = new Map();
   globalBusyCount = 0;
   renderGlobalBusy();
   stopTaskPolling();
