@@ -774,3 +774,13 @@ html.sidebar-collapsed .toggle-icon { transform: rotate(180deg); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+
+/* 全局写操作忙碌指示（顶栏进度条） */
+.global-busy {
+  position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 300;
+  background: linear-gradient(90deg, var(--accent), var(--blue), var(--accent));
+  background-size: 200% 100%;
+  animation: global-busy-slide 1.1s linear infinite;
+}
+.global-busy[hidden] { display: none; }
+@keyframes global-busy-slide { from { background-position: 0 0; } to { background-position: -200% 0; } }

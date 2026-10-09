@@ -11,7 +11,7 @@ function extractFn(name) {
   return match[0];
 }
 function run(names, context) {
-  const ctx = vm.createContext({ sessionGeneration: 1, loginAttempt: 0, routeToken: 1, newOperationId: () => 'op-test', queryOperation: async () => null, setTopbarTitle() {}, upsertTask() {}, stopTaskPolling() {}, ...context });
+  const ctx = vm.createContext({ sessionGeneration: 1, loginAttempt: 0, routeToken: 1, newOperationId: () => 'op-test', resolveOperation: async () => null, replayPublicOperation: async () => null, beginGlobalBusy() {}, endGlobalBusy() {}, renderGlobalBusy() {}, writeKey: (m, p) => m + ' ' + p, apiInFlight: new Map(), globalBusyCount: 0, setTopbarTitle() {}, upsertTask() {}, stopTaskPolling() {}, ...context });
   vm.runInContext(names.map(extractFn).join('\n'), ctx);
   return ctx;
 }

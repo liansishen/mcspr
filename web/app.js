@@ -53,6 +53,8 @@ let profileData = null;
 let accountsTab = 'accounts';
 let applicationsData = null;
 let permState = null;
+let apiInFlight = new Map();
+let globalBusyCount = 0;
 
 // 为每次逻辑写入生成稳定编号；调用方重试时可复用同一编号保证幂等。
 function newOperationId() {
@@ -99,15 +101,78 @@ async function withBusy(key, control, fn) {
 }
 
 // 断网或超时后凭操作编号回查结果，避免把“结果待确认”当成失败。
-async function queryOperation(operationId) {
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// 已认证写操作断网后凭操作编号查询终态；error 且 status_code >= 400 抛出原错误。
+async function resolveOperation(operationId, attempts = 6) {
   if (!operationId) return null;
-  try {
-    const r = await fetch('/api/operations/' + encodeURIComponent(operationId), { credentials: 'same-origin' });
-    if (!r.ok) return null;
-    const j = await r.json();
-    if (j && (j.status === 'done' || j.status === 'error')) return j.result !== undefined ? j.result : null;
-  } catch {}
+  for (let i = 0; i < attempts; i++) {
+    let j = null;
+    try {
+      const r = await fetch('/api/operations/' + encodeURIComponent(operationId), { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+      if (r.status === 401 || r.status === 404) return null;
+      if (!r.ok) return null;
+      j = await r.json();
+    } catch { return null; }
+    if (!j || !j.status) return null;
+    if (j.status === 'done') return j.result !== undefined && j.result !== null ? j.result : {};
+    if (j.status === 'error') {
+      const msg = (j.result && (j.result.error || j.result.message)) || ('操作失败 (' + (j.status_code || 0) + ')');
+      const err = new Error(msg);
+      err.status = j.status_code || 500;
+      err.operationId = operationId;
+      throw err;
+    }
+    if (j.status === 'interrupted') {
+      const err = new Error('上次操作因面板重启中断，结果待确认，请核实后再决定是否重试');
+      err.interrupted = true;
+      err.operationId = operationId;
+      throw err;
+    }
+    await sleep(400);
+  }
   return null;
+}
+
+// 公开写请求（注册 / 重申 / 状态查询）断网后凭同编号重放原内容确认结果：
+// /operations 查询需要登录，重放走公开幂等中间件，不会触发退出或 401。
+async function replayPublicOperation(path, method, headers, body, attempts = 5) {
+  for (let i = 0; i < attempts; i++) {
+    let r;
+    try {
+      r = await fetch('/api' + path, { method, headers, body, credentials: 'same-origin' });
+    } catch { await sleep(500); continue; }
+    if (r.status === 202) { await sleep(500); continue; }
+    let j = null;
+    try { j = await r.json(); } catch {}
+    if (r.ok) return j !== null && j !== undefined ? j : {};
+    const msg = (j && j.error) || r.statusText || ('请求失败 (' + r.status + ')');
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+  return null;
+}
+
+// 全局忙碌指示：任何在途写操作立即点亮顶栏进度条，完成后隐藏。
+function renderGlobalBusy() {
+  const bar = document.getElementById('global-busy');
+  if (bar) bar.hidden = globalBusyCount <= 0;
+}
+
+function beginGlobalBusy() { globalBusyCount++; renderGlobalBusy(); }
+
+function endGlobalBusy() { globalBusyCount = Math.max(0, globalBusyCount - 1); renderGlobalBusy(); }
+
+// 同主体 + 同方法 + 同路由 + 同内容指纹：并发重复写请求合并，避免双副作用。
+// 同一路由不同 body（如控制台命令、模组开关目标）会得到不同键，互不干扰。
+function writeKey(method, path, body) {
+  let bodyKey;
+  if (body === undefined || body === null) bodyKey = 'none';
+  else if (typeof body === 'string') bodyKey = body;
+  else if (typeof FormData !== 'undefined' && body instanceof FormData) bodyKey = 'form';
+  else bodyKey = String(body);
+  return method + ' ' + path + ' ' + bodyKey;
 }
 
 function taskStatusText(status) {
@@ -294,8 +359,9 @@ async function mountTurnstile(slotId, siteKey, testMode) {
   if (!slot) return;
   slot.innerHTML = '';
   if (testMode) {
-    slot.innerHTML = '<div class="auth-note">当前为人机验证测试模式，提交时不进行真实验证。</div>';
-    turnstileToken = 'test-mode';
+    // 官方测试令牌：后端测试模式仅接受该固定值
+    slot.innerHTML = '<div class="auth-note">当前为人机验证测试模式，提交使用官方测试令牌，不进行真实验证。</div>';
+    turnstileToken = 'XXXX.DUMMY.TOKEN.XXXX';
     return;
   }
   if (!siteKey) { slot.innerHTML = '<div class="banner warn">未配置人机验证站点密钥，无法继续提交。</div>'; return; }
@@ -304,6 +370,7 @@ async function mountTurnstile(slotId, siteKey, testMode) {
     if (!ts || typeof ts.render !== 'function') throw new Error('人机验证组件不可用');
     turnstileWidgetId = ts.render(slot, {
       sitekey: siteKey,
+      action: 'register',
       callback: token => { turnstileToken = token; },
       'expired-callback': () => { turnstileToken = ''; },
       'error-callback': () => { turnstileToken = ''; },
@@ -369,37 +436,84 @@ async function api(path, opts = {}) {
     h['Content-Type'] = 'application/json';
     body = JSON.stringify(body);
   }
-  // 写请求携带 CSRF 令牌；登录接口在会话建立前没有令牌，显式豁免
-  if (method !== 'GET' && method !== 'HEAD' && csrfToken && !opts.noCsrf) {
-    h['X-CSRF-Token'] = csrfToken;
+  const write = method !== 'GET' && method !== 'HEAD';
+  // 写请求携带 CSRF 令牌；登录 / 注册等公开接口在会话建立前没有令牌，显式豁免
+  if (write && csrfToken && !opts.noCsrf) h['X-CSRF-Token'] = csrfToken;
+  if (!write) {
+    const r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
+    if (r.status === 401 && !opts.skipAuthRedirect && gen === sessionGeneration) onSessionExpired();
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { const j = await r.json(); msg = j.error || msg; } catch {}
+      const err = new Error(msg || `请求失败 (${r.status})`);
+      err.status = r.status;
+      throw err;
+    }
+    const ct = r.headers.get('content-type') || '';
+    return ct.includes('application/json') ? r.json() : r.text();
   }
   // 每次逻辑写入携带稳定操作编号，便于断网后凭编号回查结果
-  const write = method !== 'GET' && method !== 'HEAD';
-  const operationId = write ? (opts.operationId || newOperationId()) : null;
-  if (operationId) h['X-Operation-ID'] = operationId;
-  let r;
-  try {
-    r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
-  } catch (netError) {
-    // 网络歧义：请求可能已被服务端接受，凭操作编号回查真实结果
-    if (operationId && typeof queryOperation === 'function') {
-      const confirmed = await queryOperation(operationId);
-      if (confirmed !== null && confirmed !== undefined) return confirmed;
+  const operationId = opts.operationId || newOperationId();
+  h['X-Operation-ID'] = operationId;
+  const publicWrite = !!opts.noCsrf;
+  // 公开注册 / 重申 / 状态查询可凭同编号重放原内容确认；登录不重放，避免重复会话
+  const canReplay = publicWrite && (path === '/auth/register' || path === '/auth/application/resubmit' || path === '/auth/application/status');
+  const canQuery = !publicWrite;
+  // 同主体 + 同路由 + 同内容的并发重复写请求合并，避免双副作用
+  const key = writeKey(method, path, body);
+  const existing = apiInFlight.get(key);
+  if (existing) return existing;
+  const task = (async () => {
+    beginGlobalBusy();
+    try {
+      let r;
+      try {
+        r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
+      } catch (netError) {
+        // 网络歧义：请求可能已被服务端接受，先确认结果再报错
+        let confirmed = null;
+        if (canReplay) confirmed = await replayPublicOperation(path, method, h, body);
+        else if (canQuery) confirmed = await resolveOperation(operationId);
+        if (confirmed !== null && confirmed !== undefined) return confirmed;
+        const err = new Error('网络错误：结果待确认，请稍后重试或在任务中心查看');
+        err.network = true;
+        err.operationId = operationId;
+        throw err;
+      }
+      // 幂等中间件重放：仍在处理中，必须先查询终态，不能当作成功
+      if (r.status === 202) {
+        let j = null;
+        try { j = await r.json(); } catch {}
+        if (j && j.status === 'pending') {
+          const opId = j.operation_id || operationId;
+          let confirmed = null;
+          if (canReplay) confirmed = await replayPublicOperation(path, method, h, body);
+          else if (canQuery) confirmed = await resolveOperation(opId);
+          if (confirmed !== null && confirmed !== undefined) return confirmed;
+          const err = new Error('操作仍在处理中，请稍后查询结果');
+          err.pending = true;
+          err.operationId = opId;
+          throw err;
+        }
+      }
+      if (r.status === 401 && !opts.skipAuthRedirect && gen === sessionGeneration) onSessionExpired();
+      if (!r.ok) {
+        let msg = r.statusText;
+        try { const j = await r.json(); msg = j.error || msg; } catch {}
+        const err = new Error(msg || `请求失败 (${r.status})`);
+        err.status = r.status;
+        throw err;
+      }
+      const ct = r.headers.get('content-type') || '';
+      return ct.includes('application/json') ? r.json() : r.text();
+    } finally {
+      endGlobalBusy();
     }
-    const err = new Error('网络错误：结果待确认，请稍后重试或在任务中心查看');
-    err.network = true;
-    throw err;
-  }
-  if (r.status === 401 && !opts.skipAuthRedirect && gen === sessionGeneration) onSessionExpired();
-  if (!r.ok) {
-    let msg = r.statusText;
-    try { const j = await r.json(); msg = j.error || msg; } catch {}
-    const err = new Error(msg || `请求失败 (${r.status})`);
-    err.status = r.status;
-    throw err;
-  }
-  const ct = r.headers.get('content-type') || '';
-  return ct.includes('application/json') ? r.json() : r.text();
+  })().finally(() => {
+    if (apiInFlight.get(key) === task) apiInFlight.delete(key);
+  });
+  apiInFlight.set(key, task);
+  return task;
 }
 
 // 原始下载 / 辅助请求的统一入口：同源 Cookie + 代际感知的 401 处理。
@@ -539,6 +653,9 @@ function teardownSession() {
   permState = null;
   profileData = null;
   statusCredentials = null;
+  apiInFlight.clear();
+  globalBusyCount = 0;
+  renderGlobalBusy();
   stopTaskPolling();
   closeDrawer();
   closeAccountMenu();
@@ -3234,12 +3351,15 @@ async function doUploadMod(id) {
   const fileEl = $('#mod-file');
   const files = fileEl ? fileEl.files : null;
   if (!files || !files.length) return toast('请选择文件', false);
+  const gen = sessionGeneration;
   await withBusy('mod-upload:' + id, fileEl, async () => {
     const fd = new FormData();
     for (const f of files) fd.append('file', f);
     try {
-      await xhrUpload({ path: `/instances/${id}/mods/upload`, body: fd });
-      closeModal(); toast('上传成功'); refresh();
+      const r = await xhrUpload({ path: `/instances/${id}/mods/upload`, body: fd });
+      if (gen !== sessionGeneration) return;
+      closeModal();
+      reportUploadResult('模组', r, () => refresh());
     } catch (e) { toast(e.message, false); }
   });
 }
@@ -3377,9 +3497,10 @@ async function doFilesUpload(id) {
     const fd = new FormData();
     for (const f of files) fd.append('file', f);
     try {
-      await xhrUpload({ path: `/instances/${id}/files/upload?path=${encodeURIComponent(path)}`, body: fd });
+      const r = await xhrUpload({ path: `/instances/${id}/files/upload?path=${encodeURIComponent(path)}`, body: fd });
       if (gen !== sessionGeneration) return;
-      closeModal(); toast('上传成功'); loadFiles(id, routeToken, path);
+      closeModal();
+      reportUploadResult('文件', r, () => loadFiles(id, routeToken, path));
     } catch (e) { toast(e.message, false); }
   });
 }
@@ -3588,6 +3709,14 @@ async function renderTabSettings(id, el) {
       <label>JVM 参数模板<div class="row"><button class="btn ghost small" onclick="fillAikar()">填入 Aikar's Flags</button></div></label>
       <label class="check"><input type="checkbox" id="f-auto" ${s.auto_restart ? 'checked' : ''}> 进程异常退出时自动重启（5 秒后）</label>
       <label class="check"><input type="checkbox" id="f-autoboot" ${s.auto_start_on_boot ? 'checked' : ''}> 面板启动时自动运行此实例（多个实例将间隔 5 秒依次拉起）</label>
+      <label>白名单身份模式
+        <select id="f-wl-identity">
+          <option value="auto" ${!s.whitelist_identity ? 'selected' : ''}>自动（按 online-mode 判定）</option>
+          <option value="online" ${s.whitelist_identity === 'online' ? 'selected' : ''}>正版（Mojang UUID）</option>
+          <option value="offline" ${s.whitelist_identity === 'offline' ? 'selected' : ''}>离线（按游戏名生成 UUID）</option>
+        </select>
+        <div class="muted small">代理转发等 online-mode 不可靠时，显式指定自动白名单同步使用的身份模式。</div>
+      </label>
       <div class="row right"><button class="btn primary" onclick="saveInstance('${id}')">保存设置</button></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -3705,6 +3834,7 @@ async function detectJava() {
   } catch (e) { $('#java-hint').textContent = e.message; }
 }
 async function saveInstance(id) {
+  const wl = ($('#f-wl-identity') && $('#f-wl-identity').value) || 'auto';
   try {
     await api(`/instances/${id}`, {
       method: 'PATCH',
@@ -3717,6 +3847,7 @@ async function saveInstance(id) {
         jvm_args: $('#f-jvm').value,
         auto_restart: $('#f-auto').checked,
         auto_start_on_boot: $('#f-autoboot').checked,
+        whitelist_identity_override: wl === 'auto' ? null : wl,
       },
     });
     toast('已保存');
@@ -3871,12 +4002,15 @@ async function doRegister() {
   if (password !== password2) { if (err) err.textContent = '两次输入的密码不一致'; return; }
   if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
   if (!reason) { if (err) err.textContent = '请填写申请理由'; return; }
+  const gen = sessionGeneration;
   await withBusy('auth:register', $('#reg-go'), async () => {
     try {
       await api('/auth/register', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username, password, minecraft_name, reason, captcha_token: captchaTokenOrNull() } });
+      if (gen !== sessionGeneration) return;
       if (err) err.textContent = '';
       showModal(`<h2>申请已提交</h2><p class="muted" style="margin:10px 0">账户「${esc(username)}」已提交，等待管理员审批。审批通过后即可登录。</p><div class="row right"><button class="btn" onclick="closeModal();navigate('#/status')">查询申请状态</button><button class="btn primary" onclick="closeModal();renderLogin()">返回登录</button></div>`);
     } catch (e) {
+      if (gen !== sessionGeneration) return;
       if (err) err.textContent = e.message || '注册失败';
       resetTurnstile();
     }
@@ -3907,14 +4041,17 @@ async function doStatusQuery() {
   const password = $('#st-pass')?.value || '';
   const err = $('#st-err');
   if (!username || !password) { if (err) err.textContent = '请输入用户名和密码'; return; }
+  const gen = sessionGeneration;
   await withBusy('auth:status', $('#st-go'), async () => {
     try {
       const r = await api('/auth/application/status', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username, password } });
+      if (gen !== sessionGeneration) return;
       // 凭据仅保存在本次页面内存，不写入浏览器存储
       statusCredentials = { username, password };
       if (err) err.textContent = '';
       renderApplicationResult(r && r.application);
     } catch (e) {
+      if (gen !== sessionGeneration) return;
       statusCredentials = null;
       if (err) err.textContent = e.message || '查询失败';
       renderApplicationResult(null);
@@ -3958,12 +4095,15 @@ async function doResubmit() {
   const err = $('#rs-err');
   if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
   if (!reason) { if (err) err.textContent = '请填写申请理由'; return; }
+  const gen = sessionGeneration;
   await withBusy('auth:resubmit', $('#rs-go'), async () => {
     try {
       const r = await api('/auth/application/resubmit', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username: statusCredentials.username, password: statusCredentials.password, minecraft_name, reason, captcha_token: captchaTokenOrNull() } });
+      if (gen !== sessionGeneration) return;
       toast('已重新提交，等待审批');
       renderApplicationResult(r && r.application);
     } catch (e) {
+      if (gen !== sessionGeneration) return;
       if (err) err.textContent = e.message || '提交失败';
       resetTurnstile();
     }
@@ -3988,20 +4128,28 @@ function renderProfileBody(d) {
   if (!el) return;
   const user = (d && d.user) || d || {};
   const app = d && d.application;
-  const req = (d && (d.name_request || d.name_change)) || user.name_request || null;
   const statusLabel = ({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[user.status] || user.status || '';
-  el.innerHTML = `<div class="card">
-    <div class="reason-box"><b>用户名：</b>${esc(user.username || '')} <span class="muted small">（注册后不可修改）</span><br>
-      <b>角色：</b>${user.role === 'admin' ? '管理员' : '普通用户'}<br>
-      <b>当前游戏名：</b>${esc(user.minecraft_name || '未绑定')}${statusLabel ? ' · ' + esc(statusLabel) : ''}</div>
-    ${app ? `<div class="auth-note">注册申请状态：${esc(({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[app.status] || app.status || '')}${app.rejection_reason ? ' · ' + esc(app.rejection_reason) : ''}</div>` : ''}
-    ${req ? `<div class="sync-warning"><span>改名申请审批中：新游戏名 ${esc(req.minecraft_name || '')}。审批期间旧游戏名继续生效。</span><button class="btn small" type="button" onclick="withdrawNameRequest('${esc(req.id || '')}')">撤回申请</button></div>` : ''}
+  // 后端仅在待审游戏名变更时返回 kind=name_change 的申请
+  const pendingNameChange = app && app.kind === 'name_change' && app.status === 'pending';
+  let banner = '';
+  if (pendingNameChange) {
+    banner = `<div class="sync-warning"><span>改名申请审批中：新游戏名 ${esc(app.minecraft_name || '')}。审批期间旧游戏名继续生效。</span><button class="btn small" type="button" onclick="withdrawNameRequest('${esc(app.id)}')">撤回申请</button></div>`;
+  } else if (app) {
+    banner = `<div class="auth-note">注册申请状态：${esc(({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[app.status] || app.status || '')}${app.rejection_reason ? ' · ' + esc(app.rejection_reason) : ''}</div>`;
+  }
+  const form = pendingNameChange ? '' : `
     <h3 style="margin-top:14px">申请修改游戏名</h3>
     <p class="muted small">提交后需管理员审批；等待期间保留登录与旧游戏名，批准后更新相关实例白名单。</p>
     <label>新游戏名<input id="prof-mc" autocapitalize="off" autocorrect="off" placeholder="1-16 位字母、数字或下划线"></label>
     <label>变更理由<textarea id="prof-reason" rows="3" maxlength="500"></textarea></label>
     <div id="prof-err" class="login-err" role="alert"></div>
-    <div class="row"><button class="btn primary" id="prof-go" type="button" onclick="doRequestNameChange()">提交改名申请</button></div>
+    <div class="row"><button class="btn primary" id="prof-go" type="button" onclick="doRequestNameChange()">提交改名申请</button></div>`;
+  el.innerHTML = `<div class="card">
+    <div class="reason-box"><b>用户名：</b>${esc(user.username || '')} <span class="muted small">（注册后不可修改）</span><br>
+      <b>角色：</b>${user.role === 'admin' ? '管理员' : '普通用户'}<br>
+      <b>当前游戏名：</b>${esc(user.minecraft_name || '未绑定')}${statusLabel ? ' · ' + esc(statusLabel) : ''}</div>
+    ${banner}
+    ${form}
   </div>`;
 }
 
@@ -4011,12 +4159,15 @@ async function doRequestNameChange() {
   const err = $('#prof-err');
   if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
   if (!reason) { if (err) err.textContent = '请填写变更理由'; return; }
+  const gen = sessionGeneration;
   await withBusy('profile:name', $('#prof-go'), async () => {
     try {
       await api('/auth/minecraft-name-requests', { method: 'POST', body: { minecraft_name, reason } });
+      if (gen !== sessionGeneration) return;
       toast('改名申请已提交，审批期间旧游戏名继续生效');
       renderProfile();
     } catch (e) {
+      if (gen !== sessionGeneration) return;
       if (err) err.textContent = e.message || '提交失败';
     }
   });
@@ -4084,14 +4235,18 @@ function readPermissionChecks() {
 async function savePermissions(id) {
   if (!permState) return;
   const user_ids = readPermissionChecks();
+  const token = routeToken, gen = sessionGeneration;
   await withBusy('perm:' + id, $('#perm-save'), async () => {
     try {
       const d = await api(`/instances/${id}/permissions`, { method: 'PUT', body: { revision: permState.revision, user_ids } });
+      if (gen !== sessionGeneration || token !== routeToken) return;
       permState = { revision: d.revision, users: d.users || permState.users, whitelist_enabled: d.whitelist_enabled !== undefined ? d.whitelist_enabled : permState.whitelist_enabled };
       renderPermissionRows();
       toast('实例授权已保存');
       refreshApprovalCount();
+      loadWhitelistSync(id, routeToken);
     } catch (e) {
+      if (gen !== sessionGeneration || token !== routeToken) return;
       if (e.status === 409) {
         toast('授权已被其他管理员修改，已刷新最新数据', false);
         renderTabPermissions(id, document.getElementById('tab-body'), routeToken);
@@ -4108,9 +4263,25 @@ async function loadWhitelistSync(id, t) {
   try {
     const d = await api(`/instances/${id}/whitelist-sync`);
     if (t !== routeToken || !box) return;
-    const pending = !!(d && (d.pending || d.status === 'pending' || (d.failures && d.failures.length)));
-    box.innerHTML = pending ? `<div class="sync-warning"><span>白名单同步待处理：${esc(d.detail || d.message || '部分实例尚未同步，请稍后重试')}</span><button class="btn small" type="button" onclick="loadWhitelistSync('${id}',routeToken)">重新检查</button></div>` : '';
+    const pending = d && Array.isArray(d.pending) ? d.pending : [];
+    const bad = !!(d && (['pending', 'error', 'unsupported', 'needs_override'].includes(d.status) || pending.length > 0 || d.last_error));
+    if (!bad) { box.innerHTML = ''; return; }
+    const parts = [];
+    if (pending.length) parts.push('待处理成员：' + pending.map(p => `${p.name || p.user_id || ''}${p.reason ? '（' + p.reason + '）' : ''}`).join('、'));
+    if (d.last_error) parts.push('最近错误：' + d.last_error);
+    if (!parts.length) parts.push('同步状态：' + (d.status || '未知'));
+    box.innerHTML = `<div class="sync-warning"><span>白名单同步待处理：${esc(parts.join('；'))}</span><button class="btn small" type="button" onclick="retryWhitelistSync('${id}')">重试同步</button></div>`;
   } catch { if (box) box.innerHTML = ''; }
+}
+
+async function retryWhitelistSync(id) {
+  const token = routeToken, gen = sessionGeneration;
+  try {
+    const r = await api(`/instances/${id}/whitelist-sync/retry`, { method: 'POST' });
+    if (gen !== sessionGeneration || token !== routeToken) return;
+    toast(r && r.ok ? '白名单已重新同步' : '同步仍待处理，请稍后重试', !!(r && r.ok));
+    loadWhitelistSync(id, routeToken);
+  } catch (e) { toast(e.message, false); }
 }
 
 /* ---------------- 管理员：注册申请与游戏名变更审批 ---------------- */
@@ -4188,9 +4359,11 @@ async function doApproveApplication(id) {
   if (!app) return;
   const instance_ids = $$('.appr-inst:checked').map(c => c.value);
   const err = document.getElementById('appr-err');
+  const token = routeToken, gen = sessionGeneration;
   await withBusy('approve:' + id, document.getElementById('appr-go'), async () => {
     try {
       await api('/applications/' + encodeURIComponent(id) + '/approve', { method: 'POST', body: { revision: app.revision, instance_ids } });
+      if (gen !== sessionGeneration || token !== routeToken) return;
       closeModal();
       toast('已批准');
       loadApprovals(routeToken);
@@ -4198,6 +4371,7 @@ async function doApproveApplication(id) {
       refreshApprovalCount();
       refreshTasks();
     } catch (e) {
+      if (gen !== sessionGeneration) return;
       if (err) err.textContent = e.message || '批准失败';
     }
   });
@@ -4209,17 +4383,45 @@ async function rejectApplication(id) {
   const reason = await appPrompt('请填写拒绝理由（会展示给申请人）', '', { title: '拒绝申请' });
   if (reason === null) return;
   if (!reason.trim()) { toast('拒绝必须填写理由', false); return; }
+  const gen = sessionGeneration;
   try {
     await api('/applications/' + encodeURIComponent(id) + '/reject', { method: 'POST', body: { revision: app.revision, reason: reason.trim() } });
+    if (gen !== sessionGeneration) return;
     toast('已拒绝');
     loadApprovals(routeToken);
     refreshApprovalCount();
-  } catch (e) { toast(e.message, false); }
+  } catch (e) { if (gen === sessionGeneration) toast(e.message, false); }
 }
 
+// 上传响应 {ok,saved[],failed:[{name,error}]}：区分全成功与部分失败，避免 200 视作全部成功。
+function summarizeUpload(r) {
+  const saved = (r && Array.isArray(r.saved)) ? r.saved : [];
+  const failed = (r && Array.isArray(r.failed)) ? r.failed : [];
+  return { saved, failed, ok: failed.length === 0 && !(r && r.ok === false) };
+}
+
+function reportUploadResult(noun, r, onDone) {
+  const { saved, failed } = summarizeUpload(r);
+  if (!failed.length) {
+    if (onDone) onDone();
+    toast(`${noun}上传成功${saved.length ? '（' + saved.length + ' 个）' : ''}`);
+    return;
+  }
+  const lines = failed.map(f => `${f.name || f.file || '未知文件'}：${f.error || '失败'}`).join('\n');
+  const summary = `${noun}部分失败：成功 ${saved.length} 个，失败 ${failed.length} 个`;
+  showModal(`<h2>${esc(noun)}上传结果</h2>
+    <p class="muted small">${esc(summary)}。已成功的文件已保存，失败项如下：</p>
+    <pre class="job-log">${esc(lines)}</pre>
+    <div class="row right"><button class="btn primary" onclick="closeModal()">知道了</button></div>`);
+  toast(summary, false);
+  if (onDone) onDone();
+}
 /* ---------------- 统一 XHR 上传（进度 + 100% 处理中 + 会话代际） ---------------- */
 function xhrUpload(opts) {
   return new Promise((resolve, reject) => {
+    beginGlobalBusy();
+    let settled = false;
+    const done = (fn, value) => { if (settled) return; settled = true; endGlobalBusy(); fn(value); };
     const xhr = new XMLHttpRequest();
     const gen = sessionGeneration;
     const operationId = opts.operationId || newOperationId();
@@ -4233,22 +4435,22 @@ function xhrUpload(opts) {
       if (opts.onPhase) opts.onPhase('processing');
     };
     xhr.onload = () => {
-      if (gen !== sessionGeneration) { reject(new Error('会话已切换，本次结果已丢弃')); return; }
+      if (gen !== sessionGeneration) { done(reject, new Error('会话已切换，本次结果已丢弃')); return; }
       let j = {};
       try { j = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch {}
-      if (xhr.status >= 200 && xhr.status < 300) { resolve(j); return; }
+      if (xhr.status >= 200 && xhr.status < 300) { done(resolve, j); return; }
       if (xhr.status === 401) onSessionExpired();
       const err = new Error(j.error || xhr.statusText || ('请求失败 (' + xhr.status + ')'));
       err.status = xhr.status;
-      reject(err);
+      done(reject, err);
     };
     xhr.onerror = () => {
       if (opts.onPhase) opts.onPhase('error');
       const err = new Error('网络错误：上传结果待确认');
       err.network = true;
-      reject(err);
+      done(reject, err);
     };
-    xhr.ontimeout = () => reject(new Error('上传超时：结果待确认'));
+    xhr.ontimeout = () => done(reject, new Error('上传超时：结果待确认'));
     if (opts.onStart) opts.onStart(xhr, operationId);
     xhr.send(opts.body);
   });
@@ -4448,7 +4650,15 @@ async function uploadIcon(id) {
   const f = $('#icon-file')?.files[0];
   if (!f) return toast('请选择 PNG 文件', false);
   const fd = new FormData(); fd.append('file', f);
-  try { await xhrUpload({ path: `/instances/${id}/icon`, body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
+  const gen = sessionGeneration;
+  await withBusy('icon:' + id, null, async () => {
+    try {
+      await xhrUpload({ path: `/instances/${id}/icon`, body: fd });
+      if (gen !== sessionGeneration) return;
+      toast('图标已上传');
+      refresh();
+    } catch (e) { if (gen === sessionGeneration) toast(e.message, false); }
+  });
 }
 async function downloadFile(id, path) {
   try { await downloadUrl(`/api/instances/${id}/files/download?path=${encodeURIComponent(path)}`, path.split('/').pop()); }

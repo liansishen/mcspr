@@ -15,7 +15,7 @@ function extractFn(name) {
 }
 
 function run(names, context) {
-  const ctx = vm.createContext({ routeToken: 1, sessionGeneration: 1, currentUser: null, pendingApprovals: 0, taskJobs: new Map(), opInFlight: new Map(), ...context });
+  const ctx = vm.createContext({ routeToken: 1, sessionGeneration: 1, currentUser: null, pendingApprovals: 0, taskJobs: new Map(), opInFlight: new Map(), apiInFlight: new Map(), globalBusyCount: 0, newOperationId: () => 'op-test', writeKey: (m, p, b) => m + ' ' + p + ' ' + (typeof b === 'string' ? b : 'x'), beginGlobalBusy() {}, endGlobalBusy() {}, renderGlobalBusy() {}, resolveOperation: async () => null, replayPublicOperation: async () => null, ...context });
   vm.runInContext(names.map(extractFn).join('\n'), ctx);
   return ctx;
 }
@@ -43,7 +43,7 @@ test('api queries the operation status after a network error', async () => {
   const ctx = run(['api'], {
     csrfToken: '', FormData: class {}, onSessionExpired() {},
     newOperationId: () => 'op-net',
-    queryOperation: async id => { queries.push(id); return { confirmed: true }; },
+    resolveOperation: async id => { queries.push(id); return { confirmed: true }; },
     fetch: async () => { throw new TypeError('network down'); },
   });
   const result = await ctx.api('/instances/x/start', { method: 'POST' });
@@ -54,7 +54,7 @@ test('api queries the operation status after a network error', async () => {
 test('api surfaces an ambiguous-result error when no operation record is found', async () => {
   const ctx = run(['api'], {
     csrfToken: '', FormData: class {}, onSessionExpired() {},
-    newOperationId: () => 'op-none', queryOperation: async () => null,
+    newOperationId: () => 'op-none', resolveOperation: async () => null,
     fetch: async () => { throw new TypeError('network down'); },
   });
   await assert.rejects(() => ctx.api('/instances/x/stop', { method: 'POST' }), /结果待确认/);
@@ -212,10 +212,11 @@ test('profile keeps the old game name active while a change is pending', async (
     api: async (p, o) => { calls.push({ p, o }); return {}; },
     renderProfile() {},
   });
-  ctx.renderProfileBody({ user: { username: 'bob', role: 'user', minecraft_name: 'OldName', status: 'approved' }, name_request: { id: 'r1', minecraft_name: 'NewName' } });
+  ctx.renderProfileBody({ user: { username: 'bob', role: 'user', minecraft_name: 'OldName', status: 'approved' }, application: { id: 'r1', kind: 'name_change', status: 'pending', minecraft_name: 'NewName', reason: 'r', revision: 1 } });
   assert.match(el.innerHTML, /OldName/);
   assert.match(el.innerHTML, /旧游戏名继续生效/);
   assert.match(el.innerHTML, /withdrawNameRequest\('r1'\)/);
+  assert.doesNotMatch(el.innerHTML, /id="prof-mc"/);
   await ctx.doRequestNameChange();
   assert.equal(calls[0].p, '/auth/minecraft-name-requests');
   assert.equal(calls[0].o.body.minecraft_name, 'NewName');
@@ -284,16 +285,35 @@ test('rejecting an application requires a reason', async () => {
   assert.equal(toasts.at(-1)[1], false);
 });
 
-test('whitelist sync status surfaces a warning when pending', async () => {
+test('whitelist sync surfaces pending members, last error and a retry endpoint', async () => {
   const box = { innerHTML: '' };
   const ctx = run(['loadWhitelistSync'], {
     esc: s => String(s), routeToken: 1,
     document: { getElementById: () => box },
-    api: async () => ({ pending: true, detail: '实例 B 未同步' }),
+    api: async () => ({ status: 'pending', pending: [{ name: 'Steve', reason: '正版解析失败' }], last_error: 'timeout' }),
   });
   await ctx.loadWhitelistSync('i1', 1);
   assert.match(box.innerHTML, /白名单同步待处理/);
-  assert.match(box.innerHTML, /实例 B 未同步/);
+  assert.match(box.innerHTML, /Steve/);
+  assert.match(box.innerHTML, /正版解析失败/);
+  assert.match(box.innerHTML, /timeout/);
+  assert.match(box.innerHTML, /retryWhitelistSync\('i1'\)/);
+});
+
+test('whitelist sync hides the warning when applied and retry posts the retry endpoint', async () => {
+  const box = { innerHTML: '' };
+  const calls = [];
+  const ctx = run(['loadWhitelistSync', 'retryWhitelistSync'], {
+    esc: s => String(s), routeToken: 1, toast() {},
+    document: { getElementById: () => box },
+    api: async (p, o) => { calls.push({ p, o }); return p.endsWith('/retry') ? { ok: true } : { status: 'idle', pending: [] }; },
+  });
+  await ctx.loadWhitelistSync('i1', 1);
+  assert.equal(box.innerHTML, '');
+  await ctx.retryWhitelistSync('i1');
+  const retry = calls.find(c => c.p.endsWith('/whitelist-sync/retry'));
+  assert.ok(retry, 'retry endpoint should be called');
+  assert.equal(retry.o.method, 'POST');
 });
 
 test('xhrUpload sends the operation id, reports 100% then a processing phase', async () => {
@@ -313,7 +333,7 @@ test('xhrUpload sends the operation id, reports 100% then a processing phase', a
   }
   const phases = [], progresses = [];
   const ctx = run(['xhrUpload'], {
-    XMLHttpRequest: FakeXHR, sessionGeneration: 1, csrfToken: 'c', newOperationId: () => 'op-x', onSessionExpired() {},
+    XMLHttpRequest: FakeXHR, sessionGeneration: 1, csrfToken: 'c', newOperationId: () => 'op-x', onSessionExpired() {}, beginGlobalBusy() {}, endGlobalBusy() {},
   });
   const result = await ctx.xhrUpload({ path: '/instances/x/files/upload', body: 'fd', onProgress: p => progresses.push(p), onPhase: ph => phases.push(ph) });
   assert.equal(instances[0].headers['X-Operation-ID'], 'op-x');
@@ -336,7 +356,7 @@ test('session teardown stops task polling and clears private credentials', () =>
   const main = { innerHTML: '', dataset: {}, classList: { remove() {} } };
   let stopped = 0;
   const ctx = run(['teardownSession', 'clearTimers'], {
-    timers: [], activeWS: null, clearInterval() {}, currentUser: { role: 'user' }, csrfToken: 'c', loginAttempt: 0,
+    timers: [], activeWS: null, clearInterval() {}, currentUser: { role: 'user' }, csrfToken: 'c', loginAttempt: 0, apiInFlight: new Map(), globalBusyCount: 0, renderGlobalBusy() {},
     currentInstanceInfo: null, usersData: null, usersInstanceId: null, modsCache: null, modDL: null, mpUp: null,
     filesEntriesCache: null, currentGameBackupProvider: null, accountsData: null,
     applicationsData: {}, permState: {}, profileData: {}, statusCredentials: { username: 'a', password: 'b' },
@@ -438,4 +458,116 @@ test('route closes the mobile drawer and account menu on navigation', async () =
   await ctx.route();
   assert.equal(drawerClosed, 1);
   assert.equal(menuClosed, 1);
+});
+test('resolveOperation returns the stored result and throws on terminal error', async () => {
+  const done = run(['sleep', 'resolveOperation'], { setTimeout, fetch: async () => ({ status: 200, ok: true, json: async () => ({ status: 'done', result: { id: 'i1' } }) }) });
+  assert.deepEqual(plain(await done.resolveOperation('op-1')), { id: 'i1' });
+
+  const errored = run(['sleep', 'resolveOperation'], { setTimeout, fetch: async () => ({ status: 200, ok: true, json: async () => ({ status: 'error', status_code: 400, result: { error: 'bad input' } }) }) });
+  await assert.rejects(() => errored.resolveOperation('op-2'), /bad input/);
+
+  const missing = run(['sleep', 'resolveOperation'], { setTimeout, fetch: async () => ({ status: 404, ok: false, json: async () => ({}) }) });
+  assert.equal(await missing.resolveOperation('op-3'), null);
+});
+
+test('replayPublicOperation ignores a 202 pending replay and returns the final result', async () => {
+  const responses = [
+    { status: 202, ok: false, json: async () => ({ status: 'pending' }) },
+    { status: 200, ok: true, json: async () => ({ ok: true, status: 'pending' }) },
+  ];
+  const ctx = run(['sleep', 'replayPublicOperation'], { setTimeout, fetch: async () => responses.shift() });
+  const r = await ctx.replayPublicOperation('/auth/register', 'POST', {}, '{"username":"bob"}');
+  assert.deepEqual(plain(r), { ok: true, status: 'pending' });
+});
+
+test('api resolves an authenticated 202 pending replay to its terminal result', async () => {
+  const ctx = run(['api'], {
+    csrfToken: 'c', FormData: class {}, onSessionExpired() {}, newOperationId: () => 'op-p', apiInFlight: new Map(), beginGlobalBusy() {}, endGlobalBusy() {},
+    resolveOperation: async id => ({ doneFor: id }),
+    fetch: async () => ({ status: 202, ok: true, headers: { get: () => 'application/json' }, json: async () => ({ status: 'pending', operation_id: 'op-p' }) }),
+  });
+  assert.deepEqual(plain(await ctx.api('/instances/x/start', { method: 'POST' })), { doneFor: 'op-p' });
+});
+
+test('api resolves a public register 202 by replaying the same request', async () => {
+  const replayed = [];
+  const ctx = run(['api'], {
+    csrfToken: '', FormData: class {}, onSessionExpired() {}, newOperationId: () => 'op-reg', apiInFlight: new Map(), beginGlobalBusy() {}, endGlobalBusy() {},
+    replayPublicOperation: async (path, method, headers, body) => { replayed.push({ path, body }); return { ok: true, status: 'pending' }; },
+    fetch: async () => ({ status: 202, ok: true, headers: { get: () => 'application/json' }, json: async () => ({ status: 'pending', operation_id: 'op-reg' }) }),
+  });
+  const r = await ctx.api('/auth/register', { method: 'POST', noCsrf: true, body: { username: 'bob' } });
+  assert.deepEqual(plain(r), { ok: true, status: 'pending' });
+  assert.equal(replayed[0].path, '/auth/register');
+  assert.equal(replayed[0].body, '{"username":"bob"}');
+});
+
+test('api throws when the resolved operation ended in error', async () => {
+  const ctx = run(['api'], {
+    csrfToken: 'c', FormData: class {}, onSessionExpired() {}, newOperationId: () => 'op-e', apiInFlight: new Map(), beginGlobalBusy() {}, endGlobalBusy() {},
+    resolveOperation: async () => { const e = new Error('bad'); e.status = 400; throw e; },
+    fetch: async () => ({ status: 202, ok: true, headers: { get: () => 'application/json' }, json: async () => ({ status: 'pending', operation_id: 'op-e' }) }),
+  });
+  await assert.rejects(() => ctx.api('/instances/x/start', { method: 'POST' }), /bad/);
+});
+
+test('api merges identical concurrent writes but keeps different bodies distinct', async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const ctx = run(['api', 'writeKey'], {
+    csrfToken: 'c', FormData: class {}, onSessionExpired() {}, newOperationId: () => 'op-1', apiInFlight: new Map(), beginGlobalBusy() {}, endGlobalBusy() {},
+    fetch: async () => { calls++; await gate; return { status: 200, ok: true, headers: { get: () => 'application/json' }, json: async () => ({ ok: true }) }; },
+  });
+  const p1 = ctx.api('/instances/x/command', { method: 'POST', body: { command: 'list' } });
+  const p2 = ctx.api('/instances/x/command', { method: 'POST', body: { command: 'list' } });
+  release();
+  await Promise.all([p1, p2]);
+  assert.equal(calls, 1);
+  await ctx.api('/instances/x/command', { method: 'POST', body: { command: 'say hi' } });
+  assert.equal(calls, 2);
+});
+
+test('summarizeUpload distinguishes full success from partial failure', () => {
+  const ctx = run(['summarizeUpload'], {});
+  assert.equal(ctx.summarizeUpload({ ok: true, saved: ['a.jar'], failed: [] }).ok, true);
+  const partial = ctx.summarizeUpload({ ok: true, saved: ['a.jar'], failed: [{ name: 'b.txt', error: '仅支持 .jar 文件' }] });
+  assert.equal(partial.ok, false);
+  assert.equal(partial.failed[0].name, 'b.txt');
+});
+
+test('global busy counter toggles the top bar indicator', () => {
+  const bar = { hidden: true };
+  const ctx = run(['beginGlobalBusy', 'endGlobalBusy', 'renderGlobalBusy'], { globalBusyCount: 0, document: { getElementById: () => bar } });
+  ctx.beginGlobalBusy();
+  assert.equal(ctx.globalBusyCount, 1);
+  assert.equal(bar.hidden, false);
+  ctx.endGlobalBusy();
+  assert.equal(ctx.globalBusyCount, 0);
+  assert.equal(bar.hidden, true);
+});
+
+test('turnstile uses the official test token and the register action', async () => {
+  assert.match(source, /XXXX\.DUMMY\.TOKEN\.XXXX/);
+  assert.match(source, /action: 'register'/);
+  const slot = { innerHTML: '' };
+  const ctx = run(['mountTurnstile'], { turnstileToken: '', turnstileWidgetId: null, document: { getElementById: () => slot } });
+  await ctx.mountTurnstile('reg-turnstile', '', true);
+  assert.equal(ctx.turnstileToken, 'XXXX.DUMMY.TOKEN.XXXX');
+});
+
+test('profile shows the registration application status and keeps the change form', () => {
+  const el = { innerHTML: '' };
+  const ctx = run(['renderProfileBody'], { esc: s => String(s), document: { getElementById: () => el } });
+  ctx.renderProfileBody({ user: { username: 'bob', role: 'user', minecraft_name: 'Steve', status: 'rejected' }, application: { id: 'u1', kind: 'registration', status: 'rejected', rejection_reason: '资料不完整' } });
+  assert.match(el.innerHTML, /注册申请状态/);
+  assert.match(el.innerHTML, /资料不完整/);
+  assert.match(el.innerHTML, /id="prof-mc"/);
+});
+
+test('instance settings expose the whitelist identity override and global busy element', () => {
+  assert.match(source, /id="f-wl-identity"/);
+  assert.match(source, /whitelist_identity_override/);
+  assert.match(html, /id="global-busy"/);
+  assert.match(css, /\.global-busy/);
 });
