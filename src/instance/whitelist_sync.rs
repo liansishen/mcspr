@@ -1,13 +1,11 @@
-//! 白名单自动同步：按账户的有效实例授权协调每个兼容实例的 whitelist.json。
+//! 白名单自动同步：按有效实例授权协调每个实例的 `whitelist.json`。
 //!
-//! 设计要点：
-//! - 核心只接受纯粹的期望成员快照（`DesiredSnapshot` / `DesiredMember`），不依赖认证实现；
-//!   父模块在集成时用 `AuthStore` 的已批准授权构造快照并调用 [`sync_all`]。
-//! - 每个实例维护一个旁路状态文件 `whitelist-sync.json`，记录条目来源（面板管理 / 人工保留）、
-//!   已应用代号、待重试成员与重试次数；这是崩溃安全的重试出口。
-//! - 停止的实例直接原子读写 `whitelist.json`；运行中的实例先下命令再校验文件是否真正生效，
-//!   命令发送成功不等于已生效，超时即记为待重试。
-//! - 损坏的 `whitelist.json` 只报错、绝不覆盖；移除优先于新增；人工条目与人工重复条目永不自动删除。
+//! 约束：
+//! - 输入为纯 `DesiredSnapshot`，不依赖认证实现。
+//! - 每个实例用 `whitelist-sync.json` 记录条目来源、代号与待重试成员。
+//! - 停止实例原子写文件；运行实例下命令后必须校验文件真正生效，超时记为待重试。
+//! - 损坏的白名单只报错不覆盖；移除优先于新增；人工条目永不自动删除。
+//! - 白名单任何变更前，来源登记必须先落盘，避免崩溃后丢失所有权。
 
 use super::{users, InstanceRuntime, Status, WhitelistIdentity};
 use crate::state::AppState;
@@ -310,8 +308,9 @@ async fn resolve_online(state: &AppState, name: &str) -> Result<String, String> 
 
 /// 协调单个实例到给定的期望成员集合。
 ///
-/// `generation` 是调用方的单调代号（通常为账户修订号）：小于已应用代号时直接跳过，
-/// 因此迟到的旧快照不会回滚新状态。
+/// `generation` 为调用方单调代号（通常为账户修订号）。小于已持久化代号
+/// （`generation` 与 `applied_generation` 的较大者）时直接跳过，
+/// 避免迟到的旧快照回滚更新的期望集合。
 pub async fn reconcile_instance(
     state: &AppState,
     rt: &Arc<InstanceRuntime>,
@@ -341,7 +340,7 @@ pub async fn reconcile_instance(
     };
 
     // 陈旧代号：不覆盖已持久化的期望集合，也不做任何改动
-    if generation < st.applied_generation {
+    if generation < st.generation.max(st.applied_generation) {
         return build_outcome(&id, SyncStatus::Skipped, generation, &st, vec![], vec![], None);
     }
 
@@ -490,6 +489,26 @@ pub async fn reconcile_instance(
         }
     }
 
+    // 白名单变更前先落盘来源登记（意图日志）：崩溃或白名单写失败时，
+    // 面板管理条目的所有权不会丢失，已撤销用户不会被误判为人工条目。
+    let intent_managed = build_managed_plan(&resolved, &st, &manual_dup, &current_by_name, &removals, mode);
+    st.managed = intent_managed.clone();
+    st.pending = dedup_pending(resolution_pending.clone());
+    st.status = "applying".to_string();
+    st.last_error = None;
+    st.applied_generation = generation;
+    st.updated_at = now();
+    if let Err(e) = save_state(&dir, &st).await {
+        return build_outcome(
+            &id,
+            SyncStatus::Error,
+            generation,
+            &st,
+            vec![],
+            vec![],
+            Some(format!("同步状态无法落盘，已拒绝改动白名单：{e}")),
+        );
+    }
     let mut added: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
     let mut apply_error: Option<String> = None;
@@ -555,51 +574,12 @@ pub async fn reconcile_instance(
 
     let final_by_name = index_by_name(&final_entries);
 
-    // 重建来源登记：期望成员 + 人工保留成员
-    let mut managed: BTreeMap<String, ManagedEntry> = BTreeMap::new();
-    for (key, r) in &resolved {
-        let manual = st.manual_retained.contains(key) || manual_dup.contains(key);
-        let origin = if manual { "manual_dup" } else { "panel" };
-        let uuid = final_by_name
-            .get(key)
-            .and_then(|e| e.get("uuid").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| r.uuid.clone());
-        let name = final_by_name
-            .get(key)
-            .and_then(entry_name)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| r.name.clone());
-        managed.insert(
-            key.clone(),
-            ManagedEntry {
-                user_id: r.user_id.clone(),
-                name,
-                uuid,
-                origin: origin.into(),
-                mode: Some(mode.as_str().into()),
-            },
-        );
-    }
-    for key in &st.manual_retained {
-        if managed.contains_key(key) {
-            continue;
-        }
-        if let Some(v) = final_by_name.get(key) {
-            managed.insert(
-                key.clone(),
-                ManagedEntry {
-                    user_id: String::new(),
-                    name: entry_name(v).unwrap_or(key.as_str()).to_string(),
-                    uuid: v
-                        .get("uuid")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    origin: "manual_dup".into(),
-                    mode: None,
-                },
-            );
+    // 已确认移除的面板条目从来源登记删除；未确认的保留以便下次重试。
+    let mut managed = intent_managed;
+    for name in &removed {
+        let key = name.to_lowercase();
+        if !resolved.contains_key(&key) {
+            managed.remove(&key);
         }
     }
 
@@ -659,7 +639,7 @@ pub async fn reconcile_instance(
             &st,
             added,
             removed,
-            Some(format!("同步状态落盘失败: {e}")),
+            Some(format!("同步状态更新落盘失败（来源登记已持久化）: {e}")),
         );
     }
     build_outcome(&id, status, generation, &st, added, removed, apply_error)
@@ -708,24 +688,28 @@ pub async fn reconcile_lifecycle(
     Some(reconcile_instance(state, rt, &st.desired, generation).await)
 }
 
-/// 手动新增白名单条目时调用：记录人工保留标记。
+/// 手动新增白名单条目时调用：记录人工保留标记（自行获取实例锁）。
 ///
 /// 若该条目此前由面板管理，则改为人工保留，避免后续撤权时被自动删除。
 pub async fn mark_manual_retained(rt: &Arc<InstanceRuntime>, name: &str) -> Result<(), String> {
+    let _serial = rt.whitelist_sync_lock.lock().await;
+    mark_manual_retained_locked(&rt.dir, name).await
+}
+
+/// 同 [`mark_manual_retained`]，但由调用方持有实例级锁，避免重复加锁死锁。
+pub(crate) async fn mark_manual_retained_locked(dir: &Path, name: &str) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
         return Ok(());
     }
-    let dir = rt.dir.clone();
-    let _serial = rt.whitelist_sync_lock.lock().await;
-    let mut st = load_state(&dir).await?;
+    let mut st = load_state(dir).await?;
     let key = name.to_lowercase();
     st.manual_retained.insert(key.clone());
     if let Some(e) = st.managed.get_mut(&key) {
         e.origin = "manual_dup".into();
     }
     st.updated_at = now();
-    save_state(&dir, &st).await
+    save_state(dir, &st).await
 }
 
 /// 读取某实例的同步状态（供 `GET /instances/{id}/whitelist-sync`）。
@@ -866,6 +850,70 @@ fn dedup_pending(list: Vec<PendingMember>) -> Vec<PendingMember> {
     out
 }
 
+/// 规划来源登记：期望成员 + 人工保留成员 + 未确认移除的面板条目。
+///
+/// 在任何白名单改动前持久化，保证崩溃后所有权不丢失。
+fn build_managed_plan(
+    resolved: &BTreeMap<String, ResolvedMember>,
+    st: &StateFile,
+    manual_dup: &BTreeSet<String>,
+    current_by_name: &BTreeMap<String, Value>,
+    removals: &[(String, String)],
+    mode: WhitelistIdentity,
+) -> BTreeMap<String, ManagedEntry> {
+    let mut managed: BTreeMap<String, ManagedEntry> = BTreeMap::new();
+    for (key, r) in resolved {
+        let manual = st.manual_retained.contains(key) || manual_dup.contains(key);
+        let origin = if manual { "manual_dup" } else { "panel" };
+        let uuid = current_by_name
+            .get(key)
+            .and_then(|e| e.get("uuid").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| r.uuid.clone());
+        let name = current_by_name
+            .get(key)
+            .and_then(entry_name)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| r.name.clone());
+        managed.insert(
+            key.clone(),
+            ManagedEntry {
+                user_id: r.user_id.clone(),
+                name,
+                uuid,
+                origin: origin.into(),
+                mode: Some(mode.as_str().into()),
+            },
+        );
+    }
+    for key in &st.manual_retained {
+        if managed.contains_key(key) {
+            continue;
+        }
+        if let Some(v) = current_by_name.get(key) {
+            managed.insert(
+                key.clone(),
+                ManagedEntry {
+                    user_id: String::new(),
+                    name: entry_name(v).unwrap_or(key.as_str()).to_string(),
+                    uuid: v.get("uuid").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    origin: "manual_dup".into(),
+                    mode: None,
+                },
+            );
+        }
+    }
+    for (key, _) in removals {
+        if managed.contains_key(key) {
+            continue;
+        }
+        if let Some(e) = st.managed.get(key) {
+            managed.insert(key.clone(), e.clone());
+        }
+    }
+    managed
+}
+
 fn build_outcome(
     id: &str,
     status: SyncStatus,
@@ -926,10 +974,12 @@ async fn load_state(dir: &Path) -> Result<StateFile, String> {
 
 async fn save_state(dir: &Path, st: &StateFile) -> Result<(), String> {
     let json = serde_json::to_string_pretty(st).map_err(|e| e.to_string())?;
+    let target = dir.join(SIDECAR);
     let tmp = dir.join(format!("{SIDECAR}.tmp-{}", uuid::Uuid::new_v4()));
     let result = async {
         tokio::fs::write(&tmp, json).await?;
-        tokio::fs::rename(&tmp, dir.join(SIDECAR)).await
+        users::remove_symlink_target(&target).await;
+        tokio::fs::rename(&tmp, &target).await
     }
     .await;
     if let Err(e) = result {
@@ -1307,5 +1357,78 @@ mod tests {
         assert_eq!(i1, vec!["Admin".to_string(), "Bob".to_string()]);
         let i2: Vec<String> = effective_members(&snap, "i2").into_iter().map(|m| m.name).collect();
         assert_eq!(i2, vec!["Admin".to_string(), "Cara".to_string()]);
+    }
+    #[tokio::test]
+    async fn newer_pending_generation_not_overwritten_by_older() {
+        let ctx = setup("stale-pending").await;
+        // 代理实例：身份不支持，代号被持久化但 applied_generation 不变
+        ctx.rt.meta.write().await.jar = Some("velocity-3.3.0.jar".into());
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "New")]), 10).await;
+        assert_eq!(out.status, SyncStatus::Unsupported, "{out:?}");
+        assert_eq!(read_state(&ctx.rt).await.generation, 10);
+
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Old")]), 7).await;
+        assert_eq!(out.status, SyncStatus::Skipped, "{out:?}");
+        assert_eq!(read_state(&ctx.rt).await.desired[0].name, "New");
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_removal_keeps_panel_ownership_for_retry() {
+        let ctx = setup("retry-removal").await;
+        write_props(&ctx, "online-mode=false\n");
+        reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Steve")]), 1).await;
+        assert_eq!(whitelist_names(&ctx.rt), vec!["Steve".to_string()]);
+
+        // 运行中但无命令通道：移除失败，所有权必须保留以便重试
+        *ctx.rt.status.lock().await = Status::Running;
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &[], 2).await;
+        assert_eq!(out.status, SyncStatus::Pending, "{out:?}");
+        let st = read_state(&ctx.rt).await;
+        assert_eq!(st.managed.get("steve").map(|e| e.origin.as_str()), Some("panel"));
+        assert_eq!(whitelist_names(&ctx.rt), vec!["Steve".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_blocks_whitelist_mutation() {
+        let ctx = setup("corrupt-sidecar").await;
+        write_props(&ctx, "online-mode=false\n");
+        std::fs::write(ctx.rt.dir.join("whitelist-sync.json"), "{ not json").unwrap();
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Steve")]), 1).await;
+        assert_eq!(out.status, SyncStatus::Error, "{out:?}");
+        assert!(!ctx.rt.dir.join("whitelist.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn whitelist_symlink_target_is_replaced_not_followed() {
+        let ctx = setup("symlink-whitelist").await;
+        write_props(&ctx, "online-mode=false\n");
+        let outside = ctx.root.join("outside.json");
+        std::fs::write(&outside, "[]").unwrap();
+        std::os::unix::fs::symlink(&outside, ctx.rt.dir.join("whitelist.json")).unwrap();
+
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Steve")]), 1).await;
+        assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
+        // 实例目录外的文件未被写入，白名单链接被替换为普通文件
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "[]");
+        let md = std::fs::symlink_metadata(ctx.rt.dir.join("whitelist.json")).unwrap();
+        assert!(md.file_type().is_file());
+        assert_eq!(whitelist_names(&ctx.rt), vec!["Steve".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_symlink_target_is_replaced_not_followed() {
+        let ctx = setup("symlink-sidecar").await;
+        write_props(&ctx, "online-mode=false\n");
+        let outside = ctx.root.join("outside-sidecar.json");
+        std::fs::write(&outside, r#"{"schema_version":1}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, ctx.rt.dir.join("whitelist-sync.json")).unwrap();
+
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Steve")]), 1).await;
+        assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), r#"{"schema_version":1}"#);
+        let md = std::fs::symlink_metadata(ctx.rt.dir.join("whitelist-sync.json")).unwrap();
+        assert!(md.file_type().is_file());
     }
 }

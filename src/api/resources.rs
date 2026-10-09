@@ -319,8 +319,16 @@ pub async fn users_action(
         return Err(ApiError::bad_request("IP 地址不合法（例如 192.168.1.10）"));
     }
 
+    let is_whitelist = matches!(req.action.as_str(), "whitelist_add" | "whitelist_remove");
+    let status = *rt.status.lock().await;
+
+    // 启动/停止过程中白名单文件可能被运行时覆盖，保守拒绝人工操作
+    if is_whitelist && matches!(status, Status::Starting | Status::Stopping) {
+        return Err(ApiError::bad_request("实例正在启动或停止，请稍后重试白名单操作"));
+    }
+
     // 服务器运行中：走控制台命令，实时生效
-    if matches!(*rt.status.lock().await, Status::Running | Status::Starting) {
+    if matches!(status, Status::Running | Status::Starting) {
         let cmd = match req.action.as_str() {
             "op" => format!("op {target}"),
             "deop" => format!("deop {target}"),
@@ -342,34 +350,51 @@ pub async fn users_action(
             "pardon_ip" => format!("pardon-ip {target}"),
             _ => unreachable!(),
         };
-        process::send_command(&rt, &cmd).await?;
-        // 人工新增即使条目已存在，也记录人工保留标记，避免后续撤权误删
-        if req.action == "whitelist_add" {
-            let _ = whitelist_sync::mark_manual_retained(&rt, &target).await;
+        if is_whitelist {
+            // 整个白名单人工操作在实例级锁内完成，避免与自动同步交错
+            let _lock = rt.whitelist_sync_lock.lock().await;
+            process::send_command(&rt, &cmd).await?;
+            if req.action == "whitelist_add" {
+                let _ = whitelist_sync::mark_manual_retained_locked(&rt.dir, &target).await;
+            }
+        } else {
+            process::send_command(&rt, &cmd).await?;
         }
         return Ok(Json(json!({ "ok": true, "mode": "command" })));
     }
 
-    // 服务器未运行：直接读写 JSON 文件
+    // 服务器未运行：直接读写 JSON 文件；停止中拒绝，避免被运行时覆盖
+    if status == Status::Stopping {
+        return Err(ApiError::bad_request("实例正在停止，请稍后重试"));
+    }
     let dir = rt.dir.clone();
+    if is_whitelist {
+        // 整个白名单人工操作在实例级锁内完成，避免与自动同步交错
+        let _lock = rt.whitelist_sync_lock.lock().await;
+        let warning = match req.action.as_str() {
+            "whitelist_add" => {
+                let warning = users::add_whitelist(&state, &dir, &target).await?;
+                let _ = whitelist_sync::mark_manual_retained_locked(&dir, &target).await;
+                warning
+            }
+            "whitelist_remove" => {
+                if !users::remove_entry(&dir, "whitelist.json", "name", &target).await? {
+                    return Err(ApiError::bad_request("该玩家不在白名单中"));
+                }
+                None
+            }
+            _ => unreachable!(),
+        };
+        return Ok(Json(json!({ "ok": true, "mode": "file", "warning": warning })));
+    }
+
     let warning = match req.action.as_str() {
         "op" => users::add_op(&state, &dir, &target).await?,
-        "whitelist_add" => {
-            let warning = users::add_whitelist(&state, &dir, &target).await?;
-            let _ = whitelist_sync::mark_manual_retained(&rt, &target).await;
-            warning
-        }
         "ban" => users::add_ban(&state, &dir, &target, reason).await?,
         "ban_ip" => users::add_ban_ip(&dir, &target, reason).await?,
         "deop" => {
             if !users::remove_entry(&dir, "ops.json", "name", &target).await? {
                 return Err(ApiError::bad_request("该玩家不在 OP 列表中"));
-            }
-            None
-        }
-        "whitelist_remove" => {
-            if !users::remove_entry(&dir, "whitelist.json", "name", &target).await? {
-                return Err(ApiError::bad_request("该玩家不在白名单中"));
             }
             None
         }
@@ -647,4 +672,125 @@ pub async fn playtime(
     let rt = get_instance(&state, &id).await?;
     let stats = crate::instance::playtime_snapshot(&rt).await;
     Ok(Json(json!({ "players": stats })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelConfig;
+    use crate::instance::whitelist_sync::{self as wl, SyncStatus};
+    use crate::instance::{InstanceMeta, InstanceRuntime};
+
+    async fn harness(tag: &str) -> (AppState, Arc<InstanceRuntime>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("mcspr-users-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = AppState::new(PanelConfig {
+            data_dir: root.join("data").to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = root.join("inst");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server.properties"), "online-mode=false\n").unwrap();
+        let meta = InstanceMeta {
+            id: "i1".into(),
+            name: "inst".into(),
+            ..Default::default()
+        };
+        let rt = InstanceRuntime::new(meta, dir);
+        state.instances.write().await.insert("i1".into(), rt.clone());
+        (state, rt, root)
+    }
+
+    fn action(name: &str, target: &str) -> UserActionReq {
+        UserActionReq {
+            action: name.into(),
+            target: target.into(),
+            reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_whitelist_add_serializes_against_auto_sync() {
+        let (state, rt, root) = harness("lock").await;
+        // 持有实例锁，模拟自动同步正在执行
+        let guard = rt.whitelist_sync_lock.lock().await;
+        let st2 = state.clone();
+        let task = tokio::spawn(async move {
+            users_action(
+                State(st2),
+                Path("i1".to_string()),
+                Json(action("whitelist_add", "Steve")),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!task.is_finished(), "人工白名单操作必须在实例锁内等待");
+        drop(guard);
+        let res = task.await.unwrap();
+        assert!(res.is_ok(), "{:?}", res.err());
+        let arr = users::read_array_strict(&rt.dir, "whitelist.json").unwrap();
+        assert!(arr.iter().any(|e| e["name"] == "Steve"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn malformed_whitelist_manual_actions_preserve_file() {
+        let (state, rt, root) = harness("malformed").await;
+        let raw = "{ not json";
+        std::fs::write(rt.dir.join("whitelist.json"), raw).unwrap();
+
+        let add = users_action(
+            State(state.clone()),
+            Path("i1".to_string()),
+            Json(action("whitelist_add", "Steve")),
+        )
+        .await;
+        assert!(add.is_err());
+        assert_eq!(std::fs::read_to_string(rt.dir.join("whitelist.json")).unwrap(), raw);
+
+        let remove = users_action(
+            State(state.clone()),
+            Path("i1".to_string()),
+            Json(action("whitelist_remove", "Steve")),
+        )
+        .await;
+        assert!(remove.is_err());
+        assert_eq!(std::fs::read_to_string(rt.dir.join("whitelist.json")).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stopping_instance_rejects_manual_whitelist_file_action() {
+        let (state, rt, root) = harness("stopping").await;
+        *rt.status.lock().await = Status::Stopping;
+        let res = users_action(
+            State(state.clone()),
+            Path("i1".to_string()),
+            Json(action("whitelist_add", "Steve")),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(!rt.dir.join("whitelist.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn manual_add_survives_auto_revoke() {
+        let (state, rt, root) = harness("manual-auto").await;
+        let res = users_action(
+            State(state.clone()),
+            Path("i1".to_string()),
+            Json(action("whitelist_add", "Steve")),
+        )
+        .await;
+        assert!(res.is_ok(), "{:?}", res.err());
+        // 自动同步撤权：人工条目应保留
+        let out = wl::reconcile_instance(&state, &rt, &[], 1).await;
+        assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
+        let arr = users::read_array_strict(&rt.dir, "whitelist.json").unwrap();
+        assert!(arr.iter().any(|e| e["name"] == "Steve"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

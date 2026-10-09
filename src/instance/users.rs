@@ -38,14 +38,16 @@ pub(crate) fn read_array_strict(dir: &Path, file: &str) -> Result<Vec<Value>, St
         .ok_or_else(|| format!("{} 顶层不是数组", path.display()))
 }
 
-/// 原子写入玩家列表 JSON：先写同目录唯一临时文件再 rename 替换，
-/// 写入中断或并发写者不会留下半文件，也不会互相覆盖临时文件。
+/// 原子写入玩家列表 JSON：先写同目录唯一临时文件再 rename 替换。
+/// 目标为符号链接时先移除链接，避免写到实例目录之外。
 pub(crate) async fn write_array_atomic(dir: &Path, file: &str, arr: &[Value]) -> ApiResult<()> {
     let s = serde_json::to_string_pretty(arr)?;
+    let target = dir.join(file);
     let tmp = dir.join(format!("{file}.tmp-{}", uuid::Uuid::new_v4()));
     let result = async {
         tokio::fs::write(&tmp, s).await?;
-        tokio::fs::rename(&tmp, dir.join(file)).await
+        remove_symlink_target(&target).await;
+        tokio::fs::rename(&tmp, &target).await
     }
     .await;
     if let Err(e) = result {
@@ -53,6 +55,15 @@ pub(crate) async fn write_array_atomic(dir: &Path, file: &str, arr: &[Value]) ->
         return Err(e.into());
     }
     Ok(())
+}
+
+/// 若路径是符号链接则先删除，使后续 rename 落在实例目录内。
+pub(crate) async fn remove_symlink_target(path: &Path) {
+    if let Ok(md) = tokio::fs::symlink_metadata(path).await {
+        if md.file_type().is_symlink() {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
 }
 
 /// 合法 Minecraft 玩家名：1-16 位字母、数字或下划线。
@@ -175,7 +186,8 @@ pub async fn add_op(state: &AppState, dir: &Path, name: &str) -> ApiResult<Optio
 }
 
 pub async fn add_whitelist(state: &AppState, dir: &Path, name: &str) -> ApiResult<Option<String>> {
-    let mut arr = read_array(dir, "whitelist.json");
+    // 白名单必须严格解析、原子写入：无法确认现状时拒绝修改，绝不覆盖损坏文件
+    let mut arr = read_array_strict(dir, "whitelist.json").map_err(ApiError::bad_request)?;
     if contains_name(&arr, name) {
         return Ok(Some("该玩家已在白名单中".into()));
     }
@@ -183,7 +195,7 @@ pub async fn add_whitelist(state: &AppState, dir: &Path, name: &str) -> ApiResul
         .await
         .map_err(ApiError::bad_request)?;
     arr.push(json!({ "uuid": uuid, "name": name }));
-    write_array(dir, "whitelist.json", &arr).await?;
+    write_array_atomic(dir, "whitelist.json", &arr).await?;
     Ok(warn)
 }
 
@@ -233,7 +245,13 @@ pub async fn add_ban_ip(dir: &Path, ip: &str, reason: Option<&str>) -> ApiResult
 
 /// 从指定文件中移除条目（按 name 或 ip 匹配），返回是否确实存在并被移除
 pub async fn remove_entry(dir: &Path, file: &str, key: &str, value: &str) -> ApiResult<bool> {
-    let mut arr = read_array(dir, file);
+    // 仅白名单收紧为严格解析 + 原子写入；其余游戏列表保持原有宽松行为
+    let strict = file == "whitelist.json";
+    let mut arr = if strict {
+        read_array_strict(dir, file).map_err(ApiError::bad_request)?
+    } else {
+        read_array(dir, file)
+    };
     let before = arr.len();
     arr.retain(|e| {
         let matches = match key {
@@ -248,7 +266,11 @@ pub async fn remove_entry(dir: &Path, file: &str, key: &str, value: &str) -> Api
     });
     let removed = arr.len() != before;
     if removed {
-        write_array(dir, file, &arr).await?;
+        if strict {
+            write_array_atomic(dir, file, &arr).await?;
+        } else {
+            write_array(dir, file, &arr).await?;
+        }
     }
     Ok(removed)
 }
