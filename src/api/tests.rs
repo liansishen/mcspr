@@ -1663,3 +1663,144 @@ async fn instance_update_override_echoes_and_clears() {
     let (_, body) = call(&h, detail()).await;
     assert!(body["whitelist_identity"].is_null(), "null 应清除覆盖");
 }
+
+#[tokio::test]
+async fn register_requires_initialized_admin() {
+    let h = setup(&[]).await;
+    enable_test_registration(&h).await;
+    // 未创建管理员：注册被明确拒绝，pending 不得占用存储
+    let (status, _) = register_user(&h, "bob", "Bob", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let (status, body) = register_user(&h, "bob", "Bob", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn sensitive_json_routes_reject_oversized_bodies() {
+    let h = setup(&["inst-a"]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+    let big = "x".repeat(9 * 1024);
+
+    let (status, _) = call(
+        &h,
+        req("POST", "/api/accounts")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "username": "bob", "password": "password123", "role": "user", "pad": big })
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (status, _) = call(
+        &h,
+        req("PUT", "/api/instances/inst-a/permissions")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": 1, "user_ids": [], "pad": big }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn credential_endpoints_share_login_rate_bucket_while_register_is_separate() {
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    // 状态查询与登录共用 s: 来源桶：用不同用户名打满来源额度（避开账户桶上限）
+    for i in 0..30 {
+        let (status, _) = call(
+            &h,
+            req("POST", "/api/auth/application/status")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "username": format!("ghost{i}"), "password": "password123" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // 同一来源的登录现在被限流拒绝，证明共享桶
+    let (status, _) = call(
+        &h,
+        req("POST", "/api/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "username": "root", "password": "password123" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // 注册使用独立 reg: 桶，不受凭据来源限流影响
+    enable_test_registration(&h).await;
+    let (status, body) = register_user(&h, "newbie", "Newbie", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn config_import_validates_registration_config() {
+    let _guard = ConfigFileGuard::new();
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+    let data_dir = h.dir.to_string_lossy().to_string();
+
+    // 开启注册但未配置人机验证：与 put_settings 一致地拒绝
+    let (status, _) = call(
+        &h,
+        req("POST", "/api/config/import")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "settings": {
+                        "listen": "127.0.0.1:8080",
+                        "data_dir": data_dir,
+                        "registration_enabled": true
+                    },
+                    "instances": []
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 未开启注册的导入仍然成功
+    let (status, body) = call(
+        &h,
+        req("POST", "/api/config/import")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "settings": {
+                        "listen": "127.0.0.1:8080",
+                        "data_dir": data_dir,
+                        "registration_enabled": false
+                    },
+                    "instances": []
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

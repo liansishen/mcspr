@@ -308,7 +308,7 @@ impl RateLimiter {
     }
 
     /// 原子地检查并计入一次尝试：先清理过期命中，再判断额度，最后计数。
-    /// 达到键上限时不再登记新键（保留既有键的限流，不清空活动限制）。
+    /// 达到键上限且需要登记新键时，先全局清理过期键尝试恢复；仍无空间则失败关闭（拒绝新键）。
     fn reserve_at(&mut self, keys: &[(&str, usize)], now: Instant) -> bool {
         for (k, _) in keys {
             self.trim_at(k, now);
@@ -318,19 +318,38 @@ impl RateLimiter {
                 return false;
             }
         }
+        let needs_new_key = keys.iter().any(|(k, _)| !self.hits.contains_key(*k));
+        if needs_new_key && self.hits.len() >= RATE_MAX_KEYS {
+            self.purge_expired(now);
+            if self.hits.len() >= RATE_MAX_KEYS {
+                return false;
+            }
+        }
         for (k, _) in keys {
             match self.hits.get_mut(*k) {
                 Some(q) => q.push_back(now),
                 None => {
-                    if self.hits.len() < RATE_MAX_KEYS {
-                        let mut q = VecDeque::new();
-                        q.push_back(now);
-                        self.hits.insert((*k).to_string(), q);
-                    }
+                    let mut q = VecDeque::new();
+                    q.push_back(now);
+                    self.hits.insert((*k).to_string(), q);
                 }
             }
         }
         true
+    }
+
+    /// 全局清理过期命中，释放键位以便限流表恢复；窗口内的活动限制保持不变。
+    fn purge_expired(&mut self, now: Instant) {
+        self.hits.retain(|_, q| {
+            while q
+                .front()
+                .map(|t| now.duration_since(*t) > RATE_WINDOW)
+                .unwrap_or(false)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
     }
 
     fn clear(&mut self, key: &str) {
@@ -348,8 +367,6 @@ struct Inner {
     hashing: Arc<Semaphore>,
     /// 全局授权代际：任何账户/授权/游戏名变更都会自增，供白名单同步轮询
     revision: AtomicU64,
-    /// 实例权限修订号：多管理员并发编辑的冲突检测
-    instance_revs: Mutex<HashMap<String, u64>>,
 }
 
 /// 账户与会话存储，克隆共享同一份内存状态。
@@ -411,7 +428,6 @@ impl AuthStore {
                 limiter: Mutex::new(RateLimiter::default()),
                 hashing: Arc::new(Semaphore::new(MAX_HASH_CONCURRENCY)),
                 revision: AtomicU64::new(revision),
-                instance_revs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -517,20 +533,23 @@ impl AuthStore {
         password: &str,
     ) -> Option<(PublicUser, u64)> {
         let username = normalize_username(username);
-        let user = {
-            self.inner
-                .users
-                .read()
-                .await
-                .iter()
-                .find(|u| u.username == username)
-                .cloned()
-        }?;
-        let ok = self.verify_password(&user.password_hash, password).await;
-        if ok && user.enabled {
-            Some((PublicUser::from(&user), user.session_epoch))
-        } else {
-            None
+        let user = self
+            .inner
+            .users
+            .read()
+            .await
+            .iter()
+            .find(|u| u.username == username)
+            .cloned();
+        // 未知账户也执行一次等价的 Argon2 校验，避免通过响应时间枚举账户。
+        let hash = match &user {
+            Some(u) => u.password_hash.clone(),
+            None => dummy_password_hash().to_string(),
+        };
+        let ok = self.verify_password(&hash, password).await;
+        match user {
+            Some(u) if ok && u.enabled => Some((PublicUser::from(&u), u.session_epoch)),
+            _ => None,
         }
     }
 
@@ -549,7 +568,10 @@ impl AuthStore {
                 .find(|u| u.id == user_id)
                 .cloned()
         }?;
-        if !user.enabled || user.session_epoch != expected_epoch {
+        if !user.enabled
+            || user.status != AccountStatus::Approved
+            || user.session_epoch != expected_epoch
+        {
             return None;
         }
         let token = random_token();
@@ -774,6 +796,12 @@ impl AuthStore {
         };
         let created = user.clone();
         self.mutate(|users| {
+            if !users
+                .iter()
+                .any(|u| u.role == Role::Admin && u.enabled && u.status == AccountStatus::Approved)
+            {
+                return Err("面板尚未完成初始化，请先创建管理员".to_string());
+            }
             if users.iter().any(|u| u.username == created.username) {
                 return Err("用户名已存在".to_string());
             }
@@ -1059,54 +1087,59 @@ impl AuthStore {
 
     // ---------- 实例权限 ----------
 
-    /// 实例权限修订号：并发编辑冲突检测（首次访问惰性初始化为 1）。
-    pub async fn instance_permission_revision(&self, instance_id: &str) -> u64 {
-        let mut revs = self.inner.instance_revs.lock().await;
-        *revs.entry(instance_id.to_string()).or_insert(1)
+    /// 权限视图快照：在同一读锁内取得账户列表与当前全局修订号，保证两者一致。
+    pub async fn permission_snapshot(&self) -> (u64, Vec<PublicUser>) {
+        let users = self.inner.users.read().await;
+        let revision = self.revision();
+        let mut list: Vec<PublicUser> = users.iter().map(PublicUser::from).collect();
+        list.sort_by(|a, b| a.username.cmp(&b.username));
+        (revision, list)
+    }
+
+    /// 实例权限修订号：统一采用全局授权代际。任何账户 / 授权变更都会使其自增，
+    /// 因此创建、审批、直接授权等接口产生的权限变更同样会使旧权限快照失效，
+    /// 避免旧快照无声回滚权限（无关写可能导致 409，但不会漏检）。
+    pub async fn instance_permission_revision(&self, _instance_id: &str) -> u64 {
+        self.revision()
     }
 
     /// 原子设置单个实例的授权账户集合：只改动该实例的授权，保留其余实例授权。
     ///
-    /// 修订号必须与当前一致，否则返回冲突错误；成功后该实例修订号自增。
+    /// `expected_revision` 为调用方读取到的全局修订号；与当前不一致则返回冲突错误，
+    /// 避免用陈旧权限快照覆盖其他接口产生的授权变更。成功后返回新的全局修订号。
     pub async fn set_instance_grants_checked(
         &self,
         instance_id: &str,
         expected_revision: u64,
         user_ids: Vec<String>,
     ) -> Result<u64, String> {
-        let mut revs = self.inner.instance_revs.lock().await;
-        let current = *revs.entry(instance_id.to_string()).or_insert(1);
-        if current != expected_revision {
-            return Err("权限已被其他管理员修改，请刷新后重试".to_string());
-        }
         let wanted: HashSet<String> = user_ids
             .into_iter()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         let instance_id = instance_id.to_string();
-        self.mutate(|users| {
-            for id in &wanted {
-                if !users.iter().any(|u| &u.id == id) {
-                    return Err(format!("账户不存在: {id}"));
+        let ((), next) = self
+            .mutate_revision_checked(Some(expected_revision), |users| {
+                for id in &wanted {
+                    if !users.iter().any(|u| &u.id == id) {
+                        return Err(format!("账户不存在: {id}"));
+                    }
                 }
-            }
-            for u in users.iter_mut() {
-                let has = u.instance_ids.iter().any(|i| i == &instance_id);
-                let want = wanted.contains(&u.id);
-                if want && !has {
-                    u.instance_ids.push(instance_id.clone());
-                    u.updated_at = crate::util::now_str();
-                } else if !want && has {
-                    u.instance_ids.retain(|i| i != &instance_id);
-                    u.updated_at = crate::util::now_str();
+                for u in users.iter_mut() {
+                    let has = u.instance_ids.iter().any(|i| i == &instance_id);
+                    let want = wanted.contains(&u.id);
+                    if want && !has {
+                        u.instance_ids.push(instance_id.clone());
+                        u.updated_at = crate::util::now_str();
+                    } else if !want && has {
+                        u.instance_ids.retain(|i| i != &instance_id);
+                        u.updated_at = crate::util::now_str();
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await?;
-        let next = current + 1;
-        revs.insert(instance_id, next);
+                Ok(())
+            })
+            .await?;
         Ok(next)
     }
 
@@ -1190,14 +1223,20 @@ impl AuthStore {
                 .cloned()
         };
         match user {
-            Some(u) if u.enabled && u.session_epoch == session.epoch => Some(Identity {
-                user_id: u.id,
-                username: u.username,
-                role: u.role,
-                instance_ids: u.instance_ids,
-                csrf: session.csrf,
-                session: digest.to_string(),
-            }),
+            Some(u)
+                if u.enabled
+                    && u.status == AccountStatus::Approved
+                    && u.session_epoch == session.epoch =>
+            {
+                Some(Identity {
+                    user_id: u.id,
+                    username: u.username,
+                    role: u.role,
+                    instance_ids: u.instance_ids,
+                    csrf: session.csrf,
+                    session: digest.to_string(),
+                })
+            }
             _ => {
                 self.inner.sessions.lock().await.remove(digest);
                 None
@@ -1223,7 +1262,7 @@ impl AuthStore {
         )
     }
 
-    /// 公开接口（注册 / 状态查询 / 重申）限流：与登录共用限流表但使用独立键前缀。
+    /// 注册接口限流：调用方使用独立 `reg:` 键前缀，与登录 / 状态 / 重申共用的凭据额度隔离。
     pub async fn reserve_public(&self, account_key: &str, source_key: &str) -> bool {
         let mut l = self.inner.limiter.lock().await;
         l.reserve_at(
@@ -1247,7 +1286,27 @@ impl AuthStore {
     where
         F: FnOnce(&mut Vec<User>) -> Result<T, String>,
     {
+        self.mutate_revision_checked(None, f)
+            .await
+            .map(|(out, _)| out)
+    }
+
+    /// 与 [`AuthStore::mutate`] 相同，但在同一写锁内可校验全局修订号，
+    /// 并返回提交后的新修订号；用于权限等需要防止陈旧快照覆盖的写入。
+    async fn mutate_revision_checked<F, T>(
+        &self,
+        expected_revision: Option<u64>,
+        f: F,
+    ) -> Result<(T, u64), String>
+    where
+        F: FnOnce(&mut Vec<User>) -> Result<T, String>,
+    {
         let mut users = self.inner.users.write().await;
+        if let Some(expected) = expected_revision {
+            if self.revision() != expected {
+                return Err("权限已被其他管理员修改，请刷新后重试".to_string());
+            }
+        }
         let mut next = users.clone();
         let out = f(&mut next)?;
         let path = self.inner.path.clone();
@@ -1259,7 +1318,7 @@ impl AuthStore {
             .map_err(|e| format!("持久化任务失败: {e}"))??;
         *users = next;
         self.inner.revision.store(next_revision, Ordering::SeqCst);
-        Ok(out)
+        Ok((out, next_revision))
     }
 
     async fn hash_password(&self, password: &str) -> Result<String, String> {
@@ -1312,6 +1371,19 @@ where
     })
     .await
     .map_err(|e| format!("密码哈希任务失败: {e}"))
+}
+
+/// 未知账户占位校验使用的固定 Argon2 哈希：首次使用时生成一次，
+/// 之后每次只做一次与真实校验成本相当的 verify，避免通过响应时间枚举账户。
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"mcspr-timing-equalizer", &salt)
+            .expect("生成占位密码哈希失败")
+            .to_string()
+    })
 }
 
 pub fn normalize_username(raw: &str) -> String {
@@ -1930,6 +2002,9 @@ mod tests {
     #[tokio::test]
     async fn registration_creates_pending_unique_user() {
         let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
         let pending = s
             .register_pending_user("Alice", "password123", "Steve", "请批准")
             .await
@@ -1955,6 +2030,9 @@ mod tests {
     #[tokio::test]
     async fn name_change_reserves_name_and_revision_guards_approval() {
         let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
         let u = s
             .register_pending_user("alice", "password123", "Alice", "reason")
             .await
@@ -1990,6 +2068,9 @@ mod tests {
     #[tokio::test]
     async fn reject_and_resubmit_bumps_revision() {
         let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
         let u = s
             .register_pending_user("dave", "password123", "Dave", "reason")
             .await
@@ -2050,6 +2131,9 @@ mod tests {
     #[tokio::test]
     async fn approved_named_grants_and_revision_track_changes() {
         let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
         let u = s
             .register_pending_user("alice", "password123", "Alice", "r")
             .await
@@ -2098,6 +2182,7 @@ mod tests {
     #[tokio::test]
     async fn retired_old_name_blocks_register_and_rebind_until_released() {
         let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![]).await.unwrap();
         let u = s
             .register_pending_user("alice", "password123", "Alice", "r")
             .await
@@ -2158,5 +2243,96 @@ mod tests {
             .register_pending_user("carol", "password123", "Alice", "x")
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn registration_requires_approved_admin() {
+        let (s, _dir) = store().await;
+        // 尚无已批准管理员：注册被拒，避免 pending 占存储锁死首次管理员 CLI
+        assert!(s
+            .register_pending_user("alice", "password123", "Alice", "r")
+            .await
+            .is_err());
+        assert!(!s.has_users().await, "被拒的注册不得占用存储");
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
+        assert!(s
+            .register_pending_user("alice", "password123", "Alice", "r")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn start_session_and_identity_require_approval() {
+        let (s, _dir) = store().await;
+        s.create_user("root", "password123", Role::Admin, vec![])
+            .await
+            .unwrap();
+        let pending = s
+            .register_pending_user("alice", "password123", "Alice", "r")
+            .await
+            .unwrap();
+        assert_eq!(pending.status, AccountStatus::Pending);
+        // 待审批账户不能创建会话
+        assert!(s.start_session(&pending.id, 0).await.is_none());
+        s.approve_application(&pending.id, 1, vec![], "root")
+            .await
+            .unwrap();
+        let (token, _) = s.start_session(&pending.id, 0).await.unwrap();
+        assert!(s.session_identity(&token).await.is_some());
+        // 会话建立后再回到非批准状态：身份解析必须拒绝并撤销会话
+        {
+            let mut users = s.inner.users.write().await;
+            let u = users.iter_mut().find(|u| u.id == pending.id).unwrap();
+            u.status = AccountStatus::Pending;
+        }
+        assert!(s.session_identity(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn instance_permission_revision_invalidated_by_other_grants() {
+        let (s, _dir) = store().await;
+        let bob = s
+            .create_user("bob", "password123", Role::User, vec![])
+            .await
+            .unwrap();
+        let stale = s.instance_permission_revision("inst-a").await;
+        // 通过其他接口（直接授权）修改同一实例的权限
+        s.set_instances(&bob.id, vec!["inst-a".to_string()])
+            .await
+            .unwrap();
+        // 旧权限快照不再有效，避免无声回滚
+        let err = s
+            .set_instance_grants_checked("inst-a", stale, vec![])
+            .await
+            .unwrap_err();
+        assert!(err.contains("已被其他管理员修改"));
+        let after = s.get(&bob.id).await.unwrap();
+        assert!(after.instance_ids.iter().any(|i| i == "inst-a"));
+    }
+
+    #[tokio::test]
+    async fn unknown_user_verification_uses_valid_dummy_hash() {
+        let (s, _dir) = store().await;
+        assert!(s.verify_credentials("ghost", "password123").await.is_none());
+        assert!(PasswordHash::new(dummy_password_hash()).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_fails_closed_and_recovers() {
+        let mut l = RateLimiter::default();
+        let now = Instant::now();
+        for i in 0..RATE_MAX_KEYS {
+            assert!(l.reserve_at(&[(format!("k{i}").as_str(), RATE_MAX_PER_ACCOUNT)], now));
+        }
+        assert_eq!(l.hits.len(), RATE_MAX_KEYS);
+        // 达到上限后新键失败关闭（不再放行）
+        assert!(!l.reserve_at(&[("fresh", RATE_MAX_PER_ACCOUNT)], now));
+        assert!(!l.hits.contains_key("fresh"));
+        // 窗口过期后全局清理，新键可重新登记
+        let later = now + RATE_WINDOW + Duration::from_secs(1);
+        assert!(l.reserve_at(&[("fresh", RATE_MAX_PER_ACCOUNT)], later));
+        assert_eq!(l.hits.len(), 1);
     }
 }

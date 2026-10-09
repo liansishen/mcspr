@@ -34,8 +34,7 @@ async fn whitelist_enabled(state: &AppState, id: &str) -> bool {
 }
 
 async fn build_view(state: &AppState, id: &str) -> Value {
-    let revision = state.auth.instance_permission_revision(id).await;
-    let users = state.auth.list().await;
+    let (revision, users) = state.auth.permission_snapshot().await;
     let list: Vec<Value> = users
         .iter()
         .map(|u| {

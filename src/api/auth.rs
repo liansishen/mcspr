@@ -234,6 +234,13 @@ pub async fn register(
     if !enabled {
         return super::api_error(StatusCode::FORBIDDEN, "注册暂未开放");
     }
+    // 未创建管理员时不允许注册：pending 申请不得占用存储，避免首次管理员 CLI 被锁死。
+    if !state.auth.has_users().await {
+        return super::api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "面板尚未完成初始化，请先创建管理员",
+        );
+    }
     let attempted = crate::auth::normalize_username(&req.username);
     let account_key = format!("reg:u:{attempted}");
     let src = format!("reg:s:{}", peer_key(peer));
@@ -293,9 +300,9 @@ pub async fn application_status(
         return super::api_error(StatusCode::FORBIDDEN, "请求来源不受信任");
     }
     let attempted = crate::auth::normalize_username(&req.username);
-    let account_key = format!("status:u:{attempted}");
-    let src = format!("status:s:{}", peer_key(peer));
-    if !state.auth.reserve_public(&account_key, &src).await {
+    let account_key = format!("u:{attempted}");
+    let src = format!("s:{}", peer_key(peer));
+    if !state.auth.reserve_login(&account_key, &src).await {
         return super::api_error(StatusCode::TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
     }
     let Some((user, _epoch)) = state
@@ -346,9 +353,9 @@ pub async fn application_resubmit(
         captcha::TurnstileSettings::from_config(&c)
     };
     let attempted = crate::auth::normalize_username(&req.username);
-    let account_key = format!("resub:u:{attempted}");
-    let src = format!("resub:s:{}", peer_key(peer));
-    if !state.auth.reserve_public(&account_key, &src).await {
+    let account_key = format!("u:{attempted}");
+    let src = format!("s:{}", peer_key(peer));
+    if !state.auth.reserve_login(&account_key, &src).await {
         return super::api_error(StatusCode::TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
     }
     let Some((user, _epoch)) = state

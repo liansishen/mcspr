@@ -51,7 +51,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
-        .route("/auth/password", put(auth::password))
+        .route("/auth/password", put(auth::password).layer(DefaultBodyLimit::max(8 * 1024)))
         .route("/auth/registration-config", get(auth::registration_config))
         .route(
             "/auth/register",
@@ -68,19 +68,41 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/profile", get(auth::profile))
         .route(
             "/auth/minecraft-name-requests",
-            post(auth::create_name_request),
+            post(auth::create_name_request).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
             "/auth/minecraft-name-requests/{id}",
-            delete(auth::delete_name_request),
+            delete(auth::delete_name_request).layer(DefaultBodyLimit::max(8 * 1024)),
         )
-        .route("/accounts", get(accounts::list).post(accounts::create))
-        .route("/accounts/{id}", patch(accounts::patch).delete(accounts::remove))
-        .route("/accounts/{id}/password", put(accounts::reset_password))
-        .route("/accounts/{id}/instances", put(accounts::set_instances))
+        .route(
+            "/accounts",
+            get(accounts::list)
+                .post(accounts::create)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/accounts/{id}",
+            patch(accounts::patch)
+                .delete(accounts::remove)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/accounts/{id}/password",
+            put(accounts::reset_password).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/accounts/{id}/instances",
+            put(accounts::set_instances).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route("/applications", get(applications::list))
-        .route("/applications/{id}/approve", post(applications::approve))
-        .route("/applications/{id}/reject", post(applications::reject))
+        .route(
+            "/applications/{id}/approve",
+            post(applications::approve).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/applications/{id}/reject",
+            post(applications::reject).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route("/announcements/preview", post(announcement::preview))
         .route("/stats", get(instances::stats))
         .route("/instances", get(instances::list).post(instances::create))
@@ -122,7 +144,9 @@ pub fn router(state: AppState) -> Router {
         .route("/instances/{id}/users/action", post(resources::users_action))
         .route(
             "/instances/{id}/permissions",
-            get(permissions::get).put(permissions::put),
+            get(permissions::get)
+                .put(permissions::put)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route("/instances/{id}/mods", get(resources::mods_list))
         .route("/instances/{id}/mods/toggle", post(resources::mods_toggle))
@@ -577,11 +601,7 @@ async fn put_settings(
         cfg.turnstile_test_mode = v;
     }
     // 开启注册前必须完成有效的人机验证配置（失败关闭）
-    if cfg.registration_enabled {
-        crate::captcha::TurnstileSettings::from_config(&cfg)
-            .is_configured()
-            .map_err(|e| ApiError::bad_request(e))?;
-    }
+    validate_registration_config(&cfg)?;
     config::save(&cfg)?;
     *state.config.write().await = cfg;
     // 控制台缓存上限对运行中的实例立即生效
@@ -771,6 +791,17 @@ fn redact_secrets(cfg: &mut crate::config::PanelConfig) {
     cfg.turnstile_secret_key = String::new();
 }
 
+/// 注册配置校验：开启注册时人机验证必须配置有效（失败关闭）。
+/// `put_settings` 与 `config_import` 共用，避免导入配置绕过注册校验。
+fn validate_registration_config(cfg: &crate::config::PanelConfig) -> Result<(), ApiError> {
+    if cfg.registration_enabled {
+        crate::captcha::TurnstileSettings::from_config(cfg)
+            .is_configured()
+            .map_err(ApiError::bad_request)?;
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct ConfigImport {
     settings: Option<crate::config::PanelConfig>,
@@ -782,28 +813,14 @@ async fn config_import(
     State(state): State<AppState>,
     Json(data): Json<ConfigImport>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if let Some(cfg) = &data.settings {
+    let ConfigImport { settings, instances } = data;
+    let mut settings = settings;
+    // 先合并机密字段并做与 put_settings 相同的注册配置校验，
+    // 避免非法设置写入磁盘后才失败，或绕过注册校验。
+    if let Some(cfg) = settings.as_mut() {
         if cfg.listen.trim().is_empty() {
             return Err(ApiError::bad_request("导入的 settings 缺少 listen"));
         }
-    }
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let mut imported = 0u32;
-    for meta in &data.instances {
-        if meta.id.is_empty() {
-            continue;
-        }
-        let dir = state.config.read().await.instances_dir().join(&meta.id);
-        std::fs::create_dir_all(&dir).ok();
-        let json_path = dir.join("instance.json");
-        if json_path.exists() {
-            let _ = std::fs::rename(&json_path, dir.join(format!("instance.json.bak-{ts}")));
-        }
-        std::fs::write(&json_path, serde_json::to_string_pretty(meta)?).ok();
-        imported += 1;
-    }
-    let mut note = String::new();
-    if let Some(mut cfg) = data.settings {
         // 脱敏导出的机密字段为空时保留现值，避免导入清除密钥
         {
             let current = state.config.read().await;
@@ -820,6 +837,25 @@ async fn config_import(
                 cfg.turnstile_secret_key = current.turnstile_secret_key.clone();
             }
         }
+        validate_registration_config(cfg)?;
+    }
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut imported = 0u32;
+    for meta in &instances {
+        if meta.id.is_empty() {
+            continue;
+        }
+        let dir = state.config.read().await.instances_dir().join(&meta.id);
+        std::fs::create_dir_all(&dir).ok();
+        let json_path = dir.join("instance.json");
+        if json_path.exists() {
+            let _ = std::fs::rename(&json_path, dir.join(format!("instance.json.bak-{ts}")));
+        }
+        std::fs::write(&json_path, serde_json::to_string_pretty(meta)?).ok();
+        imported += 1;
+    }
+    let mut note = String::new();
+    if let Some(cfg) = settings {
         let cfg_path = std::path::Path::new("config.toml");
         if cfg_path.exists() {
             let _ = std::fs::copy(cfg_path, std::path::Path::new(&format!("config.toml.bak-{ts}")));
