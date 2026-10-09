@@ -145,7 +145,11 @@ pub fn reserve(
     fingerprint: &str,
 ) -> Result<Reserve, ReserveError> {
     {
-        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(op) = map.get(id) {
             if op.principal != principal {
                 return Ok(Reserve::PrincipalConflict);
@@ -159,8 +163,21 @@ pub fn reserve(
         if map.len() >= MAX_OPERATIONS {
             prune(&mut map);
         }
-        if map.len() >= MAX_OPERATIONS {
-            return Err(ReserveError::Capacity);
+        while map.len() >= MAX_OPERATIONS {
+            let oldest = map
+                .values()
+                .filter(|op| op.status != "pending")
+                .min_by(|a, b| {
+                    a.updated_at
+                        .cmp(&b.updated_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+                .map(|op| op.id.clone());
+            if let Some(oldest) = oldest {
+                map.remove(&oldest);
+            } else {
+                return Err(ReserveError::Capacity);
+            }
         }
         let ts = now_iso();
         map.insert(
@@ -203,7 +220,11 @@ pub fn complete(
     job_id: Option<String>,
 ) {
     {
-        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(op) = map.get_mut(id) {
             op.status = if status_code >= 400 { "error" } else { "done" }.into();
             op.status_code = status_code;
@@ -217,7 +238,11 @@ pub fn complete(
     }
     if let Err(e) = persist(state) {
         // 不虚报可靠存储：标记未落盘，重启后该编号只会被视为中断
-        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(op) = map.get_mut(id) {
             op.durable = false;
         }
@@ -227,7 +252,11 @@ pub fn complete(
 
 /// 查询操作；普通账户仅能查询自己的操作。
 pub fn lookup(state: &AppState, id: &str, principal: &str, admin: bool) -> Option<Operation> {
-    let map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+    let map = state
+        .operations
+        .map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     map.get(id)
         .filter(|op| admin || op.principal == principal)
         .cloned()
@@ -235,7 +264,11 @@ pub fn lookup(state: &AppState, id: &str, principal: &str, admin: bool) -> Optio
 
 /// 按任务编号查找已登记的操作（用于失败任务重试时解除旧编号）。
 pub fn find_by_job(state: &AppState, job_id: &str) -> Option<Operation> {
-    let map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+    let map = state
+        .operations
+        .map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     map.values()
         .find(|op| op.job_id.as_deref() == Some(job_id))
         .cloned()
@@ -244,7 +277,11 @@ pub fn find_by_job(state: &AppState, job_id: &str) -> Option<Operation> {
 /// 删除一条操作登记（显式重试时解除旧编号的幂等绑定）。
 pub fn forget(state: &AppState, id: &str) -> bool {
     let removed = {
-        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         map.remove(id).is_some()
     };
     if removed {
@@ -268,7 +305,11 @@ pub fn restore(state: &AppState) -> Result<(), String> {
     let saved = serde_json::from_str::<HashMap<String, Operation>>(&text)
         .map_err(|e| format!("操作账本损坏，拒绝启动以免丢失幂等记录: {e}"))?;
     let ts = now_iso();
-    let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = state
+        .operations
+        .map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     for (id, mut op) in saved {
         if op.status == "pending" {
             op.status = "interrupted".into();
@@ -284,17 +325,21 @@ pub fn restore(state: &AppState) -> Result<(), String> {
 
 /// 快照 + 写入在 `persist_lock` 内串行，避免迟到旧快照覆盖新快照。
 fn persist(state: &AppState) -> Result<(), String> {
-    let _guard = state
-        .persist_lock
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = state.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
     let json = {
-        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         prune(&mut map);
         serde_json::to_string(&*map).map_err(|e| e.to_string())?
     };
-    crate::jobs::write_private(&state.operations.dir.join("operations.json"), json.as_bytes())
-        .map_err(|e| e.to_string())
+    crate::jobs::write_private(
+        &state.operations.dir.join("operations.json"),
+        json.as_bytes(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// 只裁剪终态记录：过期的、以及超出上限的最旧终态记录；pending 永不驱逐。
@@ -397,7 +442,8 @@ mod tests {
     use crate::config::PanelConfig;
 
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mcspr-ops-test-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("mcspr-ops-test-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = PanelConfig {
             data_dir: dir.to_string_lossy().to_string(),
@@ -411,7 +457,14 @@ mod tests {
     #[tokio::test]
     async fn reserve_replays_same_content_and_conflicts_on_change() {
         let (state, dir) = test_state("reserve").await;
-        let fp1 = fingerprint(&state, "u1", "POST", "/api/instances/x/start", "", Some(b"{}"));
+        let fp1 = fingerprint(
+            &state,
+            "u1",
+            "POST",
+            "/api/instances/x/start",
+            "",
+            Some(b"{}"),
+        );
         assert!(matches!(
             reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp1).unwrap(),
             Reserve::Reserved
@@ -422,7 +475,14 @@ mod tests {
             Reserve::Replay(_)
         ));
         // 相同编号 + 不同内容：冲突
-        let fp2 = fingerprint(&state, "u1", "POST", "/api/instances/x/start", "", Some(b"{\"a\":1}"));
+        let fp2 = fingerprint(
+            &state,
+            "u1",
+            "POST",
+            "/api/instances/x/start",
+            "",
+            Some(b"{\"a\":1}"),
+        );
         assert!(matches!(
             reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp2).unwrap(),
             Reserve::Conflict
@@ -440,7 +500,13 @@ mod tests {
         let (state, dir) = test_state("complete").await;
         let fp = fingerprint(&state, "u1", "POST", "/api/instances", "", Some(b"{}"));
         let _ = reserve(&state, "op-2", "u1", "POST", "/api/instances", &fp).unwrap();
-        complete(&state, "op-2", 200, Some(serde_json::json!({"ok": true})), Some("job-9".into()));
+        complete(
+            &state,
+            "op-2",
+            200,
+            Some(serde_json::json!({"ok": true})),
+            Some("job-9".into()),
+        );
         let op = lookup(&state, "op-2", "u1", false).unwrap();
         assert_eq!(op.status, "done");
         assert!(op.durable, "成功落盘后应标记 durable");
@@ -513,11 +579,18 @@ mod tests {
             response: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            finished_at: if status == "pending" { None } else { Some(ts.clone()) },
+            finished_at: if status == "pending" {
+                None
+            } else {
+                Some(ts.clone())
+            },
             durable: status != "pending",
         };
         for i in 0..50 {
-            map.insert(format!("pending-{i}"), make(&format!("pending-{i}"), "pending"));
+            map.insert(
+                format!("pending-{i}"),
+                make(&format!("pending-{i}"), "pending"),
+            );
         }
         for i in 0..(MAX_OPERATIONS + 10) {
             map.insert(format!("done-{i}"), make(&format!("done-{i}"), "done"));
@@ -527,6 +600,31 @@ mod tests {
         assert_eq!(pending, 50, "pending 记录不得被裁剪");
         let terminal = map.values().filter(|op| op.status != "pending").count();
         assert!(terminal <= MAX_OPERATIONS, "终态记录应有界: {terminal}");
+    }
+
+    #[tokio::test]
+    async fn full_terminal_history_allows_new_operations() {
+        let (state, dir) = test_state("terminal-capacity").await;
+        reserve(&state, "seed", "u1", "POST", "/api/x", "fp").unwrap();
+        complete(&state, "seed", 200, None, None);
+        let template = lookup(&state, "seed", "u1", false).unwrap();
+        {
+            let mut map = state.operations.map.lock().unwrap();
+            map.clear();
+            for i in 0..MAX_OPERATIONS {
+                let mut operation = template.clone();
+                operation.id = format!("old-{i}");
+                map.insert(operation.id.clone(), operation);
+            }
+        }
+        assert!(matches!(
+            reserve(&state, "new", "u1", "POST", "/api/x", "fp").unwrap(),
+            Reserve::Reserved
+        ));
+        assert_eq!(state.operations.map.lock().unwrap().len(), MAX_OPERATIONS);
+        assert!(lookup(&state, "new", "u1", false).is_some());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

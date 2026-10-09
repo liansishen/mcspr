@@ -37,7 +37,10 @@ pub async fn list(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_LIMIT)
         .clamp(1, MAX_LIMIT);
-    let offset = q.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let offset = q
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let admin = identity.is_admin();
     let mut jobs: Vec<Job> = crate::jobs::all(&state)
         .into_iter()
@@ -164,7 +167,14 @@ fn redact_line(line: &str) -> String {
 
 fn looks_like_path(tok: &str) -> bool {
     let t = tok.trim_matches(|c: char| {
-        c == '"' || c == '\'' || c == '(' || c == ')' || c == '（' || c == '）' || c == ',' || c == '，'
+        c == '"'
+            || c == '\''
+            || c == '('
+            || c == ')'
+            || c == '（'
+            || c == '）'
+            || c == ','
+            || c == '，'
     });
     if t.len() > 2 && t.contains('\\') {
         return true;
@@ -225,7 +235,10 @@ pub async fn operation_get(
 /// 4. 首次请求在副作用前登记，处理在独立任务中执行，客户端断连不影响结果登记。
 pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    if !matches!(method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
+    if !matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
         return next.run(req).await;
     }
     // 公开路由（登录等）不参与幂等，避免无意中包裹凭据接口
@@ -254,7 +267,12 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let mime = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = ctype
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let is_json = mime == "application/json";
     let is_multipart = mime == "multipart/form-data";
 
@@ -347,7 +365,6 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         &fingerprint,
     ) {
         Ok(crate::operations::Reserve::Reserved) => {
-            // 统一任务中心：为本次写操作登记任务（尽力而为，失败不阻断请求）
             let (kind, title, inst) = op_meta(&method, &path);
             let op_job = match crate::jobs::create_job(
                 &state,
@@ -361,8 +378,11 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
             ) {
                 Ok(id) => Some(id),
                 Err(e) => {
-                    tracing::warn!("操作任务登记失败: {e}");
-                    None
+                    tracing::warn!(%e, "操作任务登记失败");
+                    remove_spool(spool).await;
+                    let result = serde_json::json!({"error": "任务登记暂不可用，请稍后重试"});
+                    crate::operations::complete(&state, &op_id, 503, Some(result.clone()), None);
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(result)).into_response();
                 }
             };
             // 在独立任务中执行：客户端断连、请求 future 被丢弃时仍会完成并登记结果
@@ -375,15 +395,22 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
                 actor: crate::audit::AuditActor::from_identity(&identity),
             };
             let handle = tokio::spawn(async move {
-                execute_and_record(task_state, task_op, op_job, principal, audit, spool, next.run(req))
-                    .await
+                execute_and_record(
+                    task_state,
+                    task_op,
+                    op_job,
+                    principal,
+                    audit,
+                    spool,
+                    next.run(req),
+                )
+                .await
             });
             match handle.await {
                 Ok(resp) => resp,
-                Err(_) => super::api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "操作执行任务异常终止",
-                ),
+                Err(_) => {
+                    super::api_error(StatusCode::INTERNAL_SERVER_ERROR, "操作执行任务异常终止")
+                }
             }
         }
         Ok(crate::operations::Reserve::Replay(op)) => {
@@ -643,9 +670,7 @@ async fn spool_multipart(
                     .join(format!("upload-{}.spool", uuid::Uuid::new_v4()));
                 let mut f = match tokio::fs::File::create(&path).await {
                     Ok(f) => f,
-                    Err(e) => {
-                        return Err(ApiError::internal(format!("创建上传缓存失败: {e}")))
-                    }
+                    Err(e) => return Err(ApiError::internal(format!("创建上传缓存失败: {e}"))),
                 };
                 if let Err(e) = f.write_all(&mem).await {
                     let _ = tokio::fs::remove_file(&path).await;
@@ -683,9 +708,7 @@ async fn spool_multipart(
         }
     } else {
         let bytes = Bytes::from(mem.clone());
-        let stream = futures_util::stream::once(async move {
-            Ok::<Bytes, std::io::Error>(bytes)
-        });
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(bytes) });
         multipart_logical_fingerprint(stream, boundary).await?
     };
     let spooled = match spool_path {
@@ -703,10 +726,7 @@ async fn cleanup_err(spool_path: &mut Option<PathBuf>, err: ApiError) -> ApiErro
     err
 }
 
-async fn multipart_logical_fingerprint<S>(
-    stream: S,
-    boundary: String,
-) -> Result<String, ApiError>
+async fn multipart_logical_fingerprint<S>(stream: S, boundary: String) -> Result<String, ApiError>
 where
     S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
@@ -815,7 +835,11 @@ mod tests {
             name: format!("inst-{id}"),
             ..Default::default()
         };
-        std::fs::write(dir.join("instance.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("instance.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
         let rt = InstanceRuntime::new(meta, dir);
         state.instances.write().await.insert(id.to_string(), rt);
     }
@@ -862,7 +886,10 @@ mod tests {
     }
 
     async fn call(h: &Harness, request: Request<Body>) -> (StatusCode, Value) {
-        let resp = crate::api::router(h.state.clone()).oneshot(request).await.unwrap();
+        let resp = crate::api::router(h.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let value = if bytes.is_empty() {
@@ -911,6 +938,28 @@ mod tests {
         assert_eq!(s2, StatusCode::OK, "{b2}");
         assert_eq!(b1["id"], b2["id"], "重放应返回同一结果");
         assert_eq!(instance_count(&h, &cookie).await, 1, "只应产生一次副作用");
+    }
+
+    #[tokio::test]
+    async fn failed_task_admission_prevents_mutation() {
+        for full in [true, false] {
+            let h = setup().await;
+            create_user(&h, "root", Role::Admin, &[]).await;
+            let (cookie, csrf) = login(&h, "root").await;
+            if full {
+                let mut map = h.state.jobs.lock().unwrap();
+                for i in 0..crate::jobs::MAX_ACTIVE_JOBS {
+                    let id = format!("active-{i}");
+                    map.insert(id.clone(), crate::jobs::Job::new(id));
+                }
+            } else {
+                std::fs::create_dir(h.state.tasks_dir.join("jobs.json")).unwrap();
+            }
+            let (status, body) =
+                call(&h, create_body("blocked", &cookie, &csrf, "op-blocked")).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(instance_count(&h, &cookie).await, 0);
+        }
     }
 
     #[tokio::test]
@@ -1031,7 +1080,13 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "不可读取他人任务");
     }
 
-    fn multipart_field(body: &mut Vec<u8>, boundary: &str, name: &str, filename: &str, data: &[u8]) {
+    fn multipart_field(
+        body: &mut Vec<u8>,
+        boundary: &str,
+        name: &str,
+        filename: &str,
+        data: &[u8],
+    ) {
         body.extend_from_slice(
             format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
@@ -1056,7 +1111,10 @@ mod tests {
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
         let request = req("POST", "/api/instances/test/mods/upload")
-            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
             .header(header::COOKIE, &cookie)
             .header("x-csrf-token", &csrf)
             .body(Body::from(body))
@@ -1095,7 +1153,10 @@ mod tests {
         multipart_field(&mut body, boundary, "file", filename, data);
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         req("POST", "/api/instances/test/mods/upload")
-            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
             .header(header::COOKIE, cookie)
             .header("x-csrf-token", csrf)
             .header("x-operation-id", "op-mp")
@@ -1111,15 +1172,27 @@ mod tests {
         let (cookie, csrf) = login(&h, "root").await;
 
         // 相同逻辑文件、不同 boundary：应重放，而不是静默当成新上传
-        let (s1, b1) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-A", "a.jar", b"DATA1")).await;
+        let (s1, b1) = call(
+            &h,
+            mods_upload_req(&cookie, &csrf, "BOUND-A", "a.jar", b"DATA1"),
+        )
+        .await;
         assert_eq!(s1, StatusCode::OK, "{b1}");
         assert_eq!(b1["saved"], json!(["a.jar"]));
-        let (s2, b2) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-B", "a.jar", b"DATA1")).await;
+        let (s2, b2) = call(
+            &h,
+            mods_upload_req(&cookie, &csrf, "BOUND-B", "a.jar", b"DATA1"),
+        )
+        .await;
         assert_eq!(s2, StatusCode::OK, "{b2}");
         assert_eq!(b2["saved"], json!(["a.jar"]));
 
         // 相同编号、不同内容：冲突
-        let (s3, b3) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-C", "a.jar", b"DIFFERENT")).await;
+        let (s3, b3) = call(
+            &h,
+            mods_upload_req(&cookie, &csrf, "BOUND-C", "a.jar", b"DIFFERENT"),
+        )
+        .await;
         assert_eq!(s3, StatusCode::CONFLICT, "{b3}");
 
         // 无残留临时文件
@@ -1143,8 +1216,10 @@ mod tests {
     #[tokio::test]
     async fn accepted_operation_completes_when_outer_request_dropped() {
         let h = setup().await;
-        let fp = crate::operations::fingerprint(&h.state, "u1", "POST", "/api/slow", "", Some(b"{}"));
-        let _ = crate::operations::reserve(&h.state, "op-drop", "u1", "POST", "/api/slow", &fp).unwrap();
+        let fp =
+            crate::operations::fingerprint(&h.state, "u1", "POST", "/api/slow", "", Some(b"{}"));
+        let _ = crate::operations::reserve(&h.state, "op-drop", "u1", "POST", "/api/slow", &fp)
+            .unwrap();
         let handle = tokio::spawn(execute_and_record(
             h.state.clone(),
             "op-drop".into(),
@@ -1184,8 +1259,10 @@ mod tests {
         )
         .unwrap();
         crate::jobs::finish_job(&h.state, &job, Some("boom".into()), None);
-        let fp = crate::operations::fingerprint(&h.state, &admin, "POST", "/api/x", "", Some(b"{}"));
-        let _ = crate::operations::reserve(&h.state, "op-retry", &admin, "POST", "/api/x", &fp).unwrap();
+        let fp =
+            crate::operations::fingerprint(&h.state, &admin, "POST", "/api/x", "", Some(b"{}"));
+        let _ = crate::operations::reserve(&h.state, "op-retry", &admin, "POST", "/api/x", &fp)
+            .unwrap();
         crate::operations::complete(
             &h.state,
             "op-retry",
@@ -1206,7 +1283,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["manual"], true);
-        assert_eq!(body["reuse_operation_id"], true, "失败任务的旧操作编号应被解除");
+        assert_eq!(
+            body["reuse_operation_id"], true,
+            "失败任务的旧操作编号应被解除"
+        );
         assert!(
             crate::operations::lookup(&h.state, "op-retry", &admin, true).is_none(),
             "旧编号应可重新执行"
