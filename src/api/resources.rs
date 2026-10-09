@@ -61,6 +61,7 @@ pub async fn mods_upload(
     let dir = mods::mods_dir(&rt).await;
     tokio::fs::create_dir_all(&dir).await?;
     let mut saved = Vec::new();
+    let mut failed = Vec::new();
     while let Some(mut field) = multipart.next_field().await? {
         if field.name() != Some("file") {
             continue;
@@ -69,21 +70,25 @@ pub async fn mods_upload(
         let clean = fname.replace('\\', "/");
         let clean = clean.rsplit('/').next().unwrap_or("").to_string();
         if !clean.ends_with(".jar") {
-            return Err(ApiError::bad_request("仅支持 .jar 文件"));
+            failed.push(json!({ "name": clean, "error": "仅支持 .jar 文件" }));
+            continue;
         }
-        let safe = clean_file_name(&clean)?;
-        let path = dir.join(&safe);
-        let mut file = tokio::fs::File::create(&path).await?;
-        while let Some(chunk) = field.chunk().await? {
-            file.write_all(&chunk).await?;
+        let safe = match clean_file_name(&clean) {
+            Ok(s) => s,
+            Err(e) => {
+                failed.push(json!({ "name": clean, "error": e.to_string() }));
+                continue;
+            }
+        };
+        match stage_upload(&dir, &safe, &mut field).await {
+            Ok(()) => saved.push(safe),
+            Err(e) => failed.push(json!({ "name": safe, "error": e })),
         }
-        file.flush().await?;
-        saved.push(safe);
     }
-    if saved.is_empty() {
+    if saved.is_empty() && failed.is_empty() {
         return Err(ApiError::bad_request("未收到文件"));
     }
-    Ok(Json(json!({ "ok": true, "saved": saved })))
+    Ok(Json(json!({ "ok": !saved.is_empty(), "saved": saved, "failed": failed })))
 }
 
 fn clean_file_name(name: &str) -> ApiResult<String> {
@@ -91,6 +96,32 @@ fn clean_file_name(name: &str) -> ApiResult<String> {
         return Err(ApiError::bad_request("非法文件名"));
     }
     Ok(name.to_string())
+}
+
+/// 上传落盘：先写同目录临时文件，成功后原子重命名，避免半截文件；
+/// 失败时清理临时文件。
+pub(crate) async fn stage_upload(
+    dir: &std::path::Path,
+    name: &str,
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<(), String> {
+    let tmp = dir.join(format!(".upload-{}.tmp", uuid::Uuid::new_v4()));
+    let result: Result<(), String> = async {
+        let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
+        while let Some(chunk) = field.chunk().await.map_err(|e| e.to_string())? {
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        }
+        file.flush().await.map_err(|e| e.to_string())?;
+        drop(file);
+        tokio::fs::rename(&tmp, dir.join(name))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 // ---------- 文件管理 ----------
@@ -197,25 +228,24 @@ pub async fn files_upload(
         return Err(ApiError::bad_request("目标目录不存在"));
     }
     let mut saved = Vec::new();
+    let mut failed = Vec::new();
     while let Some(mut field) = multipart.next_field().await? {
         let Some(fname) = field.file_name() else { continue };
         let clean = fname.replace('\\', "/");
         let clean = clean.rsplit('/').next().unwrap_or("").to_string();
         if clean.is_empty() || clean.contains("..") {
+            failed.push(json!({ "name": clean, "error": "非法文件名" }));
             continue;
         }
-        let target = dir.join(&clean);
-        let mut file = tokio::fs::File::create(&target).await?;
-        while let Some(chunk) = field.chunk().await? {
-            file.write_all(&chunk).await?;
+        match stage_upload(&dir, &clean, &mut field).await {
+            Ok(()) => saved.push(clean),
+            Err(e) => failed.push(json!({ "name": clean, "error": e })),
         }
-        file.flush().await?;
-        saved.push(clean);
     }
-    if saved.is_empty() {
+    if saved.is_empty() && failed.is_empty() {
         return Err(ApiError::bad_request("未收到文件"));
     }
-    Ok(Json(json!({ "ok": true, "saved": saved })))
+    Ok(Json(json!({ "ok": !saved.is_empty(), "saved": saved, "failed": failed })))
 }
 
 pub async fn jars(

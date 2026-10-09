@@ -8,6 +8,7 @@ mod error;
 mod instance;
 mod java_scan;
 mod jobs;
+mod operations;
 mod rcon;
 mod state;
 mod util;

@@ -1,15 +1,15 @@
 //! 体验增强端点：控制台下载 / 克隆 / 重装 / 图标 / 文件下载与打包解压 / 世界管理 / 计划任务 / 配置直达
 
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::instance::{files, get_instance, properties, InstanceMeta, InstanceRuntime};
 use crate::state::AppState;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Extension, Multipart, Path, Query, State};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path as StdPath;
-use tokio::io::AsyncWriteExt;
 
 // ---------- 控制台日志下载 ----------
 
@@ -169,6 +169,7 @@ fn bool_true3() -> bool {
 pub async fn reinstall(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
     Json(req): Json<ReinstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
@@ -201,11 +202,17 @@ pub async fn reinstall(
     if !state.acquire_busy(&id) {
         return Err(ApiError::bad_request("该实例有整体操作（备份/更新/重装/克隆）正在进行，请稍候"));
     }
-    let job_id = uuid::Uuid::new_v4().to_string();
-    state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(job_id.clone(), crate::jobs::Job::new(job_id.clone()));
+    let iname = rt.meta.read().await.name.clone();
+    let job_id = crate::jobs::create_job(
+        &state,
+        crate::jobs::NewJob {
+            kind: "reinstall".into(),
+            title: format!("重装实例「{iname}」"),
+            instance_id: Some(id.clone()),
+            user_id: Some(identity.user_id.clone()),
+            operation_id: None,
+        },
+    );
     let st2 = state.clone();
     let jid = job_id.clone();
     let iid = id.clone();
@@ -268,12 +275,9 @@ pub async fn icon_upload(
         if !fname.to_lowercase().ends_with(".png") {
             return Err(ApiError::bad_request("仅支持 PNG 图片"));
         }
-        let path = rt.dir.join("server-icon.png");
-        let mut f = tokio::fs::File::create(&path).await?;
-        while let Some(chunk) = field.chunk().await? {
-            f.write_all(&chunk).await?;
-        }
-        f.flush().await?;
+        super::resources::stage_upload(&rt.dir, "server-icon.png", &mut field)
+            .await
+            .map_err(ApiError::internal)?;
         saved = true;
     }
     if !saved {

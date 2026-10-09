@@ -3,6 +3,7 @@ use crate::config::PanelConfig;
 use crate::instance::InstanceRuntime;
 use crate::jobs::Job;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -12,6 +13,12 @@ pub struct AppStateInner {
     pub auth: crate::auth::AuthStore,
     pub instances: RwLock<HashMap<String, Arc<InstanceRuntime>>>,
     pub jobs: std::sync::Mutex<HashMap<String, Job>>,
+    /// 任务 / 操作持久化目录（启动时确定，不随运行时设置变化）
+    pub tasks_dir: PathBuf,
+    /// 运行中任务日志落盘节流时间戳（毫秒）
+    pub job_persist_at: std::sync::atomic::AtomicU64,
+    /// 写操作幂等登记（X-Operation-ID）
+    pub operations: crate::operations::OperationStore,
     pub sys: std::sync::Mutex<sysinfo::System>,
     pub http: reqwest::Client,
     pub mc_versions: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>,
@@ -72,17 +79,23 @@ impl AppState {
     }
     pub async fn new(cfg: PanelConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.instances_dir())?;
-        let auth = crate::auth::AuthStore::load(&cfg.data_dir)?;
+        let data_dir = cfg.data_dir.clone();
+        let tasks_dir = std::path::Path::new(&data_dir).join("tasks");
+        std::fs::create_dir_all(&tasks_dir)?;
+        let auth = crate::auth::AuthStore::load(&data_dir)?;
         let instances = crate::instance::scan_instances(&cfg.instances_dir(), cfg.console_buffer_lines);
         tracing::info!("已加载 {} 个实例", instances.len());
         let http = reqwest::Client::builder()
             .user_agent("MCS-Panel/0.1")
             .build()?;
-        Ok(Self(Arc::new(AppStateInner {
+        let state = Self(Arc::new(AppStateInner {
             config: RwLock::new(cfg),
             auth,
             instances: RwLock::new(instances),
             jobs: std::sync::Mutex::new(HashMap::new()),
+            tasks_dir,
+            job_persist_at: std::sync::atomic::AtomicU64::new(0),
+            operations: crate::operations::OperationStore::load(&data_dir),
             sys: std::sync::Mutex::new(sysinfo::System::new()),
             http,
             mc_versions: std::sync::Mutex::new(None),
@@ -91,6 +104,10 @@ impl AppState {
             size_cache: std::sync::Mutex::new(HashMap::new()),
             alert_dedup: std::sync::Mutex::new(HashMap::new()),
             busy: std::sync::Mutex::new(std::collections::HashSet::new()),
-        })))
+        }));
+        // 崩溃恢复：运行中任务/操作标记为中断，不自动重放
+        crate::jobs::restore(&state);
+        crate::operations::restore(&state);
+        Ok(state)
     }
 }

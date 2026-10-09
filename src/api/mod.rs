@@ -4,6 +4,7 @@ mod announcement;
 mod auth;
 mod backup;
 mod game_backup;
+mod jobs;
 mod extras;
 mod console;
 mod instances;
@@ -24,7 +25,7 @@ use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::json;
@@ -97,7 +98,10 @@ pub fn router(state: AppState) -> Router {
         .route("/instances/{id}/modpack/preview", post(instances::modpack_preview))
         .route("/instances/{id}/modpack/apply", post(instances::modpack_apply))
         .route("/instances/import/path", post(instances::import_path))
-        .route("/jobs/{id}", get(instances::get_job))
+        .route("/jobs", get(jobs::list))
+        .route("/jobs/{id}", get(jobs::detail))
+        .route("/jobs/{id}/retry", post(jobs::retry))
+        .route("/operations/{id}", get(jobs::operation_get))
         .route(
             "/instances/{id}",
             get(instances::detail).patch(instances::update).delete(instances::remove),
@@ -222,6 +226,7 @@ pub fn router(state: AppState) -> Router {
             "/instances/{id}/announcement",
             get(announcement::get).put(announcement::put),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), jobs::operation_mw))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(middleware::from_fn_with_state(state.clone(), audit_mw))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
@@ -274,6 +279,10 @@ fn classify(method: &Method, path: &str) -> (Access, Option<String>) {
         ["auth", "minecraft-name-requests", _] if method == Method::DELETE => {
             (Access::Authenticated, None)
         }
+        ["jobs"] if get => (Access::Authenticated, None),
+        ["jobs", _id] if get => (Access::Authenticated, None),
+        ["jobs", _id, "retry"] if post => (Access::Authenticated, None),
+        ["operations", _id] if get => (Access::Authenticated, None),
         _ => (Access::Admin, None),
     }
 }
@@ -583,15 +592,24 @@ async fn java_install_list(State(state): State<AppState>) -> Json<serde_json::Va
 }
 
 /// 一键安装指定大版本的 Temurin JRE（后台任务）
-async fn java_install(State(state): State<AppState>, Path(major): Path<u32>) -> ApiResult<Json<serde_json::Value>> {
+async fn java_install(
+    State(state): State<AppState>,
+    Path(major): Path<u32>,
+    Extension(identity): Extension<Identity>,
+) -> ApiResult<Json<serde_json::Value>> {
     if !crate::instance::javainstall::MAJORS.contains(&major) {
         return Err(ApiError::bad_request(format!("仅支持安装以下大版本: {:?}", crate::instance::javainstall::MAJORS)));
     }
-    let job_id = uuid::Uuid::new_v4().to_string();
-    state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(job_id.clone(), crate::jobs::Job::new(job_id.clone()));
+    let job_id = crate::jobs::create_job(
+        &state,
+        crate::jobs::NewJob {
+            kind: "java-install".into(),
+            title: format!("安装 Java {major}"),
+            instance_id: None,
+            user_id: Some(identity.user_id.clone()),
+            operation_id: None,
+        },
+    );
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::spawn(async move {

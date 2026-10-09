@@ -1,8 +1,9 @@
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::instance::{game_backup, get_instance, process, InstanceRuntime, Status};
 use crate::jobs::{finish_job, log_job, Job};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::response::Response;
 use axum::Json;
 use serde_json::json;
@@ -63,23 +64,25 @@ async fn provider(rt: &Arc<InstanceRuntime>) -> ApiResult<game_backup::Provider>
         .ok_or_else(|| ApiError::bad_request("未识别到支持的游戏内备份模组（ServerUtilities）"))
 }
 
-fn new_job(state: &AppState, id: &str, message: &str) -> String {
-    let jid = uuid::Uuid::new_v4().to_string();
-    let mut job = Job::new(jid.clone());
-    job.kind = Some("game-backup".into());
-    job.instance_id = Some(id.into());
-    job.log(message);
-    state
-        .jobs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(jid.clone(), job);
+fn new_job(state: &AppState, id: &str, user_id: Option<&str>, message: &str) -> String {
+    let jid = crate::jobs::create_job(
+        state,
+        crate::jobs::NewJob {
+            kind: "game-backup".into(),
+            title: message.to_string(),
+            instance_id: Some(id.into()),
+            user_id: user_id.map(|s| s.to_string()),
+            operation_id: None,
+        },
+    );
+    crate::jobs::log_job(state, &jid, message);
     jid
 }
 
 pub async fn create(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
     let busy = state
@@ -101,7 +104,7 @@ pub async fn create(
         chrono::Local::now().format("%Y%m%d-%H%M%S"),
         uuid::Uuid::new_v4().simple()
     );
-    let jid = new_job(&state, &id, "正在通过 ServerUtilities 创建游戏内备份");
+    let jid = new_job(&state, &id, Some(&identity.user_id), "正在通过 ServerUtilities 创建游戏内备份");
     let st = state.clone();
     let job_id = jid.clone();
     tokio::spawn(async move {
@@ -263,6 +266,7 @@ pub async fn update_config(
 pub async fn restore(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
+    Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
     let busy = state
@@ -273,7 +277,7 @@ pub async fn restore(
     }
     let p = provider(&rt).await?;
     let dir = rt.dir.clone();
-    let jid = new_job(&state, &id, "正在校验游戏内备份并保留当前数据");
+    let jid = new_job(&state, &id, Some(&identity.user_id), "正在校验游戏内备份并保留当前数据");
     let st = state.clone();
     let job_id = jid.clone();
     tokio::spawn(async move {
@@ -307,6 +311,17 @@ mod tests {
     use crate::instance::InstanceMeta;
     use std::fs;
     use std::io::Write;
+
+    fn test_identity() -> Identity {
+        Identity {
+            user_id: "test-user".into(),
+            username: "test".into(),
+            role: crate::auth::Role::Admin,
+            instance_ids: vec![],
+            csrf: "csrf".into(),
+            session: "session".into(),
+        }
+    }
     use std::path::PathBuf;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
@@ -378,10 +393,10 @@ mod tests {
     #[tokio::test]
     async fn list_retains_latest_completed_job_and_separates_active_job() {
         let f = Fixture::new().await;
-        let old = new_job(&f.state, "test", "old");
+        let old = new_job(&f.state, "test", None, "old");
         finish_job(&f.state, &old, None, Some("test".into()));
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let latest = new_job(&f.state, "test", "new");
+        let latest = new_job(&f.state, "test", None, "new");
         let response = list(State(f.state.clone()), Path("test".into()))
             .await
             .unwrap()
@@ -407,7 +422,8 @@ mod tests {
         *f.rt.status.lock().await = Status::Running;
         assert!(restore(
             State(f.state.clone()),
-            Path(("test".into(), "old.zip".into()))
+            Path(("test".into(), "old.zip".into())),
+            Extension(test_identity()),
         )
         .await
         .unwrap_err()
@@ -422,7 +438,8 @@ mod tests {
             .contains("整体操作"));
         assert!(restore(
             State(f.state.clone()),
-            Path(("test".into(), "old.zip".into()))
+            Path(("test".into(), "old.zip".into())),
+            Extension(test_identity()),
         )
         .await
         .is_err());
@@ -430,6 +447,7 @@ mod tests {
         let response = restore(
             State(f.state.clone()),
             Path(("test".into(), "old.zip".into())),
+            Extension(test_identity()),
         )
         .await
         .unwrap()
@@ -444,6 +462,7 @@ mod tests {
         let response = restore(
             State(f.state.clone()),
             Path(("test".into(), "missing.zip".into())),
+            Extension(test_identity()),
         )
         .await
         .unwrap()
@@ -460,13 +479,13 @@ mod tests {
     #[tokio::test]
     async fn create_state_and_command_errors_are_explicit_and_release_lock() {
         let f = Fixture::new().await;
-        assert!(create(State(f.state.clone()), Path("test".into()))
+        assert!(create(State(f.state.clone()), Path("test".into()), Extension(test_identity()))
             .await
             .unwrap_err()
             .to_string()
             .contains("运行"));
         *f.rt.status.lock().await = Status::Running;
-        let response = create(State(f.state.clone()), Path("test".into()))
+        let response = create(State(f.state.clone()), Path("test".into()), Extension(test_identity()))
             .await
             .unwrap()
             .0;
@@ -478,7 +497,7 @@ mod tests {
             "backups {\n B:enable_backups=false\n}\n",
         )
         .unwrap();
-        assert!(create(State(f.state.clone()), Path("test".into()))
+        assert!(create(State(f.state.clone()), Path("test".into()), Extension(test_identity()))
             .await
             .unwrap_err()
             .to_string()

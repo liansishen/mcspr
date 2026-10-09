@@ -3,7 +3,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::instance::modpack;
 use crate::instance::process;
 use crate::instance::{get_instance, InstanceMeta, InstanceRuntime, InstanceSummary, Status};
-use crate::jobs::{finish_job, Job};
+use crate::jobs::finish_job;
 use crate::state::AppState;
 use crate::util::now_str;
 use axum::extract::{Multipart, Path, Query, State};
@@ -103,6 +103,7 @@ pub struct CreateReq {
 
 pub async fn create(
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Json(req): Json<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let name = req.name.trim().to_string();
@@ -129,7 +130,7 @@ pub async fn create(
     }
     let meta = InstanceMeta {
         id: id.clone(),
-        name,
+        name: name.clone(),
         created_at: now_str(),
         java_path: None,
         min_ram_mb: 1024,
@@ -146,15 +147,20 @@ pub async fn create(
     let rt = InstanceRuntime::new(meta, dir);
     state.instances.write().await.insert(id.clone(), rt);
 
-    let job_id = uuid::Uuid::new_v4().to_string();
     if let Some(loader) = mod_loader {
         // 模组服安装任务
         let game = mc_version.expect("上面已校验");
         let lver = loader_version.expect("上面已校验");
-        state
-            .jobs
-            .lock().unwrap_or_else(|p| p.into_inner())
-            .insert(job_id.clone(), Job::new(job_id.clone()));
+        let job_id = crate::jobs::create_job(
+            &state,
+            crate::jobs::NewJob {
+                kind: "instance-create".into(),
+                title: format!("创建实例「{name}」"),
+                instance_id: Some(id.clone()),
+                user_id: Some(identity.user_id.clone()),
+                operation_id: None,
+            },
+        );
         let st2 = state.clone();
         let jid = job_id.clone();
         let iid = id.clone();
@@ -165,10 +171,16 @@ pub async fn create(
     }
     if let Some(ver) = mc_version {
         // 原版官方服务端下载任务
-        state
-            .jobs
-            .lock().unwrap_or_else(|p| p.into_inner())
-            .insert(job_id.clone(), Job::new(job_id.clone()));
+        let job_id = crate::jobs::create_job(
+            &state,
+            crate::jobs::NewJob {
+                kind: "instance-create".into(),
+                title: format!("创建实例「{name}」"),
+                instance_id: Some(id.clone()),
+                user_id: Some(identity.user_id.clone()),
+                operation_id: None,
+            },
+        );
         let st2 = state.clone();
         let jid = job_id.clone();
         let iid = id.clone();
@@ -533,6 +545,7 @@ pub struct ImportPathReq {
 
 pub async fn import_path(
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Json(req): Json<ImportPathReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = PathBuf::from(req.path.trim());
@@ -549,11 +562,16 @@ pub async fn import_path(
                 .unwrap_or_else(|| "导入的实例".into())
         });
     let instances_dir = state.config.read().await.instances_dir();
-    let job_id = uuid::Uuid::new_v4().to_string();
-    state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(job_id.clone(), Job::new(job_id.clone()));
+    let job_id = crate::jobs::create_job(
+        &state,
+        crate::jobs::NewJob {
+            kind: "modpack-import".into(),
+            title: format!("导入整合包「{name}」"),
+            instance_id: None,
+            user_id: Some(identity.user_id.clone()),
+            operation_id: None,
+        },
+    );
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::task::spawn_blocking(move || {
@@ -568,6 +586,7 @@ pub async fn import_path(
 
 pub async fn import_upload(
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
     mut multipart: Multipart,
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut name: Option<String> = None;
@@ -605,11 +624,16 @@ pub async fn import_upload(
     let name = name.filter(|s| !s.trim().is_empty()).unwrap_or(zip_name);
 
     let instances_dir = state.config.read().await.instances_dir();
-    let job_id = uuid::Uuid::new_v4().to_string();
-    state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(job_id.clone(), Job::new(job_id.clone()));
+    let job_id = crate::jobs::create_job(
+        &state,
+        crate::jobs::NewJob {
+            kind: "modpack-import".into(),
+            title: format!("导入整合包「{name}」"),
+            instance_id: None,
+            user_id: Some(identity.user_id.clone()),
+            operation_id: None,
+        },
+    );
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::task::spawn_blocking(move || {
@@ -674,6 +698,7 @@ pub async fn modpack_preview(
 pub async fn modpack_apply(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(identity): Extension<Identity>,
     Json(req): Json<ModpackApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
@@ -687,11 +712,17 @@ pub async fn modpack_apply(
         state.release_busy(&id);
         return Err(ApiError::bad_request("orphan_mode 仅支持 keep / disable / delete"));
     }
-    let job_id = uuid::Uuid::new_v4().to_string();
-    state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(job_id.clone(), Job::new(job_id.clone()));
+    let iname = rt.meta.read().await.name.clone();
+    let job_id = crate::jobs::create_job(
+        &state,
+        crate::jobs::NewJob {
+            kind: "modpack-update".into(),
+            title: format!("更新整合包「{iname}」"),
+            instance_id: Some(id.clone()),
+            user_id: Some(identity.user_id.clone()),
+            operation_id: None,
+        },
+    );
     let st2 = state.clone();
     let jid = job_id.clone();
     let iid = id.clone();
@@ -711,15 +742,3 @@ pub async fn modpack_apply(
     Ok(Json(json!({ "job_id": job_id })))
 }
 
-pub async fn get_job(
-    State(state): State<AppState>,
-    Path(jid): Path<String>,
-) -> ApiResult<Json<Job>> {
-    let job = state
-        .jobs
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .get(&jid)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("任务不存在"))?;
-    Ok(Json(job))
-}
