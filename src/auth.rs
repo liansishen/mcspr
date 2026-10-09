@@ -109,6 +109,32 @@ pub struct NameChangeRequest {
     pub rejection_reason: Option<String>,
 }
 
+/// 已批准改名后保留的旧游戏名：相关实例确认移除前禁止复用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredName {
+    /// 旧游戏名（保留原始大小写）
+    pub name: String,
+    /// 改名时该账户的显式实例授权；管理员为空但 `global=true`
+    #[serde(default)]
+    pub instance_ids: Vec<String>,
+    /// 管理员旧名可能存在于任意实例，无法枚举，故永不自动释放
+    #[serde(default)]
+    pub global: bool,
+    #[serde(default)]
+    pub retired_at: String,
+}
+
+/// 协调器对退休名在单个实例上保留状态的判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredNameStatus {
+    /// 已确认该实例不再保留旧名，可释放
+    Removed,
+    /// 该实例仍保留旧名（面板管理或人工保留）
+    Retained,
+    /// 无法确认（实例缺失 / 同步未完成），保守保留
+    Unknown,
+}
+
 /// 对外展示的申请（注册申请或游戏名变更申请）。
 #[derive(Debug, Clone, Serialize)]
 pub struct Application {
@@ -165,6 +191,9 @@ pub struct User {
     /// 有限的游戏名变更审核历史
     #[serde(default)]
     pub name_change_history: Vec<NameChangeRequest>,
+    /// 改名后保留的旧游戏名：跨实例白名单移除确认前不得复用
+    #[serde(default)]
+    pub retired_names: Vec<RetiredName>,
 }
 
 /// 对外返回的账户字段（不含密码哈希等内部数据）
@@ -217,10 +246,20 @@ impl Identity {
     }
 }
 
+/// 具名授权快照：`revision` 与 `grants` 在同一读锁内采集，二者严格对应。
+#[derive(Debug, Clone)]
+pub struct NamedGrantsSnapshot {
+    pub revision: u64,
+    pub grants: Vec<(String, String, Vec<String>, bool)>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AccountFile {
     #[serde(default = "default_schema_version")]
     schema_version: u32,
+    /// 全局授权代际，与 users 同事务持久化；重启后恢复，避免白名单同步代号被误判陈旧。
+    #[serde(default)]
+    revision: u64,
     #[serde(default)]
     users: Vec<User>,
 }
@@ -350,16 +389,17 @@ impl AuthStore {
         })?;
 
         let path = dir.join("users.json");
-        let users = if path.exists() {
+        let (users, revision) = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("读取账户文件失败 {}: {e}", path.display()))?;
             let parsed: AccountFile = serde_json::from_str(&raw)
                 .map_err(|e| anyhow::anyhow!("账户文件解析失败 {}: {e}", path.display()))?;
             validate_schema(parsed.schema_version)
                 .map_err(|e| anyhow::anyhow!("账户文件无效 {}: {e}", path.display()))?;
-            parsed.users
+            // 旧 schema 无 revision 字段时 serde 默认 0，仍可加载
+            (parsed.users, parsed.revision)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         Ok(Self {
@@ -370,7 +410,7 @@ impl AuthStore {
                 sessions: Mutex::new(HashMap::new()),
                 limiter: Mutex::new(RateLimiter::default()),
                 hashing: Arc::new(Semaphore::new(MAX_HASH_CONCURRENCY)),
-                revision: AtomicU64::new(0),
+                revision: AtomicU64::new(revision),
                 instance_revs: Mutex::new(HashMap::new()),
             }),
         })
@@ -454,6 +494,7 @@ impl AuthStore {
             rejection_reason: None,
             pending_name_change: None,
             name_change_history: Vec::new(),
+            retired_names: Vec::new(),
         };
         let created = user.clone();
         self.mutate(|users| {
@@ -676,31 +717,20 @@ impl AuthStore {
     /// 返回 `(user_id, minecraft_name, instance_ids, is_admin)`；管理员 `is_admin=true`，
     /// 其有效范围为全部实例，`instance_ids` 仅记录显式授权。缺少游戏名的账户不生成条目。
     pub async fn approved_named_grants(&self) -> Vec<(String, String, Vec<String>, bool)> {
-        self.approved_grants_snapshot().await.1
+        self.approved_named_grants_with_revision().await.grants
     }
 
-    /// 原子读取「修订号 + 已批准具名授权」：在同一账户读锁内取值，
-    /// 保证 grants 与 revision 属于同一版本（`mutate` 在写锁内推进 revision）。
-    pub async fn approved_grants_snapshot(
-        &self,
-    ) -> (u64, Vec<(String, String, Vec<String>, bool)>) {
+    pub async fn approved_grants_snapshot(&self) -> (u64, Vec<(String, String, Vec<String>, bool)>) {
+        let snapshot = self.approved_named_grants_with_revision().await;
+        (snapshot.revision, snapshot.grants)
+    }
+
+    /// 在同一账户读锁内读取具名授权与持久化修订号。
+    pub async fn approved_named_grants_with_revision(&self) -> NamedGrantsSnapshot {
         let users = self.inner.users.read().await;
-        let grants = users
-            .iter()
-            .filter(|u| u.status == AccountStatus::Approved && u.enabled)
-            .filter_map(|u| {
-                u.minecraft_name.clone().map(|name| {
-                    (
-                        u.id.clone(),
-                        name,
-                        u.instance_ids.clone(),
-                        u.role == Role::Admin,
-                    )
-                })
-            })
-            .collect();
+        let grants = named_grants(&users);
         let revision = self.inner.revision.load(Ordering::SeqCst);
-        (revision, grants)
+        NamedGrantsSnapshot { revision, grants }
     }
 
     /// 注册：始终创建待审批的普通用户，忽略客户端可注入的角色与授权。
@@ -740,6 +770,7 @@ impl AuthStore {
             rejection_reason: None,
             pending_name_change: None,
             name_change_history: Vec::new(),
+            retired_names: Vec::new(),
         };
         let created = user.clone();
         self.mutate(|users| {
@@ -849,6 +880,19 @@ impl AuthStore {
             req.reviewed_at = Some(crate::util::now_str());
             req.rejection_reason = None;
             push_name_history(&mut users[pos], req);
+            // 旧名进入退休保留：跨实例白名单移除确认前不得复用
+            if let Some(old) = users[pos].minecraft_name.clone() {
+                if !old.eq_ignore_ascii_case(new_name.trim()) {
+                    let global = users[pos].role == Role::Admin;
+                    let instance_ids = users[pos].instance_ids.clone();
+                    users[pos].retired_names.push(RetiredName {
+                        name: old,
+                        instance_ids,
+                        global,
+                        retired_at: crate::util::now_str(),
+                    });
+                }
+            }
             users[pos].minecraft_name = Some(new_name);
             users[pos].updated_at = crate::util::now_str();
             Ok(())
@@ -1066,6 +1110,42 @@ impl AuthStore {
         Ok(next)
     }
 
+    /// 协调器释放已确认从相关实例移除的退休名；未确认的一律保守保留。
+    ///
+    /// `status_of` 按实例 ID 返回旧名在该实例的保留状态：仅当退休名的每个相关实例都返回
+    /// [`RetiredNameStatus::Removed`] 时才释放；`Retained`/`Unknown` 均保持预留。
+    /// 管理员退休名（`global`）无法枚举全部实例，永不自动释放；无相关实例的退休名视为
+    /// 无需移除，可直接释放。返回本次释放的退休名数量。
+    pub async fn release_retired_names_if_removed<F>(&self, status_of: F) -> Result<usize, String>
+    where
+        F: Fn(&str) -> RetiredNameStatus,
+    {
+        // 先只读探测：无可释放项时不写盘、不推进修订号
+        let any = {
+            let users = self.inner.users.read().await;
+            users.iter().any(|u| {
+                u.retired_names
+                    .iter()
+                    .any(|r| retired_releasable(r, &status_of))
+            })
+        };
+        if !any {
+            return Ok(0);
+        }
+        let mut released = 0usize;
+        self.mutate(|users| {
+            for u in users.iter_mut() {
+                let before = u.retired_names.len();
+                u.retired_names
+                    .retain(|r| !retired_releasable(r, &status_of));
+                released += before - u.retired_names.len();
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(released)
+    }
+
     pub async fn delete(&self, user_id: &str) -> Result<(), String> {
         self.mutate(|users| {
             let target = users.iter().find(|u| u.id == user_id).ok_or("账户不存在")?;
@@ -1166,7 +1246,7 @@ impl AuthStore {
 
     // ---------- 内部 ----------
 
-    /// 在写锁内修改账户：先持久化到磁盘，成功后才提交到内存。
+    /// 在写锁内修改账户：账户与修订号在同一事务持久化，成功后才提交到内存。
     async fn mutate<F, T>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&mut Vec<User>) -> Result<T, String>,
@@ -1176,11 +1256,13 @@ impl AuthStore {
         let out = f(&mut next)?;
         let path = self.inner.path.clone();
         let snapshot = next.clone();
-        tokio::task::spawn_blocking(move || write_accounts(&path, &snapshot))
+        // 修订号与账户同事务落盘：重启后据此恢复，避免白名单同步代号回退
+        let next_revision = self.inner.revision.load(Ordering::SeqCst).saturating_add(1);
+        tokio::task::spawn_blocking(move || write_accounts(&path, &snapshot, next_revision))
             .await
             .map_err(|e| format!("持久化任务失败: {e}"))??;
         *users = next;
-        self.inner.revision.fetch_add(1, Ordering::SeqCst);
+        self.inner.revision.store(next_revision, Ordering::SeqCst);
         Ok(out)
     }
 
@@ -1282,10 +1364,17 @@ pub(crate) fn normalize_minecraft_name(raw: &str) -> Result<String, String> {
     Ok(name)
 }
 
-/// 游戏名唯一性：忽略大小写，涵盖已占用名与待处理的变更预留名。
+/// 游戏名唯一性：忽略大小写，涵盖已占用名、待处理的变更预留名与退休名。
 fn name_taken(users: &[User], candidate: &str, exclude_user_id: Option<&str>) -> bool {
     let needle = candidate.trim().to_ascii_lowercase();
     users.iter().any(|u| {
+        // 退休名对所有账户（含本人）保留：改名后不得立即复用旧名
+        if u.retired_names
+            .iter()
+            .any(|r| r.name.trim().to_ascii_lowercase() == needle)
+        {
+            return true;
+        }
         if exclude_user_id == Some(u.id.as_str()) {
             return false;
         }
@@ -1301,6 +1390,37 @@ fn name_taken(users: &[User], candidate: &str, exclude_user_id: Option<&str>) ->
             .unwrap_or(false);
         current || reserved
     })
+}
+
+/// 从账户列表提取已批准且启用的具名授权（纯函数，供快照复用）。
+fn named_grants(users: &[User]) -> Vec<(String, String, Vec<String>, bool)> {
+    users
+        .iter()
+        .filter(|u| u.status == AccountStatus::Approved && u.enabled)
+        .filter_map(|u| {
+            u.minecraft_name.clone().map(|name| {
+                (
+                    u.id.clone(),
+                    name,
+                    u.instance_ids.clone(),
+                    u.role == Role::Admin,
+                )
+            })
+        })
+        .collect()
+}
+
+/// 退休名是否可释放：管理员退休名保守保留；其余需每个相关实例均确认移除。
+fn retired_releasable<F>(r: &RetiredName, status_of: &F) -> bool
+where
+    F: Fn(&str) -> RetiredNameStatus,
+{
+    if r.global {
+        return false;
+    }
+    r.instance_ids
+        .iter()
+        .all(|id| status_of(id) == RetiredNameStatus::Removed)
 }
 
 fn registration_application(u: &User) -> Application {
@@ -1375,9 +1495,10 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn write_accounts(path: &Path, users: &[User]) -> Result<(), String> {
+fn write_accounts(path: &Path, users: &[User], revision: u64) -> Result<(), String> {
     let file = AccountFile {
         schema_version: SCHEMA_VERSION,
+        revision,
         users: users.to_vec(),
     };
     let data = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化账户失败: {e}"))?;
@@ -1807,6 +1928,8 @@ mod tests {
         let body = r#"{"schema_version":1,"users":[{"id":"u1","username":"old","password_hash":"x","role":"user","enabled":true,"instance_ids":[],"session_epoch":0,"created_at":"","updated_at":""}]}"#;
         std::fs::write(auth.join("users.json"), body).unwrap();
         let store = AuthStore::load(&dir.0).unwrap();
+        // 旧 schema 无 revision 字段：默认为 0，仍可加载
+        assert_eq!(store.revision(), 0);
         let users = store.list().await;
         let old = users.iter().find(|u| u.username == "old").unwrap();
         assert_eq!(old.status, AccountStatus::Approved);
@@ -1866,11 +1989,11 @@ mod tests {
         let after = s.get(&u.id).await.unwrap();
         assert_eq!(after.username, "alice");
         assert_eq!(after.minecraft_name.as_deref(), Some("Neo"));
-        // 旧名释放，可再次注册
+        // 旧名退休保留：改名后不能立即复用
         assert!(s
             .register_pending_user("carol", "password123", "Alice", "x")
             .await
-            .is_ok());
+            .is_err());
     }
 
     #[tokio::test]
@@ -1953,7 +2076,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_grants_snapshot_is_consistent_with_revision() {
+    async fn revision_persists_across_restart_including_instance_grants() {
+        let dir = temp_dir();
+        let persisted = {
+            let store = AuthStore::load(&dir.0).unwrap();
+            let root = store
+                .create_user("root", "password123", Role::Admin, vec![])
+                .await
+                .unwrap();
+            let rev = store.instance_permission_revision("inst-a").await;
+            store
+                .set_instance_grants_checked("inst-a", rev, vec![root.id.clone()])
+                .await
+                .unwrap();
+            assert!(store.revision() >= 2);
+            store.revision()
+        };
+        // 重载后修订号不得回退为 0，否则白名单同步会因代号陈旧被跳过
+        let reloaded = AuthStore::load(&dir.0).unwrap();
+        assert_eq!(reloaded.revision(), persisted);
+        assert_eq!(
+            reloaded
+                .approved_named_grants_with_revision()
+                .await
+                .revision,
+            persisted
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_old_name_blocks_register_and_rebind_until_released() {
         let (s, _dir) = store().await;
         let u = s
             .register_pending_user("alice", "password123", "Alice", "r")
@@ -1968,5 +2120,52 @@ mod tests {
         assert_eq!(grants[0].1, "Alice");
         assert_eq!(grants[0].2, vec!["inst-a".to_string()]);
         assert!(!grants[0].3);
+        let req = s.request_name_change(&u.id, "Neo", "改名").await.unwrap();
+        s.approve_application(&req.id, req.revision, vec![], "root")
+            .await
+            .unwrap();
+        let after = s.get(&u.id).await.unwrap();
+        assert_eq!(after.minecraft_name.as_deref(), Some("Neo"));
+
+        // 旧名退休：他人注册被拒
+        assert!(s
+            .register_pending_user("carol", "password123", "Alice", "x")
+            .await
+            .is_err());
+        // 本人改回旧名同样被拒
+        assert!(s.request_name_change(&u.id, "Alice", "回退").await.is_err());
+
+        // 相关实例未确认移除：保守保留
+        let n = s
+            .release_retired_names_if_removed(|_| RetiredNameStatus::Unknown)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(s
+            .register_pending_user("carol", "password123", "Alice", "x")
+            .await
+            .is_err());
+
+        // 实例仍人工保留旧名：同样保持预留
+        let n = s
+            .release_retired_names_if_removed(|_| RetiredNameStatus::Retained)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // 相关实例确认移除后释放
+        let n = s
+            .release_retired_names_if_removed(|_| RetiredNameStatus::Removed)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // 本人可改回旧名
+        let back = s.request_name_change(&u.id, "Alice", "回退").await.unwrap();
+        s.withdraw_name_change(&u.id, &back.id).await.unwrap();
+        // 释放后他人可注册旧名
+        assert!(s
+            .register_pending_user("carol", "password123", "Alice", "x")
+            .await
+            .is_ok());
     }
 }
