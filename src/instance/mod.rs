@@ -10,6 +10,7 @@ pub mod process;
 pub mod properties;
 pub mod tasks;
 pub mod users;
+pub mod name_reservations;
 pub mod vanilla;
 pub mod whitelist_sync;
 

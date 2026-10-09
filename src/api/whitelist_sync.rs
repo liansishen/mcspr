@@ -35,7 +35,11 @@ static SYNC_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 pub async fn reconcile_all(state: &AppState) -> whitelist_sync::SyncAllReport {
     let (revision, grants) = state.auth.approved_grants_snapshot().await;
     let snapshot = DesiredSnapshot::from_grants(revision, grants);
-    whitelist_sync::sync_all(state, &snapshot).await
+    let report = whitelist_sync::sync_all(state, &snapshot).await;
+    if let Err(error) = crate::instance::name_reservations::release_confirmed(state, &report).await {
+        tracing::warn!(%error, "旧游戏名移除确认失败，继续保留预留");
+    }
+    report
 }
 
 /// 请求一次后台协调（非阻塞）：实际协调由 [`spawn_scheduler`] 中的任务串行执行。

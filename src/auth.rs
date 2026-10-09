@@ -117,14 +117,14 @@ pub struct RetiredName {
     /// 改名时该账户的显式实例授权；管理员为空但 `global=true`
     #[serde(default)]
     pub instance_ids: Vec<String>,
-    /// 管理员旧名可能存在于任意实例，无法枚举，故永不自动释放
+    /// 改名时是否具有全实例授权
     #[serde(default)]
     pub global: bool,
     #[serde(default)]
     pub retired_at: String,
 }
 
-/// 协调器对退休名在单个实例上保留状态的判定。
+/// 协调器对旧游戏名在全部实例上的移除判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetiredNameStatus {
     /// 已确认该实例不再保留旧名，可释放
@@ -1111,11 +1111,7 @@ impl AuthStore {
     }
 
     /// 协调器释放已确认从相关实例移除的退休名；未确认的一律保守保留。
-    ///
-    /// `status_of` 按实例 ID 返回旧名在该实例的保留状态：仅当退休名的每个相关实例都返回
-    /// [`RetiredNameStatus::Removed`] 时才释放；`Retained`/`Unknown` 均保持预留。
-    /// 管理员退休名（`global`）无法枚举全部实例，永不自动释放；无相关实例的退休名视为
-    /// 无需移除，可直接释放。返回本次释放的退休名数量。
+    /// `status_of` 按旧游戏名确认全部实例的移除结果，人工保留或无法确认时继续预留。
     pub async fn release_retired_names_if_removed<F>(&self, status_of: F) -> Result<usize, String>
     where
         F: Fn(&str) -> RetiredNameStatus,
@@ -1410,17 +1406,12 @@ fn named_grants(users: &[User]) -> Vec<(String, String, Vec<String>, bool)> {
         .collect()
 }
 
-/// 退休名是否可释放：管理员退休名保守保留；其余需每个相关实例均确认移除。
+/// 全部实例确认移除后才释放旧游戏名。
 fn retired_releasable<F>(r: &RetiredName, status_of: &F) -> bool
 where
     F: Fn(&str) -> RetiredNameStatus,
 {
-    if r.global {
-        return false;
-    }
-    r.instance_ids
-        .iter()
-        .all(|id| status_of(id) == RetiredNameStatus::Removed)
+    status_of(&r.name) == RetiredNameStatus::Removed
 }
 
 fn registration_application(u: &User) -> Application {
