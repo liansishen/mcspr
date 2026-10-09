@@ -65,6 +65,21 @@ pub struct PanelConfig {
     /// 控制台内存保留的最大日志行数（历史回放与日志下载上限）
     #[serde(default = "d_console_buffer_lines")]
     pub console_buffer_lines: usize,
+    /// 是否开放公开注册（默认关闭；正式配置有效后由管理员开启）
+    #[serde(default)]
+    pub registration_enabled: bool,
+    /// Cloudflare Turnstile 站点密钥（可公开返回）
+    #[serde(default)]
+    pub turnstile_site_key: String,
+    /// Cloudflare Turnstile 服务端密钥（秘密字段：不导出、不记录日志）
+    #[serde(default)]
+    pub turnstile_secret_key: String,
+    /// Siteverify 允许的主机名列表（大小写不敏感）
+    #[serde(default)]
+    pub turnstile_allowed_hostnames: Vec<String>,
+    /// Turnstile 显式测试模式（仅接受官方测试密钥与测试令牌）
+    #[serde(default)]
+    pub turnstile_test_mode: bool,
 }
 
 /// 控制台显示行数的取值范围
@@ -92,6 +107,11 @@ impl Default for PanelConfig {
             telegram_chat_id: String::new(),
             console_max_lines: d_console_max_lines(),
             console_buffer_lines: d_console_buffer_lines(),
+            registration_enabled: false,
+            turnstile_site_key: String::new(),
+            turnstile_secret_key: String::new(),
+            turnstile_allowed_hostnames: Vec::new(),
+            turnstile_test_mode: false,
         }
     }
 }

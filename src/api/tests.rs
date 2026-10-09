@@ -43,7 +43,11 @@ async fn add_instance(state: &AppState, id: &str) {
         name: format!("inst-{id}"),
         ..Default::default()
     };
-    std::fs::write(dir.join("instance.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("instance.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
     let rt = InstanceRuntime::new(meta, dir);
     state.instances.write().await.insert(id.to_string(), rt);
 }
@@ -125,7 +129,11 @@ async fn ping_reports_auth_required_and_initialized() {
 #[tokio::test]
 async fn uninitialized_api_is_closed() {
     let h = setup(&[]).await;
-    let (status, _) = call(&h, req("GET", "/api/instances").body(Body::empty()).unwrap()).await;
+    let (status, _) = call(
+        &h,
+        req("GET", "/api/instances").body(Body::empty()).unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -140,7 +148,9 @@ async fn login_me_and_wrong_password() {
         &h,
         req("POST", "/api/auth/login")
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "username": "root", "password": "bad" }).to_string()))
+            .body(Body::from(
+                json!({ "username": "root", "password": "bad" }).to_string(),
+            ))
             .unwrap(),
     )
     .await;
@@ -390,8 +400,16 @@ async fn accounts_admin_crud_and_last_admin_protection() {
 
     // 最后一个可用管理员不可禁用 / 删除 / 降级
     for (method, uri, payload) in [
-        ("PATCH", format!("/api/accounts/{admin_id}"), json!({ "enabled": false })),
-        ("PATCH", format!("/api/accounts/{admin_id}"), json!({ "role": "user" })),
+        (
+            "PATCH",
+            format!("/api/accounts/{admin_id}"),
+            json!({ "enabled": false }),
+        ),
+        (
+            "PATCH",
+            format!("/api/accounts/{admin_id}"),
+            json!({ "role": "user" }),
+        ),
         ("DELETE", format!("/api/accounts/{admin_id}"), json!({})),
     ] {
         let (status, _) = call(
@@ -404,7 +422,11 @@ async fn accounts_admin_crud_and_last_admin_protection() {
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "应保护最后一个管理员: {method} {uri}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "应保护最后一个管理员: {method} {uri}"
+        );
     }
 
     // 无效实例 ID 被拒绝
@@ -427,7 +449,9 @@ async fn accounts_admin_crud_and_last_admin_protection() {
             .header(header::COOKIE, &cookie)
             .header("x-csrf-token", &csrf)
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "instance_ids": ["inst-a"] }).to_string()))
+            .body(Body::from(
+                json!({ "instance_ids": ["inst-a"] }).to_string(),
+            ))
             .unwrap(),
     )
     .await;
@@ -484,7 +508,9 @@ async fn session_revoked_on_disable_reset_and_role_change() {
             .header(header::COOKIE, &admin_cookie)
             .header("x-csrf-token", &admin_csrf)
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "password": "newpassword1" }).to_string()))
+            .body(Body::from(
+                json!({ "password": "newpassword1" }).to_string(),
+            ))
             .unwrap(),
     )
     .await;
@@ -877,15 +903,639 @@ async fn login_source_limit_uses_ip_across_ports_and_ignores_forwarded_headers()
             .header("content-type", "application/json")
             .header("x-forwarded-for", format!("192.0.2.{}", attempt + 1))
             .extension(axum::extract::ConnectInfo(peer))
-            .body(Body::from(json!({
-                "username": format!("missing-{attempt}"), "password": "password123"
-            }).to_string()))
+            .body(Body::from(
+                json!({
+                    "username": format!("missing-{attempt}"), "password": "password123"
+                })
+                .to_string(),
+            ))
             .unwrap();
         let (status, _) = call(&h, request).await;
-        assert_eq!(status, if attempt < 30 {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::TOO_MANY_REQUESTS
-        });
+        assert_eq!(
+            status,
+            if attempt < 30 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+        );
     }
+}
+
+// ---------- 注册 / 审批 / 游戏名变更 / 实例权限 ----------
+
+async fn enable_test_registration(h: &Harness) {
+    let mut c = h.state.config.write().await;
+    c.registration_enabled = true;
+    c.turnstile_test_mode = true;
+    c.turnstile_site_key = crate::captcha::TEST_SITE_KEY.to_string();
+    c.turnstile_secret_key = crate::captcha::TEST_SECRET_KEY.to_string();
+}
+
+async fn register_user(h: &Harness, username: &str, mc: &str, token: &str) -> (StatusCode, Value) {
+    call(
+        h,
+        req("POST", "/api/auth/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "username": username,
+                    "password": "password123",
+                    "minecraft_name": mc,
+                    "reason": "申请",
+                    "captcha_token": token,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+/// 测试结束时恢复或删除工作目录下的 config.toml，避免污染仓库。
+struct ConfigFileGuard {
+    path: std::path::PathBuf,
+    backup: Option<Vec<u8>>,
+}
+
+impl ConfigFileGuard {
+    fn new() -> Self {
+        let path = crate::config::config_path();
+        let backup = std::fs::read(&path).ok();
+        Self { path, backup }
+    }
+}
+
+impl Drop for ConfigFileGuard {
+    fn drop(&mut self) {
+        match &self.backup {
+            Some(b) => {
+                let _ = std::fs::write(&self.path, b);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn registration_flow_is_gated_and_creates_pending_user() {
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+
+    let (status, body) = call(
+        &h,
+        req("GET", "/api/auth/registration-config")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["test_mode"], false);
+    assert_eq!(body["site_key"], "");
+
+    // 未开启注册
+    let (status, _) = register_user(&h, "bob", "Bob", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    enable_test_registration(&h).await;
+
+    // 测试模式只接受官方测试令牌
+    let (status, _) = register_user(&h, "bob", "Bob", "fake-token").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = register_user(&h, "Bob", "Bob", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending");
+
+    // 用户名与游戏名（忽略大小写）唯一
+    let (status, _) = register_user(&h, "bob", "Other", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = register_user(&h, "carol", "bob", crate::captcha::TEST_PASS_TOKEN).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 待审批账户不能获得业务会话
+    let (status, _) = call(
+        &h,
+        req("POST", "/api/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "username": "bob", "password": "password123" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 状态查询：无会话、禁止缓存
+    let resp = router(h.state.clone())
+        .oneshot(
+            req("POST", "/api/auth/application/status")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "username": "bob", "password": "password123" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["application"]["status"], "pending");
+    assert_eq!(body["application"]["kind"], "registration");
+    assert_eq!(body["application"]["minecraft_name"], "Bob");
+    assert!(body.get("csrf_token").is_none());
+
+    // 错误密码统一 401
+    let (status, _) = call(
+        &h,
+        req("POST", "/api/auth/application/status")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "username": "bob", "password": "wrongpass" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_approval_assigns_grants_and_unlocks_login() {
+    let h = setup(&["inst-a"]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    enable_test_registration(&h).await;
+    register_user(&h, "bob", "Bob", crate::captcha::TEST_PASS_TOKEN).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+
+    let (status, body) = call(
+        &h,
+        req("GET", "/api/applications")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let apps = body["applications"].as_array().unwrap();
+    assert_eq!(apps.len(), 1);
+    let id = apps[0]["id"].as_str().unwrap().to_string();
+    let rev = apps[0]["revision"].as_u64().unwrap();
+    assert_eq!(apps[0]["kind"], "registration");
+
+    // 错误修订号 -> 409
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{id}/approve"))
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev + 99, "instance_ids": ["inst-a"] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // 批准并分配授权
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{id}/approve"))
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "instance_ids": ["inst-a"] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 现在可登录并看到授权实例
+    let (bob_cookie, _) = login(&h, "bob", "password123").await;
+    let (status, body) = call(
+        &h,
+        req("GET", "/api/instances")
+            .header(header::COOKIE, &bob_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instances"].as_array().unwrap().len(), 1);
+    assert_eq!(body["instances"][0]["id"], "inst-a");
+
+    // 账户仍为普通用户，未注入角色；账户列表不含申请理由
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/accounts")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let bob = body["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["username"] == "bob")
+        .unwrap();
+    assert_eq!(bob["role"], "user");
+    assert_eq!(bob["status"], "approved");
+    assert_eq!(bob["minecraft_name"], "Bob");
+    assert!(bob.get("application_reason").is_none());
+}
+
+#[tokio::test]
+async fn rejection_reason_required_and_resubmit_returns_to_pending() {
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    enable_test_registration(&h).await;
+    register_user(&h, "carol", "Carol", crate::captcha::TEST_PASS_TOKEN).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/applications")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let id = body["applications"][0]["id"].as_str().unwrap().to_string();
+    let rev = body["applications"][0]["revision"].as_u64().unwrap();
+
+    // 拒绝必须给理由
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{id}/reject"))
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "reason": "" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{id}/reject"))
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "reason": "资料不全" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 被拒后仍可用旧密码查询并看到理由
+    let (status, body) = call(
+        &h,
+        req("POST", "/api/auth/application/status")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "username": "carol", "password": "password123" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["application"]["status"], "rejected");
+    assert_eq!(body["application"]["rejection_reason"], "资料不全");
+
+    // 重申回到待审批
+    let (status, body) = call(
+        &h,
+        req("POST", "/api/auth/application/resubmit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "username": "carol",
+                    "password": "password123",
+                    "minecraft_name": "Carol2",
+                    "reason": "补充资料",
+                    "captcha_token": crate::captcha::TEST_PASS_TOKEN,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending");
+
+    // 旧修订号批准失败
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{id}/approve"))
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "instance_ids": [] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn name_change_request_keeps_login_and_updates_name_on_approval() {
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    enable_test_registration(&h).await;
+    register_user(&h, "dave", "Dave", crate::captcha::TEST_PASS_TOKEN).await;
+    let (admin_cookie, admin_csrf) = login(&h, "root", "password123").await;
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/applications")
+            .header(header::COOKIE, &admin_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let uid = body["applications"][0]["id"].as_str().unwrap().to_string();
+    let rev = body["applications"][0]["revision"].as_u64().unwrap();
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{uid}/approve"))
+            .header(header::COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "instance_ids": [] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (dave_cookie, dave_csrf) = login(&h, "dave", "password123").await;
+
+    // 提交改名申请
+    let (status, body) = call(
+        &h,
+        req("POST", "/api/auth/minecraft-name-requests")
+            .header(header::COOKIE, &dave_cookie)
+            .header("x-csrf-token", &dave_csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "minecraft_name": "Neo", "reason": "改名" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let req_id = body["request"]["id"].as_str().unwrap().to_string();
+
+    // profile 显示待处理申请
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/auth/profile")
+            .header(header::COOKIE, &dave_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["user"]["username"], "dave");
+    assert_eq!(body["application"]["kind"], "name_change");
+    assert_eq!(body["application"]["minecraft_name"], "Neo");
+
+    // 管理员批准
+    let (status, _) = call(
+        &h,
+        req("POST", &format!("/api/applications/{req_id}/approve"))
+            .header(header::COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": 1, "instance_ids": [] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 游戏名更新，登录用户名不变
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/auth/profile")
+            .header(header::COOKIE, &dave_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["user"]["minecraft_name"], "Neo");
+    assert_eq!(body["user"]["username"], "dave");
+    login(&h, "dave", "password123").await;
+
+    // 撤回待处理申请
+    let (status, body) = call(
+        &h,
+        req("POST", "/api/auth/minecraft-name-requests")
+            .header(header::COOKIE, &dave_cookie)
+            .header("x-csrf-token", &dave_csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "minecraft_name": "Neo2", "reason": "x" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rid = body["request"]["id"].as_str().unwrap().to_string();
+    let (status, _) = call(
+        &h,
+        req(
+            "DELETE",
+            &format!("/api/auth/minecraft-name-requests/{rid}"),
+        )
+        .header(header::COOKIE, &dave_cookie)
+        .header("x-csrf-token", &dave_csrf)
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn instance_permissions_are_scoped_and_revision_checked() {
+    let h = setup(&["inst-a", "inst-b"]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let bob = create_user(&h, "bob", Role::User, &[]).await;
+    create_user(&h, "carol", Role::User, &["inst-a"]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+
+    let (status, body) = call(
+        &h,
+        req("GET", "/api/instances/inst-a/permissions")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rev = body["revision"].as_u64().unwrap();
+    assert_eq!(body["whitelist_enabled"], false);
+    let users = body["users"].as_array().unwrap();
+    assert_eq!(
+        users.iter().find(|u| u["username"] == "carol").unwrap()["granted"],
+        true
+    );
+    assert_eq!(
+        users.iter().find(|u| u["username"] == "bob").unwrap()["granted"],
+        false
+    );
+
+    // 授权 bob（carol 的 inst-a 授权被本次提交替换）
+    let (status, body) = call(
+        &h,
+        req("PUT", "/api/instances/inst-a/permissions")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "user_ids": [bob] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["revision"].as_u64().unwrap() > rev);
+    let users = body["users"].as_array().unwrap();
+    assert_eq!(
+        users.iter().find(|u| u["username"] == "bob").unwrap()["granted"],
+        true
+    );
+    assert_eq!(
+        users.iter().find(|u| u["username"] == "carol").unwrap()["granted"],
+        false
+    );
+
+    // 陈旧修订号冲突
+    let (status, _) = call(
+        &h,
+        req("PUT", "/api/instances/inst-a/permissions")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "revision": rev, "user_ids": [] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // 普通用户不能访问权限接口
+    let (bob_cookie, _) = login(&h, "bob", "password123").await;
+    let (status, _) = call(
+        &h,
+        req("GET", "/api/instances/inst-a/permissions")
+            .header(header::COOKIE, &bob_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 未知实例
+    let (status, _) = call(
+        &h,
+        req("GET", "/api/instances/nope/permissions")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn settings_guard_registration_and_export_redacts_secret() {
+    let _guard = ConfigFileGuard::new();
+    let h = setup(&[]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+
+    // 未配置人机验证时不能开启注册
+    let (status, _) = call(
+        &h,
+        req("PUT", "/api/settings")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "registration_enabled": true }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 测试模式 + 官方密钥可开启
+    let (status, _) = call(
+        &h,
+        req("PUT", "/api/settings")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "registration_enabled": true,
+                    "turnstile_test_mode": true,
+                    "turnstile_site_key": crate::captcha::TEST_SITE_KEY,
+                    "turnstile_secret_key": crate::captcha::TEST_SECRET_KEY,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 设置读取：服务端密钥脱敏，仅回 *_set
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/settings")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["turnstile_secret_key"], "");
+    assert_eq!(body["turnstile_secret_key_set"], true);
+    assert_eq!(body["registration_enabled"], true);
+
+    // 导出配置脱敏
+    let (_, body) = call(
+        &h,
+        req("GET", "/api/config/export")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["settings"]["turnstile_secret_key"], "");
+    assert_eq!(body["settings"]["token"], "");
+    assert_eq!(
+        body["settings"]["turnstile_site_key"],
+        crate::captcha::TEST_SITE_KEY
+    );
 }

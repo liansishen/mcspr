@@ -10,8 +10,10 @@ use fs4::fs_std::FileExt;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -20,7 +22,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// 账户文件 schema 版本
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 /// 存储排他文件锁
 const LOCK_FILE: &str = ".lock";
 /// 会话有效期（24 小时）
@@ -28,6 +30,13 @@ pub const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_USERNAME_LEN: usize = 32;
 const MIN_PASSWORD_LEN: usize = 8;
 const MAX_PASSWORD_LEN: usize = 128;
+/// 申请理由最大长度
+const MAX_REASON_LEN: usize = 1000;
+/// Minecraft 游戏名长度范围（保留原始大小写，唯一性忽略大小写）
+const MIN_MC_NAME_LEN: usize = 3;
+const MAX_MC_NAME_LEN: usize = 16;
+/// 单个账户保留的游戏名变更审核历史上限
+const MAX_NAME_HISTORY: usize = 20;
 /// 同时进行的 Argon2 哈希/校验任务上限，避免登录风暴耗尽 CPU
 const MAX_HASH_CONCURRENCY: usize = 4;
 /// 登录失败限流窗口与阈值（账户维度 / 来源维度）
@@ -61,6 +70,61 @@ impl Role {
     }
 }
 
+/// 账户注册审批状态；`enabled` 独立表示管理员禁用，登录须同时满足已批准且启用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountStatus {
+    Pending,
+    #[default]
+    Approved,
+    Rejected,
+}
+
+impl AccountStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccountStatus::Pending => "pending",
+            AccountStatus::Approved => "approved",
+            AccountStatus::Rejected => "rejected",
+        }
+    }
+}
+
+/// 游戏名变更申请（保留原始大小写；等待或拒绝时旧名继续生效）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameChangeRequest {
+    pub id: String,
+    pub new_name: String,
+    #[serde(default)]
+    pub reason: String,
+    pub status: AccountStatus,
+    pub revision: u64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+}
+
+/// 对外展示的申请（注册申请或游戏名变更申请）。
+#[derive(Debug, Clone, Serialize)]
+pub struct Application {
+    pub id: String,
+    /// registration / name_change
+    pub kind: String,
+    pub user_id: String,
+    pub username: String,
+    pub minecraft_name: Option<String>,
+    pub reason: String,
+    pub status: AccountStatus,
+    pub revision: u64,
+    pub rejection_reason: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -77,6 +141,30 @@ pub struct User {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// 游戏名（保留原始大小写；None 表示尚未绑定）
+    #[serde(default)]
+    pub minecraft_name: Option<String>,
+    /// 注册审批状态
+    #[serde(default)]
+    pub status: AccountStatus,
+    /// 注册申请理由
+    #[serde(default)]
+    pub application_reason: String,
+    /// 申请修订号：重申时自增，审核须匹配以避免批准旧资料
+    #[serde(default)]
+    pub application_revision: u64,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+    /// 待处理的游戏名变更申请
+    #[serde(default)]
+    pub pending_name_change: Option<NameChangeRequest>,
+    /// 有限的游戏名变更审核历史
+    #[serde(default)]
+    pub name_change_history: Vec<NameChangeRequest>,
 }
 
 /// 对外返回的账户字段（不含密码哈希等内部数据）
@@ -87,6 +175,9 @@ pub struct PublicUser {
     pub role: Role,
     pub enabled: bool,
     pub instance_ids: Vec<String>,
+    /// 游戏名（不含申请理由等敏感信息）
+    pub minecraft_name: Option<String>,
+    pub status: AccountStatus,
 }
 
 impl From<&User> for PublicUser {
@@ -97,6 +188,8 @@ impl From<&User> for PublicUser {
             role: u.role,
             enabled: u.enabled,
             instance_ids: u.instance_ids.clone(),
+            minecraft_name: u.minecraft_name.clone(),
+            status: u.status,
         }
     }
 }
@@ -214,6 +307,10 @@ struct Inner {
     sessions: Mutex<HashMap<String, Session>>,
     limiter: Mutex<RateLimiter>,
     hashing: Arc<Semaphore>,
+    /// 全局授权代际：任何账户/授权/游戏名变更都会自增，供白名单同步轮询
+    revision: AtomicU64,
+    /// 实例权限修订号：多管理员并发编辑的冲突检测
+    instance_revs: Mutex<HashMap<String, u64>>,
 }
 
 /// 账户与会话存储，克隆共享同一份内存状态。
@@ -273,6 +370,8 @@ impl AuthStore {
                 sessions: Mutex::new(HashMap::new()),
                 limiter: Mutex::new(RateLimiter::default()),
                 hashing: Arc::new(Semaphore::new(MAX_HASH_CONCURRENCY)),
+                revision: AtomicU64::new(0),
+                instance_revs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -288,8 +387,14 @@ impl AuthStore {
     }
 
     pub async fn list(&self) -> Vec<PublicUser> {
-        let mut users: Vec<PublicUser> =
-            self.inner.users.read().await.iter().map(PublicUser::from).collect();
+        let mut users: Vec<PublicUser> = self
+            .inner
+            .users
+            .read()
+            .await
+            .iter()
+            .map(PublicUser::from)
+            .collect();
         users.sort_by(|a, b| a.username.cmp(&b.username));
         users
     }
@@ -340,6 +445,15 @@ impl AuthStore {
             session_epoch: 0,
             created_at: now.clone(),
             updated_at: now,
+            minecraft_name: None,
+            status: AccountStatus::Approved,
+            application_reason: String::new(),
+            application_revision: 0,
+            reviewed_at: None,
+            reviewer: None,
+            rejection_reason: None,
+            pending_name_change: None,
+            name_change_history: Vec::new(),
         };
         let created = user.clone();
         self.mutate(|users| {
@@ -437,7 +551,8 @@ impl AuthStore {
         }
         let new_hash = self.hash_password(new_password).await?;
         // 写入前复核原哈希与纪元：若期间发生重置，拒绝覆盖
-        self.apply_password_change(user_id, hash, epoch, new_hash).await
+        self.apply_password_change(user_id, hash, epoch, new_hash)
+            .await
     }
 
     async fn apply_password_change(
@@ -467,7 +582,10 @@ impl AuthStore {
         validate_password(new_password)?;
         let new_hash = self.hash_password(new_password).await?;
         self.mutate(|users| {
-            let u = users.iter_mut().find(|u| u.id == user_id).ok_or("账户不存在")?;
+            let u = users
+                .iter_mut()
+                .find(|u| u.id == user_id)
+                .ok_or("账户不存在")?;
             u.password_hash = new_hash;
             u.session_epoch += 1;
             u.updated_at = crate::util::now_str();
@@ -515,12 +633,16 @@ impl AuthStore {
 
     #[cfg(test)]
     pub async fn set_enabled(&self, user_id: &str, enabled: bool) -> Result<(), String> {
-        self.update_user(user_id, Some(enabled), None).await.map(|_| ())
+        self.update_user(user_id, Some(enabled), None)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
     pub async fn set_role(&self, user_id: &str, role: Role) -> Result<(), String> {
-        self.update_user(user_id, None, Some(role)).await.map(|_| ())
+        self.update_user(user_id, None, Some(role))
+            .await
+            .map(|_| ())
     }
 
     /// 全量保存授权实例；单次原子写入，授权变更在下次请求即生效，无需撤销会话。
@@ -531,12 +653,409 @@ impl AuthStore {
     ) -> Result<(), String> {
         let ids = dedup_ids(instance_ids);
         self.mutate(|users| {
-            let u = users.iter_mut().find(|u| u.id == user_id).ok_or("账户不存在")?;
+            let u = users
+                .iter_mut()
+                .find(|u| u.id == user_id)
+                .ok_or("账户不存在")?;
             u.instance_ids = ids.clone();
             u.updated_at = crate::util::now_str();
             Ok(())
         })
         .await
+    }
+
+    // ---------- 注册审批 / 游戏名变更 ----------
+
+    /// 全局授权代际：任何账户、授权或游戏名变更后自增，供白名单同步轮询。
+    pub fn revision(&self) -> u64 {
+        self.inner.revision.load(Ordering::SeqCst)
+    }
+
+    /// 已批准且启用的具名账户授权快照，供白名单同步使用。
+    ///
+    /// 返回 `(user_id, minecraft_name, instance_ids, is_admin)`；管理员 `is_admin=true`，
+    /// 其有效范围为全部实例，`instance_ids` 仅记录显式授权。缺少游戏名的账户不生成条目。
+    pub async fn approved_named_grants(&self) -> Vec<(String, String, Vec<String>, bool)> {
+        self.inner
+            .users
+            .read()
+            .await
+            .iter()
+            .filter(|u| u.status == AccountStatus::Approved && u.enabled)
+            .filter_map(|u| {
+                u.minecraft_name.clone().map(|name| {
+                    (
+                        u.id.clone(),
+                        name,
+                        u.instance_ids.clone(),
+                        u.role == Role::Admin,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// 注册：始终创建待审批的普通用户，忽略客户端可注入的角色与授权。
+    pub async fn register_pending_user(
+        &self,
+        username: &str,
+        password: &str,
+        minecraft_name: &str,
+        reason: &str,
+    ) -> Result<PublicUser, String> {
+        let username = normalize_username(username);
+        validate_username(&username)?;
+        validate_password(password)?;
+        let mc_name = normalize_minecraft_name(minecraft_name)?;
+        let reason = reason.trim().to_string();
+        if reason.chars().count() > MAX_REASON_LEN {
+            return Err(format!("申请理由最长 {MAX_REASON_LEN} 个字符"));
+        }
+        let hash = self.hash_password(password).await?;
+        let now = crate::util::now_str();
+        let user = User {
+            id: uuid::Uuid::new_v4().to_string(),
+            username,
+            password_hash: hash,
+            role: Role::User,
+            enabled: true,
+            instance_ids: Vec::new(),
+            session_epoch: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            minecraft_name: Some(mc_name.clone()),
+            status: AccountStatus::Pending,
+            application_reason: reason,
+            application_revision: 1,
+            reviewed_at: None,
+            reviewer: None,
+            rejection_reason: None,
+            pending_name_change: None,
+            name_change_history: Vec::new(),
+        };
+        let created = user.clone();
+        self.mutate(|users| {
+            if users.iter().any(|u| u.username == created.username) {
+                return Err("用户名已存在".to_string());
+            }
+            if name_taken(users, &mc_name, None) {
+                return Err("该游戏名已被占用".to_string());
+            }
+            users.push(created.clone());
+            Ok(())
+        })
+        .await?;
+        Ok(PublicUser::from(&user))
+    }
+
+    /// 被拒绝的注册申请重申：更新资料并回到待审批，修订号自增使旧审核失效。
+    pub async fn resubmit_application(
+        &self,
+        user_id: &str,
+        minecraft_name: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let mc_name = normalize_minecraft_name(minecraft_name)?;
+        let reason = reason.trim().to_string();
+        if reason.chars().count() > MAX_REASON_LEN {
+            return Err(format!("申请理由最长 {MAX_REASON_LEN} 个字符"));
+        }
+        self.mutate(|users| {
+            let idx = users
+                .iter()
+                .position(|u| u.id == user_id)
+                .ok_or("账户不存在")?;
+            if users[idx].status != AccountStatus::Rejected {
+                return Err("仅被拒绝的申请可以重新提交".to_string());
+            }
+            if name_taken(users, &mc_name, Some(user_id)) {
+                return Err("该游戏名已被占用".to_string());
+            }
+            let u = &mut users[idx];
+            u.minecraft_name = Some(mc_name.clone());
+            u.application_reason = reason.clone();
+            u.status = AccountStatus::Pending;
+            u.application_revision += 1;
+            u.reviewer = None;
+            u.rejection_reason = None;
+            u.reviewed_at = None;
+            u.updated_at = crate::util::now_str();
+            Ok(())
+        })
+        .await
+    }
+
+    /// 管理员批准申请（注册申请或游戏名变更申请），修订号必须匹配。
+    ///
+    /// 注册批准时在同一次原子写入中分配实例授权。
+    pub async fn approve_application(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        instance_ids: Vec<String>,
+        reviewer: &str,
+    ) -> Result<(), String> {
+        let ids = dedup_ids(instance_ids);
+        let reviewer = reviewer.to_string();
+        self.mutate(|users| {
+            if let Some(idx) = users.iter().position(|u| u.id == id) {
+                if users[idx].status != AccountStatus::Pending {
+                    return Err("申请状态已变化".to_string());
+                }
+                if users[idx].application_revision != expected_revision {
+                    return Err("申请已被修改，请刷新后重试".to_string());
+                }
+                let u = &mut users[idx];
+                u.status = AccountStatus::Approved;
+                u.instance_ids = ids.clone();
+                u.reviewer = Some(reviewer.clone());
+                u.reviewed_at = Some(crate::util::now_str());
+                u.rejection_reason = None;
+                u.application_revision += 1;
+                u.updated_at = crate::util::now_str();
+                return Ok(());
+            }
+            let pos = users
+                .iter()
+                .position(|u| {
+                    u.pending_name_change
+                        .as_ref()
+                        .map(|r| r.id == id)
+                        .unwrap_or(false)
+                })
+                .ok_or("申请不存在")?;
+            let (rev, new_name) = {
+                let r = users[pos].pending_name_change.as_ref().unwrap();
+                (r.revision, r.new_name.clone())
+            };
+            if rev != expected_revision {
+                return Err("申请已被修改，请刷新后重试".to_string());
+            }
+            let owner = users[pos].id.clone();
+            if name_taken(users, &new_name, Some(&owner)) {
+                return Err("该游戏名已被占用".to_string());
+            }
+            let mut req = users[pos].pending_name_change.take().unwrap();
+            req.status = AccountStatus::Approved;
+            req.reviewer = Some(reviewer.clone());
+            req.reviewed_at = Some(crate::util::now_str());
+            req.rejection_reason = None;
+            push_name_history(&mut users[pos], req);
+            users[pos].minecraft_name = Some(new_name);
+            users[pos].updated_at = crate::util::now_str();
+            Ok(())
+        })
+        .await
+    }
+
+    /// 管理员拒绝申请；拒绝必须给出理由，旧游戏名继续生效。
+    pub async fn reject_application(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        reason: &str,
+        reviewer: &str,
+    ) -> Result<(), String> {
+        let reason = reason.trim().to_string();
+        if reason.is_empty() {
+            return Err("拒绝理由不能为空".to_string());
+        }
+        if reason.chars().count() > MAX_REASON_LEN {
+            return Err(format!("拒绝理由最长 {MAX_REASON_LEN} 个字符"));
+        }
+        let reviewer = reviewer.to_string();
+        self.mutate(|users| {
+            if let Some(idx) = users.iter().position(|u| u.id == id) {
+                if users[idx].status != AccountStatus::Pending {
+                    return Err("申请状态已变化".to_string());
+                }
+                if users[idx].application_revision != expected_revision {
+                    return Err("申请已被修改，请刷新后重试".to_string());
+                }
+                let u = &mut users[idx];
+                u.status = AccountStatus::Rejected;
+                u.rejection_reason = Some(reason.clone());
+                u.reviewer = Some(reviewer.clone());
+                u.reviewed_at = Some(crate::util::now_str());
+                u.application_revision += 1;
+                u.updated_at = crate::util::now_str();
+                return Ok(());
+            }
+            let pos = users
+                .iter()
+                .position(|u| {
+                    u.pending_name_change
+                        .as_ref()
+                        .map(|r| r.id == id)
+                        .unwrap_or(false)
+                })
+                .ok_or("申请不存在")?;
+            let rev = users[pos].pending_name_change.as_ref().unwrap().revision;
+            if rev != expected_revision {
+                return Err("申请已被修改，请刷新后重试".to_string());
+            }
+            let mut req = users[pos].pending_name_change.take().unwrap();
+            req.status = AccountStatus::Rejected;
+            req.rejection_reason = Some(reason.clone());
+            req.reviewer = Some(reviewer.clone());
+            req.reviewed_at = Some(crate::util::now_str());
+            push_name_history(&mut users[pos], req);
+            users[pos].updated_at = crate::util::now_str();
+            Ok(())
+        })
+        .await
+    }
+
+    /// 已批准用户提交游戏名变更申请（首次绑定游戏名同样走此流程）。
+    pub async fn request_name_change(
+        &self,
+        user_id: &str,
+        minecraft_name: &str,
+        reason: &str,
+    ) -> Result<NameChangeRequest, String> {
+        let new_name = normalize_minecraft_name(minecraft_name)?;
+        let reason = reason.trim().to_string();
+        if reason.chars().count() > MAX_REASON_LEN {
+            return Err(format!("申请理由最长 {MAX_REASON_LEN} 个字符"));
+        }
+        let req = NameChangeRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            new_name: new_name.clone(),
+            reason,
+            status: AccountStatus::Pending,
+            revision: 1,
+            created_at: crate::util::now_str(),
+            reviewed_at: None,
+            reviewer: None,
+            rejection_reason: None,
+        };
+        let stored = req.clone();
+        self.mutate(|users| {
+            let idx = users
+                .iter()
+                .position(|u| u.id == user_id)
+                .ok_or("账户不存在")?;
+            if users[idx].status != AccountStatus::Approved {
+                return Err("账户尚未通过审核".to_string());
+            }
+            if users[idx].pending_name_change.is_some() {
+                return Err("已有待处理的游戏名变更申请".to_string());
+            }
+            if name_taken(users, &new_name, Some(user_id)) {
+                return Err("该游戏名已被占用".to_string());
+            }
+            users[idx].pending_name_change = Some(stored.clone());
+            users[idx].updated_at = crate::util::now_str();
+            Ok(())
+        })
+        .await?;
+        Ok(req)
+    }
+
+    /// 撤回自己的待处理游戏名变更申请。
+    pub async fn withdraw_name_change(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<(), String> {
+        self.mutate(|users| {
+            let idx = users
+                .iter()
+                .position(|u| u.id == user_id)
+                .ok_or("账户不存在")?;
+            let matches = users[idx]
+                .pending_name_change
+                .as_ref()
+                .map(|r| r.id == request_id)
+                .unwrap_or(false);
+            if !matches {
+                return Err("申请不存在".to_string());
+            }
+            users[idx].pending_name_change = None;
+            users[idx].updated_at = crate::util::now_str();
+            Ok(())
+        })
+        .await
+    }
+
+    /// 全部待处理/被拒的注册申请与游戏名变更申请（管理员）。
+    pub async fn applications(&self) -> Vec<Application> {
+        let users = self.inner.users.read().await;
+        let mut out = Vec::new();
+        for u in users.iter() {
+            if matches!(u.status, AccountStatus::Pending | AccountStatus::Rejected) {
+                out.push(registration_application(u));
+            }
+            if let Some(r) = &u.pending_name_change {
+                out.push(name_change_application(u, r));
+            }
+        }
+        out
+    }
+
+    /// 指定用户当前的申请：注册申请（待审/被拒）或待处理的游戏名变更申请。
+    pub async fn application_for_user(&self, user_id: &str) -> Option<Application> {
+        let users = self.inner.users.read().await;
+        let u = users.iter().find(|u| u.id == user_id)?;
+        if matches!(u.status, AccountStatus::Pending | AccountStatus::Rejected) {
+            return Some(registration_application(u));
+        }
+        u.pending_name_change
+            .as_ref()
+            .map(|r| name_change_application(u, r))
+    }
+
+    // ---------- 实例权限 ----------
+
+    /// 实例权限修订号：并发编辑冲突检测（首次访问惰性初始化为 1）。
+    pub async fn instance_permission_revision(&self, instance_id: &str) -> u64 {
+        let mut revs = self.inner.instance_revs.lock().await;
+        *revs.entry(instance_id.to_string()).or_insert(1)
+    }
+
+    /// 原子设置单个实例的授权账户集合：只改动该实例的授权，保留其余实例授权。
+    ///
+    /// 修订号必须与当前一致，否则返回冲突错误；成功后该实例修订号自增。
+    pub async fn set_instance_grants_checked(
+        &self,
+        instance_id: &str,
+        expected_revision: u64,
+        user_ids: Vec<String>,
+    ) -> Result<u64, String> {
+        let mut revs = self.inner.instance_revs.lock().await;
+        let current = *revs.entry(instance_id.to_string()).or_insert(1);
+        if current != expected_revision {
+            return Err("权限已被其他管理员修改，请刷新后重试".to_string());
+        }
+        let wanted: HashSet<String> = user_ids
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let instance_id = instance_id.to_string();
+        self.mutate(|users| {
+            for id in &wanted {
+                if !users.iter().any(|u| &u.id == id) {
+                    return Err(format!("账户不存在: {id}"));
+                }
+            }
+            for u in users.iter_mut() {
+                let has = u.instance_ids.iter().any(|i| i == &instance_id);
+                let want = wanted.contains(&u.id);
+                if want && !has {
+                    u.instance_ids.push(instance_id.clone());
+                    u.updated_at = crate::util::now_str();
+                } else if !want && has {
+                    u.instance_ids.retain(|i| i != &instance_id);
+                    u.updated_at = crate::util::now_str();
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        let next = current + 1;
+        revs.insert(instance_id, next);
+        Ok(next)
     }
 
     pub async fn delete(&self, user_id: &str) -> Result<(), String> {
@@ -620,6 +1139,18 @@ impl AuthStore {
         )
     }
 
+    /// 公开接口（注册 / 状态查询 / 重申）限流：与登录共用限流表但使用独立键前缀。
+    pub async fn reserve_public(&self, account_key: &str, source_key: &str) -> bool {
+        let mut l = self.inner.limiter.lock().await;
+        l.reserve_at(
+            &[
+                (account_key, RATE_MAX_PER_ACCOUNT),
+                (source_key, RATE_MAX_PER_SOURCE),
+            ],
+            Instant::now(),
+        )
+    }
+
     /// 登录成功：清除该账户的失败计数（来源计数保留，继续约束暴力尝试）。
     pub async fn login_succeeded(&self, account_key: &str) {
         self.inner.limiter.lock().await.clear(account_key);
@@ -641,6 +1172,7 @@ impl AuthStore {
             .await
             .map_err(|e| format!("持久化任务失败: {e}"))??;
         *users = next;
+        self.inner.revision.fetch_add(1, Ordering::SeqCst);
         Ok(out)
     }
 
@@ -700,7 +1232,7 @@ pub fn normalize_username(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
-fn validate_username(name: &str) -> Result<(), String> {
+pub(crate) fn validate_username(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("用户名不能为空".to_string());
     }
@@ -716,7 +1248,7 @@ fn validate_username(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> Result<(), String> {
+pub(crate) fn validate_password(password: &str) -> Result<(), String> {
     let len = password.chars().count();
     if len < MIN_PASSWORD_LEN {
         return Err(format!("密码至少 {MIN_PASSWORD_LEN} 位"));
@@ -725,6 +1257,80 @@ fn validate_password(password: &str) -> Result<(), String> {
         return Err(format!("密码最长 {MAX_PASSWORD_LEN} 位"));
     }
     Ok(())
+}
+
+/// 校验游戏名并返回保留原始大小写的值（仅去除首尾空白）。
+pub(crate) fn normalize_minecraft_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim().to_string();
+    let len = name.chars().count();
+    if len < MIN_MC_NAME_LEN || len > MAX_MC_NAME_LEN {
+        return Err(format!(
+            "游戏名长度需为 {MIN_MC_NAME_LEN}~{MAX_MC_NAME_LEN} 个字符"
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("游戏名只能包含字母、数字或下划线".to_string());
+    }
+    Ok(name)
+}
+
+/// 游戏名唯一性：忽略大小写，涵盖已占用名与待处理的变更预留名。
+fn name_taken(users: &[User], candidate: &str, exclude_user_id: Option<&str>) -> bool {
+    let needle = candidate.trim().to_ascii_lowercase();
+    users.iter().any(|u| {
+        if exclude_user_id == Some(u.id.as_str()) {
+            return false;
+        }
+        let current = u
+            .minecraft_name
+            .as_deref()
+            .map(|n| n.trim().to_ascii_lowercase() == needle)
+            .unwrap_or(false);
+        let reserved = u
+            .pending_name_change
+            .as_ref()
+            .map(|r| r.new_name.trim().to_ascii_lowercase() == needle)
+            .unwrap_or(false);
+        current || reserved
+    })
+}
+
+fn registration_application(u: &User) -> Application {
+    Application {
+        id: u.id.clone(),
+        kind: "registration".to_string(),
+        user_id: u.id.clone(),
+        username: u.username.clone(),
+        minecraft_name: u.minecraft_name.clone(),
+        reason: u.application_reason.clone(),
+        status: u.status,
+        revision: u.application_revision,
+        rejection_reason: u.rejection_reason.clone(),
+        created_at: u.created_at.clone(),
+    }
+}
+
+fn name_change_application(u: &User, r: &NameChangeRequest) -> Application {
+    Application {
+        id: r.id.clone(),
+        kind: "name_change".to_string(),
+        user_id: u.id.clone(),
+        username: u.username.clone(),
+        minecraft_name: Some(r.new_name.clone()),
+        reason: r.reason.clone(),
+        status: r.status,
+        revision: r.revision,
+        rejection_reason: r.rejection_reason.clone(),
+        created_at: r.created_at.clone(),
+    }
+}
+
+fn push_name_history(u: &mut User, req: NameChangeRequest) {
+    u.name_change_history.push(req);
+    if u.name_change_history.len() > MAX_NAME_HISTORY {
+        let overflow = u.name_change_history.len() - MAX_NAME_HISTORY;
+        u.name_change_history.drain(0..overflow);
+    }
 }
 
 fn dedup_ids(ids: Vec<String>) -> Vec<String> {
@@ -926,7 +1532,10 @@ mod tests {
             .is_err());
         assert!(s.verify_credentials("alice", "password123").await.is_some());
         assert!(s.verify_credentials("alice", "wrong").await.is_none());
-        assert!(s.verify_credentials("nobody", "password123").await.is_none());
+        assert!(s
+            .verify_credentials("nobody", "password123")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -995,11 +1604,7 @@ mod tests {
             .await
             .unwrap();
         assert!(s.session_identity(&token).await.is_none());
-        let epoch = s
-            .verify_credentials("bob", "newpassword1")
-            .await
-            .unwrap()
-            .1;
+        let epoch = s.verify_credentials("bob", "newpassword1").await.unwrap().1;
         let (token2, _) = s.start_session(&user.id, epoch).await.unwrap();
         s.set_role(&user.id, Role::Admin).await.unwrap();
         assert!(s.session_identity(&token2).await.is_none());
@@ -1045,10 +1650,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("已变更"));
         // 重置后的密码仍然有效，未被覆盖
-        assert!(s
-            .verify_credentials("bob", "anotherpass1")
-            .await
-            .is_some());
+        assert!(s.verify_credentials("bob", "anotherpass1").await.is_some());
     }
 
     #[test]
@@ -1129,11 +1731,7 @@ mod tests {
         // 取消等待中的 async future（阻塞任务仍在运行并持有许可）
         handle.abort();
         let _ = handle.await;
-        assert_eq!(
-            sem.available_permits(),
-            0,
-            "取消后阻塞任务必须继续持有许可"
-        );
+        assert_eq!(sem.available_permits(), 0, "取消后阻塞任务必须继续持有许可");
         done_rx.await.unwrap();
         // 阻塞任务结束后许可才归还
         let mut released = false;
@@ -1158,7 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_schema_is_rejected() {
-        for version in [0u32, 2, 999] {
+        for version in [0u32, 3, 999] {
             let dir = temp_dir();
             let auth = dir.0.join("auth");
             std::fs::create_dir_all(&auth).unwrap();
@@ -1169,12 +1767,15 @@ mod tests {
                 "schema_version={version} 应被拒绝"
             );
         }
-        // 受支持版本可加载
-        let dir = temp_dir();
-        let auth = dir.0.join("auth");
-        std::fs::create_dir_all(&auth).unwrap();
-        std::fs::write(auth.join("users.json"), "{\"schema_version\":1,\"users\":[]}").unwrap();
-        assert!(AuthStore::load(&dir.0).is_ok());
+        // 受支持版本（含迁移来源 v1）可加载
+        for version in [1u32, 2] {
+            let dir = temp_dir();
+            let auth = dir.0.join("auth");
+            std::fs::create_dir_all(&auth).unwrap();
+            let body = format!("{{\"schema_version\":{version},\"users\":[]}}");
+            std::fs::write(auth.join("users.json"), body).unwrap();
+            assert!(AuthStore::load(&dir.0).is_ok());
+        }
     }
 
     #[tokio::test]
@@ -1188,5 +1789,158 @@ mod tests {
         drop(first);
         // 释放后可以再次获取
         assert!(AuthStore::load(&dir.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_account_migrates_to_approved() {
+        let dir = temp_dir();
+        let auth = dir.0.join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        let body = r#"{"schema_version":1,"users":[{"id":"u1","username":"old","password_hash":"x","role":"user","enabled":true,"instance_ids":[],"session_epoch":0,"created_at":"","updated_at":""}]}"#;
+        std::fs::write(auth.join("users.json"), body).unwrap();
+        let store = AuthStore::load(&dir.0).unwrap();
+        let users = store.list().await;
+        let old = users.iter().find(|u| u.username == "old").unwrap();
+        assert_eq!(old.status, AccountStatus::Approved);
+        assert!(old.minecraft_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_creates_pending_unique_user() {
+        let (s, _dir) = store().await;
+        let pending = s
+            .register_pending_user("Alice", "password123", "Steve", "请批准")
+            .await
+            .unwrap();
+        assert_eq!(pending.status, AccountStatus::Pending);
+        assert_eq!(pending.role, Role::User);
+        assert_eq!(pending.minecraft_name.as_deref(), Some("Steve"));
+        // 大小写不敏感的游戏名占用
+        assert!(s
+            .register_pending_user("bob", "password123", "steve", "x")
+            .await
+            .is_err());
+        // 用户名重复
+        assert!(s
+            .register_pending_user("alice", "password123", "Alex", "x")
+            .await
+            .is_err());
+        // 待审批账户仍可用凭据查询（登录接口再判定状态）
+        let (user, _epoch) = s.verify_credentials("alice", "password123").await.unwrap();
+        assert_eq!(user.status, AccountStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn name_change_reserves_name_and_revision_guards_approval() {
+        let (s, _dir) = store().await;
+        let u = s
+            .register_pending_user("alice", "password123", "Alice", "reason")
+            .await
+            .unwrap();
+        s.approve_application(&u.id, 1, vec![], "root")
+            .await
+            .unwrap();
+        let req = s.request_name_change(&u.id, "Neo", "改名").await.unwrap();
+        // 新名被预留（大小写不敏感）
+        assert!(s
+            .register_pending_user("bob", "password123", "neo", "x")
+            .await
+            .is_err());
+        // 错误修订号被拒
+        assert!(s
+            .approve_application(&req.id, 99, vec![], "root")
+            .await
+            .is_err());
+        // 正确修订号批准：用户名与登录不变，游戏名更新
+        s.approve_application(&req.id, req.revision, vec![], "root")
+            .await
+            .unwrap();
+        let after = s.get(&u.id).await.unwrap();
+        assert_eq!(after.username, "alice");
+        assert_eq!(after.minecraft_name.as_deref(), Some("Neo"));
+        // 旧名释放，可再次注册
+        assert!(s
+            .register_pending_user("carol", "password123", "Alice", "x")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn reject_and_resubmit_bumps_revision() {
+        let (s, _dir) = store().await;
+        let u = s
+            .register_pending_user("dave", "password123", "Dave", "reason")
+            .await
+            .unwrap();
+        s.reject_application(&u.id, 1, "资料不全", "root")
+            .await
+            .unwrap();
+        // 被拒后仍可用旧密码查询状态
+        assert!(s.verify_credentials("dave", "password123").await.is_some());
+        // 重申回到待审批，修订号自增
+        s.resubmit_application(&u.id, "Dave2", "补充资料")
+            .await
+            .unwrap();
+        let after = s.get(&u.id).await.unwrap();
+        assert_eq!(after.status, AccountStatus::Pending);
+        assert_eq!(after.minecraft_name.as_deref(), Some("Dave2"));
+        // 旧修订号批准被拒
+        assert!(s
+            .approve_application(&u.id, 1, vec![], "root")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn instance_grants_are_scoped_and_revision_checked() {
+        let (s, _dir) = store().await;
+        let a = s
+            .create_user("a", "password123", Role::User, vec!["inst-x".to_string()])
+            .await
+            .unwrap();
+        let b = s
+            .create_user("b", "password123", Role::User, vec![])
+            .await
+            .unwrap();
+        let rev = s.instance_permission_revision("inst-y").await;
+        let next = s
+            .set_instance_grants_checked("inst-y", rev, vec![a.id.clone(), b.id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(next, rev + 1);
+        let a_after = s.get(&a.id).await.unwrap();
+        assert!(a_after.instance_ids.iter().any(|i| i == "inst-y"));
+        assert!(a_after.instance_ids.iter().any(|i| i == "inst-x"));
+        // 陈旧修订号冲突
+        assert!(s
+            .set_instance_grants_checked("inst-y", rev, vec![a.id.clone()])
+            .await
+            .is_err());
+        // 仅改变 inst-y：a 失去 inst-y，b 获得，inst-x 保留
+        s.set_instance_grants_checked("inst-y", next, vec![b.id.clone()])
+            .await
+            .unwrap();
+        let a_final = s.get(&a.id).await.unwrap();
+        assert!(!a_final.instance_ids.iter().any(|i| i == "inst-y"));
+        assert!(a_final.instance_ids.iter().any(|i| i == "inst-x"));
+    }
+
+    #[tokio::test]
+    async fn approved_named_grants_and_revision_track_changes() {
+        let (s, _dir) = store().await;
+        let u = s
+            .register_pending_user("alice", "password123", "Alice", "r")
+            .await
+            .unwrap();
+        let before = s.revision();
+        s.approve_application(&u.id, 1, vec!["inst-a".to_string()], "root")
+            .await
+            .unwrap();
+        let grants = s.approved_named_grants().await;
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].1, "Alice");
+        assert_eq!(grants[0].2, vec!["inst-a".to_string()]);
+        assert!(!grants[0].3);
+        assert!(s.revision() > before);
     }
 }

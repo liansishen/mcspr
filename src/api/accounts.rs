@@ -112,7 +112,7 @@ pub async fn set_instances(
 }
 
 /// 授权保存前校验实例存在，避免写入无效实例 ID。
-async fn validate_instance_ids(state: &AppState, ids: &[String]) -> Result<(), String> {
+pub(crate) async fn validate_instance_ids(state: &AppState, ids: &[String]) -> Result<(), String> {
     let map = state.instances.read().await;
     for id in ids {
         let id = id.trim();

@@ -1,4 +1,5 @@
 mod accounts;
+mod applications;
 mod announcement;
 mod auth;
 mod backup;
@@ -7,6 +8,7 @@ mod extras;
 mod console;
 mod instances;
 mod overview;
+mod permissions;
 mod resources;
 #[cfg(test)]
 mod tests;
@@ -21,7 +23,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -46,10 +48,35 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/password", put(auth::password))
+        .route("/auth/registration-config", get(auth::registration_config))
+        .route(
+            "/auth/register",
+            post(auth::register).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/auth/application/status",
+            post(auth::application_status).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/auth/application/resubmit",
+            post(auth::application_resubmit).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route("/auth/profile", get(auth::profile))
+        .route(
+            "/auth/minecraft-name-requests",
+            post(auth::create_name_request),
+        )
+        .route(
+            "/auth/minecraft-name-requests/{id}",
+            delete(auth::delete_name_request),
+        )
         .route("/accounts", get(accounts::list).post(accounts::create))
         .route("/accounts/{id}", patch(accounts::patch).delete(accounts::remove))
         .route("/accounts/{id}/password", put(accounts::reset_password))
         .route("/accounts/{id}/instances", put(accounts::set_instances))
+        .route("/applications", get(applications::list))
+        .route("/applications/{id}/approve", post(applications::approve))
+        .route("/applications/{id}/reject", post(applications::reject))
         .route("/announcements/preview", post(announcement::preview))
         .route("/stats", get(instances::stats))
         .route("/instances", get(instances::list).post(instances::create))
@@ -86,6 +113,10 @@ pub fn router(state: AppState) -> Router {
         .route("/instances/{id}/ws", get(console::ws))
         .route("/instances/{id}/users", get(resources::users_get))
         .route("/instances/{id}/users/action", post(resources::users_action))
+        .route(
+            "/instances/{id}/permissions",
+            get(permissions::get).put(permissions::put),
+        )
         .route("/instances/{id}/mods", get(resources::mods_list))
         .route("/instances/{id}/mods/toggle", post(resources::mods_toggle))
         .route("/instances/{id}/mods/delete", post(resources::mods_delete))
@@ -234,6 +265,15 @@ fn classify(method: &Method, path: &str) -> (Access, Option<String>) {
         {
             (Access::Authenticated, Some((*id).to_string()))
         }
+        ["auth", "registration-config"] if get => (Access::Public, None),
+        ["auth", "register"] if post => (Access::Public, None),
+        ["auth", "application", "status"] if post => (Access::Public, None),
+        ["auth", "application", "resubmit"] if post => (Access::Public, None),
+        ["auth", "profile"] if get => (Access::Authenticated, None),
+        ["auth", "minecraft-name-requests"] if post => (Access::Authenticated, None),
+        ["auth", "minecraft-name-requests", _] if method == Method::DELETE => {
+            (Access::Authenticated, None)
+        }
         _ => (Access::Admin, None),
     }
 }
@@ -378,12 +418,14 @@ pub(crate) fn api_error_actor(
 async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
     // 认证始终必需；`initialized` 表示是否已创建账户（未初始化时业务接口保持封闭）
     let initialized = state.auth.has_users().await;
+    let registration_enabled = state.config.read().await.registration_enabled;
     Json(json!({
         "ok": true,
         "name": "MCS Panel",
         "version": env!("CARGO_PKG_VERSION"),
         "auth_required": true,
         "initialized": initialized,
+        "registration_enabled": registration_enabled,
     }))
 }
 
@@ -396,6 +438,11 @@ struct SettingsUpdate {
     telegram_bot_token: Option<String>,
     console_max_lines: Option<usize>,
     console_buffer_lines: Option<usize>,
+    registration_enabled: Option<bool>,
+    turnstile_site_key: Option<String>,
+    turnstile_secret_key: Option<String>,
+    turnstile_allowed_hostnames: Option<Vec<String>>,
+    turnstile_test_mode: Option<bool>,
 }
 
 /// 设置读取：机密字段（token / CurseForge Key / Telegram Token）脱敏返回，
@@ -420,6 +467,12 @@ async fn get_settings(State(state): State<AppState>) -> Json<serde_json::Value> 
         "console_buffer_lines": c.console_buffer_lines,
         "console_lines_range": [*config::CONSOLE_LINES_RANGE.start(), *config::CONSOLE_LINES_RANGE.end()],
         "console_buffer_range": [*config::CONSOLE_BUFFER_RANGE.start(), *config::CONSOLE_BUFFER_RANGE.end()],
+        "registration_enabled": c.registration_enabled,
+        "turnstile_site_key": c.turnstile_site_key,
+        "turnstile_secret_key": "",
+        "turnstile_secret_key_set": !c.turnstile_secret_key.is_empty(),
+        "turnstile_allowed_hostnames": c.turnstile_allowed_hostnames,
+        "turnstile_test_mode": c.turnstile_test_mode,
     }))
 }
 
@@ -427,59 +480,89 @@ async fn put_settings(
     State(state): State<AppState>,
     Json(u): Json<SettingsUpdate>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    {
-        let mut cfg = state.config.write().await;
-        if let Some(l) = u.listen {
-            if !l.trim().is_empty() {
-                cfg.listen = l.trim().to_string();
-            }
+    let mut cfg = state.config.read().await.clone();
+    if let Some(l) = u.listen {
+        if !l.trim().is_empty() {
+            cfg.listen = l.trim().to_string();
         }
-        // 机密字段：留空 = 保持不变（配合前端脱敏显示）；如需清除请编辑 config.toml
-        if let Some(t) = u.token {
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                cfg.token = t;
-            }
-        }
-        if let Some(d) = u.data_dir {
-            if !d.trim().is_empty() {
-                cfg.data_dir = d.trim().to_string();
-            }
-        }
-        if let Some(k) = u.curseforge_api_key {
-            let k = k.trim().to_string();
-            if !k.is_empty() {
-                cfg.curseforge_api_key = k;
-            }
-        }
-        if let Some(n) = u.console_max_lines {
-            if !config::CONSOLE_LINES_RANGE.contains(&n) {
-                return Err(ApiError::bad_request(format!(
-                    "控制台显示行数需在 {}~{} 之间",
-                    config::CONSOLE_LINES_RANGE.start(),
-                    config::CONSOLE_LINES_RANGE.end()
-                )));
-            }
-            cfg.console_max_lines = n;
-        }
-        if let Some(n) = u.console_buffer_lines {
-            if !config::CONSOLE_BUFFER_RANGE.contains(&n) {
-                return Err(ApiError::bad_request(format!(
-                    "控制台缓存行数需在 {}~{} 之间",
-                    config::CONSOLE_BUFFER_RANGE.start(),
-                    config::CONSOLE_BUFFER_RANGE.end()
-                )));
-            }
-            cfg.console_buffer_lines = n;
-        }
-        if let Some(k) = u.telegram_bot_token {
-            let k = k.trim().to_string();
-            if !k.is_empty() {
-                cfg.telegram_bot_token = k;
-            }
-        }
-        config::save(&cfg)?;
     }
+    // 机密字段：留空 = 保持不变（配合前端脱敏显示）；如需清除请编辑 config.toml
+    if let Some(t) = u.token {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            cfg.token = t;
+        }
+    }
+    if let Some(d) = u.data_dir {
+        if !d.trim().is_empty() {
+            cfg.data_dir = d.trim().to_string();
+        }
+    }
+    if let Some(k) = u.curseforge_api_key {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            cfg.curseforge_api_key = k;
+        }
+    }
+    if let Some(n) = u.console_max_lines {
+        if !config::CONSOLE_LINES_RANGE.contains(&n) {
+            return Err(ApiError::bad_request(format!(
+                "控制台显示行数需在 {}~{} 之间",
+                config::CONSOLE_LINES_RANGE.start(),
+                config::CONSOLE_LINES_RANGE.end()
+            )));
+        }
+        cfg.console_max_lines = n;
+    }
+    if let Some(n) = u.console_buffer_lines {
+        if !config::CONSOLE_BUFFER_RANGE.contains(&n) {
+            return Err(ApiError::bad_request(format!(
+                "控制台缓存行数需在 {}~{} 之间",
+                config::CONSOLE_BUFFER_RANGE.start(),
+                config::CONSOLE_BUFFER_RANGE.end()
+            )));
+        }
+        cfg.console_buffer_lines = n;
+    }
+    if let Some(k) = u.telegram_bot_token {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            cfg.telegram_bot_token = k;
+        }
+    }
+    if let Some(v) = u.registration_enabled {
+        cfg.registration_enabled = v;
+    }
+    if let Some(k) = u.turnstile_site_key {
+        cfg.turnstile_site_key = k.trim().to_string();
+    }
+    if let Some(k) = u.turnstile_secret_key {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            cfg.turnstile_secret_key = k;
+        }
+    }
+    if let Some(list) = u.turnstile_allowed_hostnames {
+        let mut cleaned: Vec<String> = Vec::new();
+        for h in list {
+            let h = h.trim().to_string();
+            if !h.is_empty() && !cleaned.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+                cleaned.push(h);
+            }
+        }
+        cfg.turnstile_allowed_hostnames = cleaned;
+    }
+    if let Some(v) = u.turnstile_test_mode {
+        cfg.turnstile_test_mode = v;
+    }
+    // 开启注册前必须完成有效的人机验证配置（失败关闭）
+    if cfg.registration_enabled {
+        crate::captcha::TurnstileSettings::from_config(&cfg)
+            .is_configured()
+            .map_err(|e| ApiError::bad_request(e))?;
+    }
+    config::save(&cfg)?;
+    *state.config.write().await = cfg;
     // 控制台缓存上限对运行中的实例立即生效
     {
         let limit = state.config.read().await.console_buffer_lines;
@@ -639,7 +722,8 @@ async fn audit_query(
 }
 
 async fn config_export(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let cfg = state.config.read().await.clone();
+    let mut cfg = state.config.read().await.clone();
+    redact_secrets(&mut cfg);
     let map = state.instances.read().await;
     let mut metas = Vec::new();
     for rt in map.values() {
@@ -647,6 +731,14 @@ async fn config_export(State(state): State<AppState>) -> Json<serde_json::Value>
     }
     drop(map);
     Json(json!({ "version": env!("CARGO_PKG_VERSION"), "settings": cfg, "instances": metas }))
+}
+
+/// 导出配置前抹除机密字段，避免秘密随导出泄露。
+fn redact_secrets(cfg: &mut crate::config::PanelConfig) {
+    cfg.token = String::new();
+    cfg.curseforge_api_key = String::new();
+    cfg.telegram_bot_token = String::new();
+    cfg.turnstile_secret_key = String::new();
 }
 
 #[derive(Deserialize)]
@@ -681,7 +773,23 @@ async fn config_import(
         imported += 1;
     }
     let mut note = String::new();
-    if let Some(cfg) = data.settings {
+    if let Some(mut cfg) = data.settings {
+        // 脱敏导出的机密字段为空时保留现值，避免导入清除密钥
+        {
+            let current = state.config.read().await;
+            if cfg.token.is_empty() {
+                cfg.token = current.token.clone();
+            }
+            if cfg.curseforge_api_key.is_empty() {
+                cfg.curseforge_api_key = current.curseforge_api_key.clone();
+            }
+            if cfg.telegram_bot_token.is_empty() {
+                cfg.telegram_bot_token = current.telegram_bot_token.clone();
+            }
+            if cfg.turnstile_secret_key.is_empty() {
+                cfg.turnstile_secret_key = current.turnstile_secret_key.clone();
+            }
+        }
         let cfg_path = std::path::Path::new("config.toml");
         if cfg_path.exists() {
             let _ = std::fs::copy(cfg_path, std::path::Path::new(&format!("config.toml.bak-{ts}")));

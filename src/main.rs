@@ -2,6 +2,7 @@ mod alerts;
 mod api;
 mod auth;
 mod audit;
+mod captcha;
 mod config;
 mod error;
 mod instance;
