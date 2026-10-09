@@ -108,6 +108,8 @@ pub async fn restore(
         .and_then(|r| r.map_err(ApiError::bad_request));
     state.release_busy(&id);
     r?;
+    // 恢复后实例文件可能回退，后台重新协调白名单
+    super::whitelist_sync::trigger();
     Ok(Json(json!({ "ok": true })))
 }
 

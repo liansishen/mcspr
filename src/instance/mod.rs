@@ -177,6 +177,8 @@ pub struct InstanceSummary {
     pub mc_version: Option<String>,
     pub mod_loader: Option<String>,
     pub eula_accepted: bool,
+    /// 白名单身份模式覆盖（仅管理员详情返回，普通用户 SafeSummary 不含）
+    pub whitelist_identity: Option<WhitelistIdentity>,
 }
 
 impl InstanceRuntime {
@@ -289,6 +291,7 @@ impl InstanceRuntime {
             mc_version: meta.mc_version,
             mod_loader: meta.mod_loader,
             eula_accepted: eula_accepted(&self.dir),
+            whitelist_identity: meta.whitelist_identity,
         }
     }
 }

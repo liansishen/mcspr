@@ -93,6 +93,9 @@ async fn main() -> anyhow::Result<()> {
 
     let app = api::router(app_state.clone());
 
+    // 白名单后台协调器：启动即协调一次，之后按周期兜底并响应各写入后的触发
+    api::spawn_scheduler(app_state.clone());
+
     // 自动拉起开启了「面板启动时自动运行」的实例（间隔 5 秒逐个启动，避免端口冲突）
     {
         let instances = app_state.instances.read().await.clone();

@@ -2,7 +2,9 @@ use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::instance::modpack;
 use crate::instance::process;
-use crate::instance::{get_instance, InstanceMeta, InstanceRuntime, InstanceSummary, Status};
+use crate::instance::{
+    get_instance, InstanceMeta, InstanceRuntime, InstanceSummary, Status, WhitelistIdentity,
+};
 use crate::jobs::finish_job;
 use crate::state::AppState;
 use crate::util::now_str;
@@ -146,6 +148,8 @@ pub async fn create(
     tokio::fs::write(dir.join("instance.json"), serde_json::to_string_pretty(&meta)?).await?;
     let rt = InstanceRuntime::new(meta, dir);
     state.instances.write().await.insert(id.clone(), rt);
+    // 新实例需立即纳入白名单协调（管理员覆盖全部实例）
+    super::whitelist_sync::trigger();
 
     if let Some(loader) = mod_loader {
         // 模组服安装任务
@@ -263,6 +267,19 @@ pub struct UpdateReq {
     pub jvm_args: Option<String>,
     pub auto_restart: Option<bool>,
     pub auto_start_on_boot: Option<bool>,
+    /// 白名单身份模式覆盖：显式设置 online/offline，null 清除（回退自动判定），缺省不变
+    #[serde(default, deserialize_with = "deserialize_optional_identity")]
+    pub whitelist_identity_override: Option<Option<WhitelistIdentity>>,
+}
+
+/// 区分「字段缺省」与「显式 null」：缺省保持不变，null 清除覆盖。
+fn deserialize_optional_identity<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<WhitelistIdentity>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<WhitelistIdentity>::deserialize(deserializer)?))
 }
 
 pub async fn update(
@@ -300,11 +317,16 @@ pub async fn update(
         if let Some(v) = req.auto_start_on_boot {
             meta.auto_start_on_boot = v;
         }
+        if let Some(v) = req.whitelist_identity_override {
+            meta.whitelist_identity = v;
+        }
         if meta.min_ram_mb > meta.max_ram_mb {
             meta.min_ram_mb = meta.max_ram_mb;
         }
     }
     rt.persist().await?;
+    // 身份模式可能变化，后台重新协调白名单
+    super::whitelist_sync::trigger();
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -332,6 +354,8 @@ pub async fn start(
 ) -> ApiResult<Json<serde_json::Value>> {
     let rt = get_instance(&state, &id).await?;
     process::start(state.clone(), rt).await?;
+    // 启动后白名单可能需重下发（Starting 阶段会延后，由周期协调兜底）
+    super::whitelist_sync::trigger();
     Ok(Json(json!({ "ok": true })))
 }
 

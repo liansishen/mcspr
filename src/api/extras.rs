@@ -149,6 +149,8 @@ pub async fn clone_instance(
     .await?;
     let new_rt = InstanceRuntime::new(meta, new_dir);
     state.instances.write().await.insert(new_id.clone(), new_rt);
+    // 克隆实例需立即纳入白名单协调
+    super::whitelist_sync::trigger();
     Ok(Json(json!({ "id": new_id, "port": port })))
 }
 
@@ -249,6 +251,8 @@ pub async fn reinstall(
             crate::instance::loaders::install(&st2, &jid, &iid, &loader_c, &game_c, &lver_c).await;
         }
         st2.release_busy(&iid);
+        // 重装后服务端类型可能变化（如改为代理端），后台重新协调
+        super::whitelist_sync::trigger();
         crate::jobs::log_job(
             &st2,
             &jid,

@@ -300,6 +300,8 @@ pub async fn restore(
         .map_err(|e| e.to_string())
         .and_then(|r| r);
         finish_job(&st, &job_id, result.err(), Some(id));
+        // 恢复完成后后台重新协调白名单
+        super::whitelist_sync::trigger();
     });
     Ok(Json(json!({"job_id": jid})))
 }

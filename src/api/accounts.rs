@@ -34,7 +34,10 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateAccount
         .create_user(&req.username, &req.password, role, req.instance_ids)
         .await
     {
-        Ok(user) => (StatusCode::CREATED, Json(json!({ "account": user }))).into_response(),
+        Ok(user) => {
+            super::whitelist_sync::trigger();
+            (StatusCode::CREATED, Json(json!({ "account": user }))).into_response()
+        }
         Err(e) => super::api_error(StatusCode::BAD_REQUEST, e),
     }
 }
@@ -61,14 +64,20 @@ pub async fn patch(
     };
     // 角色与启用状态在同一次原子写入中应用，并与最后管理员校验保持一致
     match state.auth.update_user(&id, req.enabled, role).await {
-        Ok(user) => Json(json!({ "account": user })).into_response(),
+        Ok(user) => {
+            super::whitelist_sync::trigger();
+            Json(json!({ "account": user })).into_response()
+        }
         Err(e) => super::api_error(StatusCode::BAD_REQUEST, e),
     }
 }
 
 pub async fn remove(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.auth.delete(&id).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            super::whitelist_sync::trigger();
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => super::api_error(StatusCode::BAD_REQUEST, e),
     }
 }
@@ -103,10 +112,13 @@ pub async fn set_instances(
         return super::api_error(StatusCode::BAD_REQUEST, e);
     }
     match state.auth.set_instances(&id, req.instance_ids).await {
-        Ok(()) => match state.auth.get(&id).await {
-            Some(user) => Json(json!({ "account": user })).into_response(),
-            None => super::api_error(StatusCode::NOT_FOUND, "账户不存在"),
-        },
+        Ok(()) => {
+            super::whitelist_sync::trigger();
+            match state.auth.get(&id).await {
+                Some(user) => Json(json!({ "account": user })).into_response(),
+                None => super::api_error(StatusCode::NOT_FOUND, "账户不存在"),
+            }
+        }
         Err(e) => super::api_error(StatusCode::BAD_REQUEST, e),
     }
 }

@@ -12,6 +12,8 @@ mod overview;
 mod permissions;
 mod public_operations;
 mod resources;
+mod whitelist_sync;
+pub(crate) use whitelist_sync::spawn_scheduler;
 #[cfg(test)]
 mod tests;
 
@@ -227,6 +229,11 @@ pub fn router(state: AppState) -> Router {
             "/instances/{id}/announcement",
             get(announcement::get).put(announcement::put),
         )
+        .route("/instances/{id}/whitelist-sync", get(whitelist_sync::get))
+        .route(
+            "/instances/{id}/whitelist-sync/retry",
+            post(whitelist_sync::retry),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), jobs::operation_mw))
         .layer(middleware::from_fn_with_state(state.clone(), public_operations::middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
@@ -285,6 +292,9 @@ fn classify(method: &Method, path: &str) -> (Access, Option<String>) {
         ["jobs", _id] if get => (Access::Authenticated, None),
         ["jobs", _id, "retry"] if post => (Access::Authenticated, None),
         ["operations", _id] if get => (Access::Authenticated, None),
+        // 白名单同步状态 / 重试仅管理员可见（也便于后续调整默认级别）
+        ["instances", _id, "whitelist-sync"] if get => (Access::Admin, None),
+        ["instances", _id, "whitelist-sync", "retry"] if post => (Access::Admin, None),
         _ => (Access::Admin, None),
     }
 }

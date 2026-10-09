@@ -676,10 +676,16 @@ impl AuthStore {
     /// 返回 `(user_id, minecraft_name, instance_ids, is_admin)`；管理员 `is_admin=true`，
     /// 其有效范围为全部实例，`instance_ids` 仅记录显式授权。缺少游戏名的账户不生成条目。
     pub async fn approved_named_grants(&self) -> Vec<(String, String, Vec<String>, bool)> {
-        self.inner
-            .users
-            .read()
-            .await
+        self.approved_grants_snapshot().await.1
+    }
+
+    /// 原子读取「修订号 + 已批准具名授权」：在同一账户读锁内取值，
+    /// 保证 grants 与 revision 属于同一版本（`mutate` 在写锁内推进 revision）。
+    pub async fn approved_grants_snapshot(
+        &self,
+    ) -> (u64, Vec<(String, String, Vec<String>, bool)>) {
+        let users = self.inner.users.read().await;
+        let grants = users
             .iter()
             .filter(|u| u.status == AccountStatus::Approved && u.enabled)
             .filter_map(|u| {
@@ -692,7 +698,9 @@ impl AuthStore {
                     )
                 })
             })
-            .collect()
+            .collect();
+        let revision = self.inner.revision.load(Ordering::SeqCst);
+        (revision, grants)
     }
 
     /// 注册：始终创建待审批的普通用户，忽略客户端可注入的角色与授权。
@@ -1942,5 +1950,23 @@ mod tests {
         assert_eq!(grants[0].2, vec!["inst-a".to_string()]);
         assert!(!grants[0].3);
         assert!(s.revision() > before);
+    }
+
+    #[tokio::test]
+    async fn approved_grants_snapshot_is_consistent_with_revision() {
+        let (s, _dir) = store().await;
+        let u = s
+            .register_pending_user("alice", "password123", "Alice", "r")
+            .await
+            .unwrap();
+        s.approve_application(&u.id, 1, vec!["inst-a".to_string()], "root")
+            .await
+            .unwrap();
+        let (revision, grants) = s.approved_grants_snapshot().await;
+        assert_eq!(revision, s.revision(), "快照修订号应与当前修订号一致");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].1, "Alice");
+        assert_eq!(grants[0].2, vec!["inst-a".to_string()]);
+        assert!(!grants[0].3);
     }
 }

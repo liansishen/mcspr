@@ -1570,3 +1570,96 @@ async fn registration_operation_replays_before_captcha_and_checks_origin() {
     assert!(!persisted.contains("password123"));
     assert!(!persisted.contains(crate::captcha::TEST_PASS_TOKEN));
 }
+// ---------- 白名单同步路由与身份模式覆盖 ----------
+
+#[tokio::test]
+async fn whitelist_sync_routes_are_admin_only() {
+    let h = setup(&["inst-a"]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    create_user(&h, "alice", Role::User, &["inst-a"]).await;
+    let (admin_cookie, admin_csrf) = login(&h, "root", "password123").await;
+    let (alice_cookie, alice_csrf) = login(&h, "alice", "password123").await;
+
+    for (method, uri) in [
+        ("GET", "/api/instances/inst-a/whitelist-sync"),
+        ("POST", "/api/instances/inst-a/whitelist-sync/retry"),
+    ] {
+        // 普通用户即使被授权该实例也不得访问
+        let (status, _) = call(
+            &h,
+            req(method, uri)
+                .header(header::COOKIE, &alice_cookie)
+                .header("x-csrf-token", &alice_csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "普通用户应被拒绝: {method} {uri}");
+
+        // 管理员可访问
+        let (status, _) = call(
+            &h,
+            req(method, uri)
+                .header(header::COOKIE, &admin_cookie)
+                .header("x-csrf-token", &admin_csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "管理员应可访问: {method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn instance_update_override_echoes_and_clears() {
+    let h = setup(&["inst-a"]).await;
+    create_user(&h, "root", Role::Admin, &[]).await;
+    create_user(&h, "alice", Role::User, &["inst-a"]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+
+    let patch = |payload: Value| {
+        req("PATCH", "/api/instances/inst-a")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let detail = || {
+        req("GET", "/api/instances/inst-a")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // 设置覆盖，管理员详情回显
+    let (status, _) = call(&h, patch(json!({ "whitelist_identity_override": "offline" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&h, detail()).await;
+    assert_eq!(body["whitelist_identity"], "offline");
+
+    // 缺省字段不清除已有覆盖
+    let (status, _) = call(&h, patch(json!({ "name": "renamed" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&h, detail()).await;
+    assert_eq!(body["whitelist_identity"], "offline", "缺省不应清除覆盖");
+
+    // 普通用户详情不暴露管理字段
+    let (alice_cookie, _) = login(&h, "alice", "password123").await;
+    let (status, body) = call(
+        &h,
+        req("GET", "/api/instances/inst-a")
+            .header(header::COOKIE, &alice_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("whitelist_identity").is_none(), "普通用户不应看到覆盖字段");
+
+    // 显式 null 清除覆盖
+    let (status, _) = call(&h, patch(json!({ "whitelist_identity_override": null }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&h, detail()).await;
+    assert!(body["whitelist_identity"].is_null(), "null 应清除覆盖");
+}

@@ -37,7 +37,10 @@ pub async fn approve(
         .approve_application(&id, req.revision, req.instance_ids, &identity.username)
         .await
     {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            super::whitelist_sync::trigger();
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => apply_error(e),
     }
 }

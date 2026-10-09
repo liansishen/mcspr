@@ -84,7 +84,10 @@ pub async fn put(
         .set_instance_grants_checked(&id, req.revision, req.user_ids)
         .await
     {
-        Ok(_) => Json(build_view(&state, &id).await).into_response(),
+        Ok(_) => {
+            super::whitelist_sync::trigger();
+            Json(build_view(&state, &id).await).into_response()
+        }
         Err(e) => {
             let status = if e.contains("已被其他管理员修改") {
                 StatusCode::CONFLICT
