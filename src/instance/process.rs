@@ -190,6 +190,8 @@ async fn on_exit(
     // 结算未闭合的玩家在线会话（可观测性）
     settle_all_sessions(&rt).await;
     *rt.status.lock().await = Status::Stopped;
+    // 退出后白名单可原子写文件，唤醒协调以收敛运行期间未生效的成员
+    crate::api::whitelist_sync::trigger();
 
     // 崩溃归档（异常退出时保存控制台末尾 + crash-report）
     if !stopping {
@@ -414,11 +416,20 @@ async fn push_raw(rt: &Arc<InstanceRuntime>, line: String) {
         settle_playtime(rt, &p).await;
     }
     if line.contains("Done (") {
-        rt.ready.store(true, Ordering::SeqCst);
-        if rt.ready.load(Ordering::SeqCst) {
-            *rt.status.lock().await = Status::Running;
+        if mark_ready(rt).await {
+            // 就绪后白名单可能需要重下发（例如启动期间延后的成员）
+            crate::api::whitelist_sync::trigger();
         }
     }
+}
+
+/// 处理服务端就绪：首次就绪时置为 Running 并返回 true（供调用方触发白名单协调）。
+async fn mark_ready(rt: &Arc<InstanceRuntime>) -> bool {
+    if rt.ready.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    *rt.status.lock().await = Status::Running;
+    true
 }
 
 /// 原子关闭玩家会话并累计时长，保持玩家快照的一致性。
@@ -638,6 +649,23 @@ mod tests {
             vec!["line 3", "line 4", "line 5"]
         );
         drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn readiness_line_marks_running_once_and_triggers() {
+        let dir = std::env::temp_dir().join(format!("mcspr-ready-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = crate::instance::InstanceRuntime::new(Default::default(), dir.clone());
+        *rt.status.lock().await = Status::Starting;
+        // 首次就绪：置 Running 并返回 true（调用方据此触发白名单协调）
+        assert!(mark_ready(&rt).await, "首次就绪应返回 true");
+        assert_eq!(*rt.status.lock().await, Status::Running);
+        // 重复就绪不重复触发
+        assert!(!mark_ready(&rt).await, "重复就绪不应再次触发");
+        // 退出后再次就绪可再次触发
+        rt.ready.store(false, Ordering::SeqCst);
+        assert!(mark_ready(&rt).await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

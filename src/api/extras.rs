@@ -252,7 +252,7 @@ pub async fn reinstall(
         }
         st2.release_busy(&iid);
         // 重装后服务端类型可能变化（如改为代理端），后台重新协调
-        super::whitelist_sync::trigger();
+        super::whitelist_sync::trigger_force();
         crate::jobs::log_job(
             &st2,
             &jid,

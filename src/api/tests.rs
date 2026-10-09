@@ -1662,6 +1662,67 @@ async fn instance_update_override_echoes_and_clears() {
     assert_eq!(status, StatusCode::OK);
     let (_, body) = call(&h, detail()).await;
     assert!(body["whitelist_identity"].is_null(), "null 应清除覆盖");
+
+    // 前端别名 whitelist_identity：online 设置
+    let (status, _) = call(&h, patch(json!({ "whitelist_identity": "online" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&h, detail()).await;
+    assert_eq!(body["whitelist_identity"], "online");
+
+    // auto 清除覆盖（回退自动判定）
+    let (status, _) = call(&h, patch(json!({ "whitelist_identity": "auto" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&h, detail()).await;
+    assert!(body["whitelist_identity"].is_null(), "auto 应清除覆盖");
+}
+
+#[tokio::test]
+async fn whitelist_retry_uses_authoritative_grants_and_removes_revoked() {
+    let h = setup(&["inst-a"]).await;
+    // 离线模式：UUID 本地生成，无需网络
+    let inst_dir = h.state.config.read().await.instances_dir().join("inst-a");
+    std::fs::write(inst_dir.join("server.properties"), "online-mode=false\n").unwrap();
+    create_user(&h, "root", Role::Admin, &[]).await;
+    let (cookie, csrf) = login(&h, "root", "password123").await;
+
+    // 普通用户被授权 inst-a，并绑定游戏名 Bob
+    let bob = h
+        .state
+        .auth
+        .register_pending_user("bob", "password123", "Bob", "r")
+        .await
+        .unwrap();
+    h.state
+        .auth
+        .approve_application(&bob.id, 1, vec!["inst-a".to_string()], "root")
+        .await
+        .unwrap();
+
+    let retry = || {
+        req("POST", "/api/instances/inst-a/whitelist-sync/retry")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let whitelist = || std::fs::read_to_string(inst_dir.join("whitelist.json")).unwrap_or_default();
+
+    // 首次重试：权威授权含 Bob → 写入白名单，并记录统一任务
+    let (status, body) = call(&h, retry()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["job_id"].is_string(), "重试应记录任务");
+    assert!(whitelist().contains("Bob"), "Bob 应被写入: {}", whitelist());
+
+    // 撤权后重试：必须按当前授权移除 Bob，不得沿用旁路旧 desired 重新授权
+    h.state.auth.set_instances(&bob.id, vec![]).await.unwrap();
+    let (status, body) = call(&h, retry()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert!(
+        !whitelist().contains("Bob"),
+        "撤权后 Bob 不应仍在白名单: {}",
+        whitelist()
+    );
 }
 
 #[tokio::test]

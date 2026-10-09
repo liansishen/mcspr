@@ -12,7 +12,7 @@ mod overview;
 mod permissions;
 mod public_operations;
 mod resources;
-mod whitelist_sync;
+pub(crate) mod whitelist_sync;
 pub(crate) use whitelist_sync::spawn_scheduler;
 #[cfg(test)]
 mod tests;

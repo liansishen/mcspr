@@ -645,33 +645,6 @@ pub async fn reconcile_instance(
     build_outcome(&id, status, generation, &st, added, removed, apply_error)
 }
 
-/// 使用持久化的期望集合重试（`POST /instances/{id}/whitelist-sync/retry`）。
-pub async fn retry_instance(state: &AppState, rt: &Arc<InstanceRuntime>) -> SyncOutcome {
-    let id = rt.meta.read().await.id.clone();
-    let dir = rt.dir.clone();
-    let st = match load_state(&dir).await {
-        Ok(s) => s,
-        Err(e) => {
-            return SyncOutcome {
-                instance_id: id,
-                status: SyncStatus::Error,
-                generation: 0,
-                applied_generation: 0,
-                added: Vec::new(),
-                removed: Vec::new(),
-                pending: Vec::new(),
-                error: Some(e),
-                attempts: 0,
-            };
-        }
-    };
-    if st.desired.is_empty() && st.managed.is_empty() {
-        return build_outcome(&id, SyncStatus::Idle, st.generation, &st, vec![], vec![], None);
-    }
-    let generation = st.generation.max(st.applied_generation);
-    reconcile_instance(state, rt, &st.desired, generation).await
-}
-
 /// 生命周期钩子：实例新建 / 启动 / 更新 / 重装 / 恢复后重新协调已持久化的期望集合。
 ///
 /// 返回 `None` 表示该实例从未同步过（无期望集合），无需处理。
@@ -1199,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_converges_after_transient_failure() {
+    async fn explicit_reconcile_converges_after_transient_failure() {
         let _g = ONLINE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let ctx = setup("retry").await;
         write_props(&ctx, "online-mode=true\n");
@@ -1209,7 +1182,7 @@ mod tests {
         assert!(!ctx.rt.dir.join("whitelist.json").exists());
 
         set_online_override(Some(vec![("Steve", "uuid-steve")]));
-        let out = retry_instance(&ctx.state, &ctx.rt).await;
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &members(&[("u1", "Steve")]), 2).await;
         set_online_override(None);
         assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
         assert_eq!(whitelist_names(&ctx.rt), vec!["Steve".to_string()]);
@@ -1430,5 +1403,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), r#"{"schema_version":1}"#);
         let md = std::fs::symlink_metadata(ctx.rt.dir.join("whitelist-sync.json")).unwrap();
         assert!(md.file_type().is_file());
+    }
+
+    #[tokio::test]
+    async fn cloned_instance_does_not_inherit_source_grants() {
+        let ctx = setup("clone").await;
+        write_props(&ctx, "online-mode=false\n");
+        // 源实例：管理员 + 普通用户（均由面板管理）
+        let src = members(&[("u-admin", "Admin"), ("u-ordinary", "Steve")]);
+        let out = reconcile_instance(&ctx.state, &ctx.rt, &src, 1).await;
+        assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
+        assert_eq!(whitelist_names(&ctx.rt), vec!["Admin".to_string(), "Steve".to_string()]);
+
+        // 模拟克隆：复制源实例文件（含白名单与旁路状态）到新实例目录
+        let clone_dir = ctx.root.join("inst-clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        for f in ["server.properties", "whitelist.json", "whitelist-sync.json"] {
+            std::fs::copy(ctx.rt.dir.join(f), clone_dir.join(f)).unwrap();
+        }
+        let clone_meta = InstanceMeta {
+            id: "clone".into(),
+            name: "clone".into(),
+            ..Default::default()
+        };
+        std::fs::write(clone_dir.join("instance.json"), serde_json::to_string(&clone_meta).unwrap())
+            .unwrap();
+        let clone_rt = InstanceRuntime::new(clone_meta, clone_dir);
+
+        // 新实例的权威授权仅管理员：普通用户授权不会随克隆继承，面板管理条目被移除
+        let out = reconcile_instance(&ctx.state, &clone_rt, &members(&[("u-admin", "Admin")]), 1).await;
+        assert_eq!(out.status, SyncStatus::Applied, "{out:?}");
+        assert_eq!(out.removed, vec!["Steve".to_string()]);
+        assert_eq!(whitelist_names(&clone_rt), vec!["Admin".to_string()]);
+        // 源实例不受影响
+        assert_eq!(whitelist_names(&ctx.rt), vec!["Admin".to_string(), "Steve".to_string()]);
     }
 }

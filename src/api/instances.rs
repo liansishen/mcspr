@@ -11,7 +11,7 @@ use crate::util::now_str;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -267,19 +267,41 @@ pub struct UpdateReq {
     pub jvm_args: Option<String>,
     pub auto_restart: Option<bool>,
     pub auto_start_on_boot: Option<bool>,
-    /// 白名单身份模式覆盖：显式设置 online/offline，null 清除（回退自动判定），缺省不变
-    #[serde(default, deserialize_with = "deserialize_optional_identity")]
+    /// 白名单身份模式覆盖。兼容前端 `whitelist_identity`（`auto`/`online`/`offline`）
+    /// 与旧字段 `whitelist_identity_override`：`online`/`offline` 设置，`auto` 或 `null`
+    /// 清除，字段缺省保持不变。
+    #[serde(
+        default,
+        alias = "whitelist_identity",
+        deserialize_with = "deserialize_optional_identity"
+    )]
     pub whitelist_identity_override: Option<Option<WhitelistIdentity>>,
 }
 
-/// 区分「字段缺省」与「显式 null」：缺省保持不变，null 清除覆盖。
+/// 兼容 `auto` / `online` / `offline` / `null`：`auto` 与 `null` 均映射为 None（清除覆盖）。
 fn deserialize_optional_identity<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<WhitelistIdentity>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Some(Option::<WhitelistIdentity>::deserialize(deserializer)?))
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(Some(match value {
+        None => None,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("auto") => None,
+        Some(Value::String(s)) => Some(
+            serde_json::from_value::<WhitelistIdentity>(Value::String(s.clone())).map_err(|_| {
+                <D::Error as serde::de::Error>::custom(format!(
+                    "白名单身份模式不合法: {s}（可选 auto/online/offline）"
+                ))
+            })?,
+        ),
+        Some(_) => {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "白名单身份模式需为 auto / online / offline 或 null",
+            ))
+        }
+    }))
 }
 
 pub async fn update(
@@ -325,8 +347,8 @@ pub async fn update(
         }
     }
     rt.persist().await?;
-    // 身份模式可能变化，后台重新协调白名单
-    super::whitelist_sync::trigger();
+    // 身份模式可能变化，需强制重新协调白名单
+    super::whitelist_sync::trigger_force();
     Ok(Json(json!({ "ok": true })))
 }
 

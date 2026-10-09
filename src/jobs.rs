@@ -143,9 +143,11 @@ pub fn set_progress(state: &AppState, id: &str, pct: u8) {
 }
 
 pub fn finish_job(state: &AppState, id: &str, err: Option<String>, instance_id: Option<String>) {
+    let mut kind: Option<String> = None;
     {
         let mut map = state.jobs.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(j) = map.get_mut(id) {
+            kind = j.kind.clone();
             match &err {
                 Some(e) => {
                     j.status = "error".into();
@@ -158,13 +160,17 @@ pub fn finish_job(state: &AppState, id: &str, err: Option<String>, instance_id: 
                     j.stage = "done".into();
                 }
             }
-            j.instance_id = instance_id;
+            j.instance_id = instance_id.clone();
             let ts = now_iso();
             j.finished_at = Some(ts.clone());
             j.updated_at = Some(ts);
         }
     }
     persist_jobs(state, true);
+    // 实例级后台任务真正完成后唤醒白名单协调；白名单自身任务按 kind 排除，避免循环。
+    if instance_id.is_some() && kind.as_deref() != Some("whitelist-sync") {
+        crate::api::whitelist_sync::trigger();
+    }
 }
 
 /// 当前内存中全部任务快照。
