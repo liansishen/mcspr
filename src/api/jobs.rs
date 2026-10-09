@@ -6,12 +6,16 @@ use crate::jobs::Job;
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 
 /// 指纹读取的 JSON 请求体上限（超过则拒绝，避免无界缓冲）
 const MAX_FINGERPRINT_BODY: usize = 32 * 1024 * 1024;
@@ -65,8 +69,9 @@ pub async fn detail(
     Ok(Json(job_view(&job, admin)))
 }
 
-/// 失败任务重试：当前没有可安全自动重放的任务类型，统一标记为需手动重试。
-/// 手动重试应复用原操作编号（X-Operation-ID）与原始内容，以保持幂等。
+/// 失败任务重试：当前没有可安全自动重放的任务类型，返回手动重试指引。
+/// 对失败 / 中断任务，解除其关联操作编号的幂等记录，使该编号可重新执行；
+/// 已完成的任务不会解除（沿用旧编号会回放上次结果，应改用新编号）。
 pub async fn retry(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -76,11 +81,25 @@ pub async fn retry(
     if !identity.is_admin() && job.user_id.as_deref() != Some(identity.user_id.as_str()) {
         return Err(ApiError::not_found("任务不存在"));
     }
+    let mut released = false;
+    if matches!(job.status.as_str(), "error" | "interrupted") {
+        if let Some(op) = crate::operations::find_by_job(&state, &job.id) {
+            if identity.is_admin() || op.principal == identity.user_id {
+                released = crate::operations::forget(&state, &op.id);
+            }
+        }
+    }
     Ok(Json(json!({
         "ok": false,
         "manual": true,
+        "retryable": false,
+        "reuse_operation_id": released,
         "kind": job.kind,
-        "message": "该任务不支持自动重试；请回到原页面重新发起操作（前端会复用同一操作编号以保持幂等）",
+        "message": if released {
+            "该任务不支持自动重试；已解除旧操作编号的幂等记录，可沿用原编号重新发起，或使用新编号"
+        } else {
+            "该任务不支持自动重试；请重新发起操作并使用新的 X-Operation-ID（沿用已完成/未知的旧编号会回放上次结果）"
+        },
     })))
 }
 
@@ -146,11 +165,16 @@ fn looks_like_path(tok: &str) -> bool {
     let t = tok.trim_matches(|c: char| {
         c == '"' || c == '\'' || c == '(' || c == ')' || c == '（' || c == '）' || c == ',' || c == '，'
     });
-    if t.len() > 3 && t.contains('\\') {
+    if t.len() > 2 && t.contains('\\') {
         return true;
     }
-    // 绝对路径：以 / 开头且包含更多分隔符
-    t.starts_with('/') && t.matches('/').count() >= 2
+    // Unix 绝对路径
+    if t.starts_with('/') && t.len() > 1 {
+        return true;
+    }
+    // Windows 盘符路径 C:/...
+    let b = t.as_bytes();
+    t.len() > 2 && b[1] == b':' && b[2] == b'/'
 }
 
 fn redact_value(v: Value) -> Value {
@@ -194,8 +218,10 @@ pub async fn operation_get(
 /// 对所有已认证写请求生效：
 /// 1. 在认证 / CSRF / 同源校验（auth_mw）之后运行，先鉴权再重放；
 /// 2. 无 `X-Operation-ID` 时保持原有行为；
-/// 3. 同编号同内容返回原结果 / 处理中状态，不同内容冲突，不同账户拒绝；
-/// 4. 首次请求在副作用前登记，结束后写回响应以便重放。
+/// 3. JSON 按原始字节指纹；multipart 先落盘并解析出「逻辑指纹」
+///    （字段名 / 文件名 / 长度 / 内容 SHA-256），因此重放要求逻辑内容一致，
+///    不要求 multipart boundary 一致；不同内容一律 409；
+/// 4. 首次请求在副作用前登记，处理在独立任务中执行，客户端断连不影响结果登记。
 pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     if !matches!(method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
@@ -227,14 +253,11 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let is_json = ctype
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .eq_ignore_ascii_case("application/json");
+    let mime = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let is_json = mime == "application/json";
+    let is_multipart = mime == "multipart/form-data";
 
-    let (fingerprint, req) = if is_json {
+    let (fingerprint, req, spool) = if is_json {
         let (parts, body) = req.into_parts();
         match axum::body::to_bytes(body, MAX_FINGERPRINT_BODY).await {
             Ok(bytes) => {
@@ -246,7 +269,7 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
                     &query,
                     Some(&bytes),
                 );
-                (fp, Request::from_parts(parts, Body::from(bytes)))
+                (fp, Request::from_parts(parts, Body::from(bytes)), None)
             }
             Err(_) => {
                 return super::api_error(
@@ -255,8 +278,43 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
                 );
             }
         }
+    } else if is_multipart {
+        // multipart 需先落盘才能得到稳定内容指纹（不能只按路由登记，否则同编号不同文件会被静默重放）
+        let (parts, body) = req.into_parts();
+        let (spooled, logical) = match spool_multipart(&state, &ctype, body).await {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+        let fp = crate::operations::fingerprint_digest(
+            &state,
+            &identity.user_id,
+            method.as_str(),
+            &path,
+            &query,
+            Some(&logical),
+        );
+        let (body, path_guard) = match spooled {
+            Spooled::Memory(b) => (Body::from(b), None),
+            Spooled::File(p) => {
+                let file = match tokio::fs::File::open(&p).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&p).await;
+                        return super::api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("读取上传缓存失败: {e}"),
+                        );
+                    }
+                };
+                (
+                    Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+                    Some(p),
+                )
+            }
+        };
+        (fp, Request::from_parts(parts, body), path_guard)
     } else {
-        // multipart 等流式请求不预读请求体，仅按路由与查询参数登记
+        // 其它流式请求（无已知正文类型）：仅按路由与查询参数登记
         let fp = crate::operations::fingerprint(
             &state,
             &identity.user_id,
@@ -265,7 +323,7 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
             &query,
             None,
         );
-        (fp, req)
+        (fp, req, None)
     };
 
     match crate::operations::reserve(
@@ -277,40 +335,255 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         &fingerprint,
     ) {
         crate::operations::Reserve::Reserved => {
-            let resp = next.run(req).await;
-            let status = resp.status();
-            let (parts, body) = resp.into_parts();
-            let bytes = match axum::body::to_bytes(body, MAX_REPLAY_BODY).await {
-                Ok(b) => b,
-                Err(_) => Bytes::new(),
-            };
-            let value: Option<Value> = serde_json::from_slice(&bytes).ok();
-            let job_id = value
-                .as_ref()
-                .and_then(|v| v.get("job_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            crate::operations::complete(&state, &op_id, status.as_u16(), value, job_id);
-            Response::from_parts(parts, Body::from(bytes))
+            // 在独立任务中执行：客户端断连、请求 future 被丢弃时仍会完成并登记结果
+            let task_state = state.clone();
+            let task_op = op_id.clone();
+            let handle = tokio::spawn(async move {
+                execute_and_record(task_state, task_op, spool, next.run(req)).await
+            });
+            match handle.await {
+                Ok(resp) => resp,
+                Err(_) => super::api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "操作执行任务异常终止",
+                ),
+            }
         }
-        crate::operations::Reserve::Replay(op) => replay_response(&op),
-        crate::operations::Reserve::Conflict => super::api_error(
-            StatusCode::CONFLICT,
-            "操作编号已用于不同的请求内容，请使用新的操作编号",
-        ),
+        crate::operations::Reserve::Replay(op) => {
+            remove_spool(spool).await;
+            replay_response(&op)
+        }
+        crate::operations::Reserve::Conflict => {
+            remove_spool(spool).await;
+            super::api_error(
+                StatusCode::CONFLICT,
+                "操作编号已用于不同的请求内容，请使用新的操作编号",
+            )
+        }
         crate::operations::Reserve::PrincipalConflict => {
+            remove_spool(spool).await;
             super::api_error(StatusCode::CONFLICT, "操作编号属于其他账户")
         }
     }
 }
 
+/// 执行已登记的操作并把结果写回登记表；即使外层请求被取消也会运行到结束。
+async fn execute_and_record(
+    state: AppState,
+    op_id: String,
+    spool: Option<PathBuf>,
+    fut: impl std::future::Future<Output = Response>,
+) -> Response {
+    use futures_util::FutureExt;
+    let resp = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(r) => r,
+        Err(_) => super::api_error(StatusCode::INTERNAL_SERVER_ERROR, "操作执行异常终止"),
+    };
+    remove_spool(spool).await;
+    let status = resp.status();
+    let (parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_REPLAY_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            // 响应体过大：登记状态但无法缓存响应体用于重放
+            crate::operations::complete(&state, &op_id, status.as_u16(), None, None);
+            return super::api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "响应体过大，无法缓存操作结果",
+            );
+        }
+    };
+    let value: Option<Value> = serde_json::from_slice(&bytes).ok();
+    let job_id = value
+        .as_ref()
+        .and_then(|v| v.get("job_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    crate::operations::complete(&state, &op_id, status.as_u16(), value, job_id);
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+async fn remove_spool(spool: Option<PathBuf>) {
+    if let Some(p) = spool {
+        let _ = tokio::fs::remove_file(p).await;
+    }
+}
+
+/// 已读取的请求体：小请求驻留内存，大请求落盘；二者都可重新作为 Body 交给处理器。
+enum Spooled {
+    Memory(Bytes),
+    File(PathBuf),
+}
+
+/// 内存驻留阈值；超过则落盘到 `data/tasks/upload-*.spool`
+const SPOOL_MEMORY_LIMIT: usize = 8 * 1024 * 1024;
+/// 落盘上限（与 DefaultBodyLimit 一致）
+const MAX_SPOOL_BODY: usize = 1024 * 1024 * 1024;
+
+/// 读取 multipart 请求体并解析稳定的逻辑指纹：
+/// 每个字段按 `name\0filename\0len\0content-sha256` 参与指纹，
+/// 因此相同逻辑文件（即使 boundary 不同）可重放，内容不同则冲突。
+async fn spool_multipart(
+    state: &AppState,
+    ctype: &str,
+    body: Body,
+) -> Result<(Spooled, String), ApiError> {
+    let boundary = multer::parse_boundary(ctype)
+        .map_err(|e| ApiError::bad_request(format!("multipart boundary 无效: {e}")))?;
+    let mut stream = body.into_data_stream();
+    let mut mem: Vec<u8> = Vec::new();
+    let mut file: Option<tokio::fs::File> = None;
+    let mut spool_path: Option<PathBuf> = None;
+    let mut total = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(cleanup_err(
+                    &mut spool_path,
+                    ApiError::bad_request(format!("读取上传数据失败: {e}")),
+                )
+                .await)
+            }
+        };
+        total += chunk.len();
+        if total > MAX_SPOOL_BODY {
+            return Err(cleanup_err(
+                &mut spool_path,
+                ApiError::bad_request("上传数据超过大小上限"),
+            )
+            .await);
+        }
+        if let Some(f) = file.as_mut() {
+            if let Err(e) = f.write_all(&chunk).await {
+                return Err(cleanup_err(
+                    &mut spool_path,
+                    ApiError::internal(format!("写入上传缓存失败: {e}")),
+                )
+                .await);
+            }
+        } else {
+            mem.extend_from_slice(&chunk);
+            if mem.len() > SPOOL_MEMORY_LIMIT {
+                let path = state
+                    .tasks_dir
+                    .join(format!("upload-{}.spool", uuid::Uuid::new_v4()));
+                let mut f = match tokio::fs::File::create(&path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return Err(ApiError::internal(format!("创建上传缓存失败: {e}")))
+                    }
+                };
+                if let Err(e) = f.write_all(&mem).await {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(ApiError::internal(format!("写入上传缓存失败: {e}")));
+                }
+                mem.clear();
+                spool_path = Some(path);
+                file = Some(f);
+            }
+        }
+    }
+    if let Some(f) = file.as_mut() {
+        if let Err(e) = f.flush().await {
+            return Err(cleanup_err(
+                &mut spool_path,
+                ApiError::internal(format!("写入上传缓存失败: {e}")),
+            )
+            .await);
+        }
+    }
+    let logical = if let Some(path) = spool_path.as_ref() {
+        let stream = match tokio::fs::File::open(path).await {
+            Ok(f) => tokio_util::io::ReaderStream::new(f),
+            Err(e) => {
+                return Err(cleanup_err(
+                    &mut spool_path,
+                    ApiError::internal(format!("读取上传缓存失败: {e}")),
+                )
+                .await)
+            }
+        };
+        match multipart_logical_fingerprint(stream, boundary).await {
+            Ok(v) => v,
+            Err(e) => return Err(cleanup_err(&mut spool_path, e).await),
+        }
+    } else {
+        let bytes = Bytes::from(mem.clone());
+        let stream = futures_util::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(bytes)
+        });
+        multipart_logical_fingerprint(stream, boundary).await?
+    };
+    let spooled = match spool_path {
+        Some(path) => Spooled::File(path),
+        None => Spooled::Memory(Bytes::from(mem)),
+    };
+    Ok((spooled, logical))
+}
+
+/// 出错时清理已落盘的上传缓存，避免泄漏临时文件。
+async fn cleanup_err(spool_path: &mut Option<PathBuf>, err: ApiError) -> ApiError {
+    if let Some(p) = spool_path.take() {
+        let _ = tokio::fs::remove_file(p).await;
+    }
+    err
+}
+
+async fn multipart_logical_fingerprint<S>(
+    stream: S,
+    boundary: String,
+) -> Result<String, ApiError>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let mut mp = multer::Multipart::new(stream, boundary);
+    let mut canonical = String::new();
+    while let Some(mut field) = mp
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("解析上传数据失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        let filename = field.file_name().unwrap_or("").to_string();
+        let mut hasher = Sha256::new();
+        let mut len = 0usize;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| ApiError::bad_request(format!("读取上传字段失败: {e}")))?
+        {
+            hasher.update(&chunk);
+            len += chunk.len();
+        }
+        canonical.push_str(&name);
+        canonical.push('\0');
+        canonical.push_str(&filename);
+        canonical.push('\0');
+        canonical.push_str(&len.to_string());
+        canonical.push('\0');
+        canonical.push_str(&crate::operations::sha256_hex(&hasher.finalize()));
+        canonical.push('\n');
+    }
+    Ok(canonical)
+}
+
 fn replay_response(op: &crate::operations::Operation) -> Response {
     match op.status.as_str() {
-        "pending" => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "status": "pending", "operation_id": op.id })),
-        )
-            .into_response(),
+        "pending" => {
+            let poll = format!("/api/operations/{}", op.id);
+            let mut resp = (
+                StatusCode::ACCEPTED,
+                Json(json!({ "status": "pending", "operation_id": op.id, "poll": poll })),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&poll) {
+                resp.headers_mut().insert(header::LOCATION, v);
+            }
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            resp
+        }
         "interrupted" => super::api_error(
             StatusCode::CONFLICT,
             "上次操作因面板重启中断，结果待确认；请核实后再决定是否重试",
@@ -634,5 +907,126 @@ mod tests {
             .filter(|n| n.starts_with(".upload-"))
             .collect();
         assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+    }
+
+    fn mods_upload_req(
+        cookie: &str,
+        csrf: &str,
+        boundary: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> Request<Body> {
+        let mut body = Vec::new();
+        multipart_field(&mut body, boundary, "file", filename, data);
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        req("POST", "/api/instances/test/mods/upload")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .header(header::COOKIE, cookie)
+            .header("x-csrf-token", csrf)
+            .header("x-operation-id", "op-mp")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn multipart_idempotency_uses_logical_content_not_boundary() {
+        let h = setup().await;
+        create_user(&h, "root", Role::Admin, &[]).await;
+        add_instance(&h.state, "test").await;
+        let (cookie, csrf) = login(&h, "root").await;
+
+        // 相同逻辑文件、不同 boundary：应重放，而不是静默当成新上传
+        let (s1, b1) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-A", "a.jar", b"DATA1")).await;
+        assert_eq!(s1, StatusCode::OK, "{b1}");
+        assert_eq!(b1["saved"], json!(["a.jar"]));
+        let (s2, b2) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-B", "a.jar", b"DATA1")).await;
+        assert_eq!(s2, StatusCode::OK, "{b2}");
+        assert_eq!(b2["saved"], json!(["a.jar"]));
+
+        // 相同编号、不同内容：冲突
+        let (s3, b3) = call(&h, mods_upload_req(&cookie, &csrf, "BOUND-C", "a.jar", b"DIFFERENT")).await;
+        assert_eq!(s3, StatusCode::CONFLICT, "{b3}");
+
+        // 无残留临时文件
+        let mods_dir = h
+            .state
+            .config
+            .read()
+            .await
+            .instances_dir()
+            .join("test")
+            .join("mods");
+        let leftovers: Vec<String> = std::fs::read_dir(&mods_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".upload-") || n.starts_with("upload-"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn accepted_operation_completes_when_outer_request_dropped() {
+        let h = setup().await;
+        let fp = crate::operations::fingerprint(&h.state, "u1", "POST", "/api/slow", "", Some(b"{}"));
+        let _ = crate::operations::reserve(&h.state, "op-drop", "u1", "POST", "/api/slow", &fp);
+        let handle = tokio::spawn(execute_and_record(
+            h.state.clone(),
+            "op-drop".into(),
+            None,
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+            },
+        ));
+        // 模拟客户端断连：丢弃外层等待句柄，任务应继续运行并登记结果
+        drop(handle);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let op = crate::operations::lookup(&h.state, "op-drop", "u1", false).unwrap();
+        assert_eq!(op.status, "done");
+        assert_eq!(op.response.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn retry_releases_failed_job_operation() {
+        let h = setup().await;
+        let admin = create_user(&h, "root", Role::Admin, &[]).await;
+        let job = crate::jobs::create_job(
+            &h.state,
+            crate::jobs::NewJob {
+                kind: "modpack-update".into(),
+                title: "更新".into(),
+                user_id: Some(admin.clone()),
+                ..Default::default()
+            },
+        );
+        crate::jobs::finish_job(&h.state, &job, Some("boom".into()), None);
+        let fp = crate::operations::fingerprint(&h.state, &admin, "POST", "/api/x", "", Some(b"{}"));
+        let _ = crate::operations::reserve(&h.state, "op-retry", &admin, "POST", "/api/x", &fp);
+        crate::operations::complete(
+            &h.state,
+            "op-retry",
+            400,
+            Some(json!({ "error": "boom" })),
+            Some(job.clone()),
+        );
+
+        let (cookie, csrf) = login(&h, "root").await;
+        let (status, body) = call(
+            &h,
+            req("POST", &format!("/api/jobs/{job}/retry"))
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["manual"], true);
+        assert_eq!(body["reuse_operation_id"], true, "失败任务的旧操作编号应被解除");
+        assert!(
+            crate::operations::lookup(&h.state, "op-retry", &admin, true).is_none(),
+            "旧编号应可重新执行"
+        );
     }
 }

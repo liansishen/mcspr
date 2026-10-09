@@ -224,6 +224,19 @@ pub fn restore(state: &AppState) {
     prune_jobs(&mut target);
 }
 
+/// 启动时清理上次运行遗留的上传落盘缓存（`upload-*.spool`）。
+pub fn cleanup_stale_uploads(state: &AppState) {
+    let Ok(rd) = std::fs::read_dir(&state.tasks_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("upload-") && name.ends_with(".spool") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn prune_jobs(map: &mut HashMap<String, Job>) {
     let now = chrono::Utc::now();
     let mut terminal: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();

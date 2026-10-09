@@ -79,7 +79,7 @@ pub fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// 计算签名指纹：HMAC-SHA256(secret, principal|method|route|query|body-hash)。
+/// 计算签名指纹：HMAC-SHA256(secret, principal|method|route|query|body-digest)。
 pub fn fingerprint(
     state: &AppState,
     principal: &str,
@@ -87,6 +87,19 @@ pub fn fingerprint(
     route: &str,
     query: &str,
     body: Option<&[u8]>,
+) -> String {
+    let digest = body.map(sha256_hex);
+    fingerprint_digest(state, principal, method, route, query, digest.as_deref())
+}
+
+/// 以已计算的正文摘要（原始字节或多部分逻辑指纹）参与签名。
+pub fn fingerprint_digest(
+    state: &AppState,
+    principal: &str,
+    method: &str,
+    route: &str,
+    query: &str,
+    body_digest: Option<&str>,
 ) -> String {
     let mut canonical = String::new();
     canonical.push_str(principal);
@@ -97,11 +110,13 @@ pub fn fingerprint(
     canonical.push('\n');
     canonical.push_str(query);
     canonical.push('\n');
-    match body {
-        Some(bytes) => canonical.push_str(&hex(&Sha256::digest(bytes))),
-        None => canonical.push_str("no-body"),
-    }
+    canonical.push_str(body_digest.unwrap_or("no-body"));
     hex(&hmac_sha256(&state.operations.key, canonical.as_bytes()))
+}
+
+/// 正文 SHA-256 十六进制摘要。
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex(&Sha256::digest(data))
 }
 
 pub fn reserve(
@@ -174,6 +189,26 @@ pub fn lookup(state: &AppState, id: &str, principal: &str, admin: bool) -> Optio
     map.get(id)
         .filter(|op| admin || op.principal == principal)
         .cloned()
+}
+
+/// 按任务编号查找已登记的操作（用于失败任务重试时解除旧编号）。
+pub fn find_by_job(state: &AppState, job_id: &str) -> Option<Operation> {
+    let map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+    map.values()
+        .find(|op| op.job_id.as_deref() == Some(job_id))
+        .cloned()
+}
+
+/// 删除一条操作登记（显式重试时解除旧编号的幂等绑定）。
+pub fn forget(state: &AppState, id: &str) -> bool {
+    let removed = {
+        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(id).is_some()
+    };
+    if removed {
+        persist(state, true);
+    }
+    removed
 }
 
 /// 面板启动时恢复操作记录；未完成的操作标记为中断。

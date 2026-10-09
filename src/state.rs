@@ -108,6 +108,8 @@ impl AppState {
         // 崩溃恢复：运行中任务/操作标记为中断，不自动重放
         crate::jobs::restore(&state);
         crate::operations::restore(&state);
+        // 清理上次运行遗留的上传缓存
+        crate::jobs::cleanup_stale_uploads(&state);
         Ok(state)
     }
 }
