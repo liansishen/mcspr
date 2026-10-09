@@ -18,6 +18,49 @@ pub fn read_array(dir: &Path, file: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 严格读取玩家列表 JSON：文件缺失视为空数组；读取失败、JSON 非法或顶层不是数组
+/// 一律返回错误。自动同步据此拒绝在无法确认现状时覆盖白名单文件。
+pub(crate) fn read_array_strict(dir: &Path, file: &str) -> Result<Vec<Value>, String> {
+    let path = dir.join(file);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析 {} 失败: {e}", path.display()))?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| format!("{} 顶层不是数组", path.display()))
+}
+
+/// 原子写入玩家列表 JSON：先写同目录唯一临时文件再 rename 替换，
+/// 写入中断或并发写者不会留下半文件，也不会互相覆盖临时文件。
+pub(crate) async fn write_array_atomic(dir: &Path, file: &str, arr: &[Value]) -> ApiResult<()> {
+    let s = serde_json::to_string_pretty(arr)?;
+    let tmp = dir.join(format!("{file}.tmp-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::write(&tmp, s).await?;
+        tokio::fs::rename(&tmp, dir.join(file)).await
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// 合法 Minecraft 玩家名：1-16 位字母、数字或下划线。
+pub(crate) fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty() && bytes.len() <= 16 && bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
 async fn write_array(dir: &Path, file: &str, arr: &[Value]) -> ApiResult<()> {
     let s = serde_json::to_string_pretty(arr)?;
     tokio::fs::write(dir.join(file), s).await?;
@@ -59,7 +102,7 @@ fn dashed_uuid(hex: &str) -> String {
 }
 
 /// 离线模式 UUID：MD5("OfflinePlayer:<name>") 的 v3 UUID（与原版算法一致）
-fn offline_uuid(name: &str) -> String {
+pub(crate) fn offline_uuid(name: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(format!("OfflinePlayer:{name}"));
     let mut hash = hasher.finalize();
@@ -69,7 +112,7 @@ fn offline_uuid(name: &str) -> String {
     dashed_uuid(&s)
 }
 
-async fn mojang_uuid(state: &AppState, name: &str) -> Result<String, String> {
+pub(crate) async fn mojang_uuid(state: &AppState, name: &str) -> Result<String, String> {
     let url = format!("https://api.mojang.com/users/profiles/minecraft/{name}");
     let resp = state
         .http

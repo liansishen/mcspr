@@ -140,6 +140,7 @@ pub async fn clone_instance(
         announcement_markdown: m.announcement_markdown,
         announcement_updated_at: crate::util::now_str(),
         announcement_updated_by: m.announcement_updated_by,
+        whitelist_identity: m.whitelist_identity,
     };
     tokio::fs::write(
         new_dir.join("instance.json"),

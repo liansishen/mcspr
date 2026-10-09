@@ -11,6 +11,7 @@ pub mod properties;
 pub mod tasks;
 pub mod users;
 pub mod vanilla;
+pub mod whitelist_sync;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -60,6 +61,28 @@ pub struct InstanceMeta {
     /// 公告最后编辑者
     #[serde(default)]
     pub announcement_updated_by: String,
+    /// 白名单自动同步的身份模式覆盖：代理转发等 online-mode 不可靠时由管理员显式指定
+    #[serde(default)]
+    pub whitelist_identity: Option<WhitelistIdentity>,
+}
+
+/// 白名单自动同步使用的游戏身份模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhitelistIdentity {
+    /// 正版验证：通过 Mojang API 解析 UUID
+    Online,
+    /// 离线模式：按原始游戏名生成离线 UUID
+    Offline,
+}
+
+impl WhitelistIdentity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WhitelistIdentity::Online => "online",
+            WhitelistIdentity::Offline => "offline",
+        }
+    }
 }
 
 fn default_min_ram() -> u32 {
@@ -123,6 +146,8 @@ pub struct InstanceRuntime {
     pub tps_generation: AtomicU64,
     /// 复用的 RCON 连接（TPS 采样与远程命令）；服务端会为每次新建连接打一行日志
     pub rcon: std::sync::Mutex<Option<crate::rcon::Session>>,
+    /// 白名单自动同步的实例级串行锁：文件写入与命令下发互斥
+    pub whitelist_sync_lock: Mutex<()>,
     /// 控制台内存保留的最大日志行数（面板设置可调）
     pub log_limit: std::sync::atomic::AtomicUsize,
     pub log_buf: Mutex<VecDeque<LogLine>>,
@@ -193,6 +218,7 @@ impl InstanceRuntime {
             tps: Mutex::new(None),
             tps_generation: AtomicU64::new(0),
             rcon: std::sync::Mutex::new(None),
+            whitelist_sync_lock: Mutex::new(()),
             log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_LOG_LIMIT),
             log_buf: Mutex::new(buf),
             log_tx: tx,

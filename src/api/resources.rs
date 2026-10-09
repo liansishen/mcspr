@@ -5,6 +5,7 @@ use crate::instance::process;
 use crate::instance::properties::{self, PropEntry};
 use crate::instance::users;
 use crate::instance::{get_instance, InstanceRuntime, Status};
+use crate::instance::whitelist_sync;
 use crate::state::AppState;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::Json;
@@ -312,6 +313,10 @@ pub async fn users_action(
             _ => unreachable!(),
         };
         process::send_command(&rt, &cmd).await?;
+        // 人工新增即使条目已存在，也记录人工保留标记，避免后续撤权误删
+        if req.action == "whitelist_add" {
+            let _ = whitelist_sync::mark_manual_retained(&rt, &target).await;
+        }
         return Ok(Json(json!({ "ok": true, "mode": "command" })));
     }
 
@@ -319,7 +324,11 @@ pub async fn users_action(
     let dir = rt.dir.clone();
     let warning = match req.action.as_str() {
         "op" => users::add_op(&state, &dir, &target).await?,
-        "whitelist_add" => users::add_whitelist(&state, &dir, &target).await?,
+        "whitelist_add" => {
+            let warning = users::add_whitelist(&state, &dir, &target).await?;
+            let _ = whitelist_sync::mark_manual_retained(&rt, &target).await;
+            warning
+        }
         "ban" => users::add_ban(&state, &dir, &target, reason).await?,
         "ban_ip" => users::add_ban_ip(&dir, &target, reason).await?,
         "deop" => {
