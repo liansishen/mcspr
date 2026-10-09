@@ -1,4 +1,4 @@
-use crate::operations::{self, Reserve};
+use crate::operations::{self, Reserve, ReserveError};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -50,17 +50,35 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
     let fingerprint =
         operations::fingerprint(&state, &principal, "POST", &path, &query, Some(&bytes));
     match operations::reserve(&state, &id, &principal, "POST", &path, &fingerprint) {
-        Reserve::Reserved => {
+        Ok(Reserve::Reserved) => {
             let worker = tokio::spawn(async move {
                 let response = next.run(req).await;
                 let status = response.status();
+                let actor = response
+                    .extensions()
+                    .get::<crate::audit::AuditActor>()
+                    .cloned();
+                let target = super::audit_target(&path);
+                crate::audit::record(
+                    &state,
+                    "POST",
+                    &path,
+                    status.as_u16(),
+                    actor.as_ref(),
+                    target.as_deref(),
+                )
+                .await;
                 let (parts, body) = response.into_parts();
                 let bytes = axum::body::to_bytes(body, 64 * 1024)
                     .await
                     .unwrap_or_default();
                 let result = serde_json::from_slice(&bytes).ok();
                 operations::complete(&state, &id, status.as_u16(), result, None);
-                Response::from_parts(parts, Body::from(bytes))
+                let mut response = Response::from_parts(parts, Body::from(bytes));
+                response
+                    .extensions_mut()
+                    .insert(super::jobs::OperationAudited);
+                response
             });
             worker.await.unwrap_or_else(|_| {
                 super::api_error(
@@ -69,21 +87,32 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
                 )
             })
         }
-        Reserve::Replay(op) if op.status == "pending" => (
+        Ok(Reserve::Replay(op)) if op.status == "pending" => (
             StatusCode::ACCEPTED,
             Json(json!({"status":"pending", "operation_id":op.id})),
         )
             .into_response(),
-        Reserve::Replay(op) if matches!(op.status.as_str(), "done" | "error") => {
+        Ok(Reserve::Replay(op)) if matches!(op.status.as_str(), "done" | "error") => {
             let status =
                 StatusCode::from_u16(op.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(op.response.unwrap_or(json!({"ok":false})))).into_response()
         }
-        Reserve::Replay(_) => {
+        Ok(Reserve::Replay(_)) => {
             super::api_error(StatusCode::CONFLICT, "上次提交结果待确认，请先查询申请状态")
         }
-        Reserve::Conflict | Reserve::PrincipalConflict => {
+        Ok(Reserve::Conflict | Reserve::PrincipalConflict) => {
             super::api_error(StatusCode::CONFLICT, "操作编号已用于其他请求内容")
         }
+        Err(ReserveError::Storage(error)) => {
+            tracing::error!(%error, "注册操作登记失败");
+            super::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "申请登记暂不可用，请稍后重试",
+            )
+        }
+        Err(ReserveError::Capacity) => super::api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "正在处理的请求过多，请稍后重试",
+        ),
     }
 }

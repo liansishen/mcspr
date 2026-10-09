@@ -64,7 +64,12 @@ async fn provider(rt: &Arc<InstanceRuntime>) -> ApiResult<game_backup::Provider>
         .ok_or_else(|| ApiError::bad_request("未识别到支持的游戏内备份模组（ServerUtilities）"))
 }
 
-fn new_job(state: &AppState, id: &str, user_id: Option<&str>, message: &str) -> String {
+fn new_job(
+    state: &AppState,
+    id: &str,
+    user_id: Option<&str>,
+    message: &str,
+) -> Result<String, String> {
     let jid = crate::jobs::create_job(
         state,
         crate::jobs::NewJob {
@@ -74,9 +79,9 @@ fn new_job(state: &AppState, id: &str, user_id: Option<&str>, message: &str) -> 
             user_id: user_id.map(|s| s.to_string()),
             operation_id: None,
         },
-    );
+    )?;
     crate::jobs::log_job(state, &jid, message);
-    jid
+    Ok(jid)
 }
 
 pub async fn create(
@@ -104,7 +109,8 @@ pub async fn create(
         chrono::Local::now().format("%Y%m%d-%H%M%S"),
         uuid::Uuid::new_v4().simple()
     );
-    let jid = new_job(&state, &id, Some(&identity.user_id), "正在通过 ServerUtilities 创建游戏内备份");
+    let jid = new_job(&state, &id, Some(&identity.user_id), "正在通过 ServerUtilities 创建游戏内备份")
+        .map_err(ApiError::bad_request)?;
     let st = state.clone();
     let job_id = jid.clone();
     tokio::spawn(async move {
@@ -277,7 +283,8 @@ pub async fn restore(
     }
     let p = provider(&rt).await?;
     let dir = rt.dir.clone();
-    let jid = new_job(&state, &id, Some(&identity.user_id), "正在校验游戏内备份并保留当前数据");
+    let jid = new_job(&state, &id, Some(&identity.user_id), "正在校验游戏内备份并保留当前数据")
+        .map_err(ApiError::bad_request)?;
     let st = state.clone();
     let job_id = jid.clone();
     tokio::spawn(async move {
@@ -395,10 +402,10 @@ mod tests {
     #[tokio::test]
     async fn list_retains_latest_completed_job_and_separates_active_job() {
         let f = Fixture::new().await;
-        let old = new_job(&f.state, "test", None, "old");
+        let old = new_job(&f.state, "test", None, "old").unwrap();
         finish_job(&f.state, &old, None, Some("test".into()));
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let latest = new_job(&f.state, "test", None, "new");
+        let latest = new_job(&f.state, "test", None, "new").unwrap();
         let response = list(State(f.state.clone()), Path("test".into()))
             .await
             .unwrap()

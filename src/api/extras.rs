@@ -214,7 +214,8 @@ pub async fn reinstall(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::bad_request)?;
     let st2 = state.clone();
     let jid = job_id.clone();
     let iid = id.clone();

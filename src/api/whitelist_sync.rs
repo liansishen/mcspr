@@ -1,7 +1,7 @@
 //! 管理员白名单同步：状态 / 重试接口与后台批次协调（统一任务中心记录每实例结果）。
 
 use crate::auth::Identity;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::instance::get_instance;
 use crate::instance::whitelist_sync::{self, DesiredSnapshot, SyncOutcome, SyncStatus};
 use crate::jobs::{create_job, finish_job, log_job, NewJob};
@@ -54,7 +54,8 @@ pub async fn retry(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::internal)?;
     log_job(
         &state,
         &job_id,
@@ -154,15 +155,15 @@ async fn run_batch(state: &AppState, forced: bool) {
     ) {
         return;
     }
-    LAST_REVISION.store(snapshot.revision, Ordering::SeqCst);
-    LAST_INSTANCE_FP.store(fp, Ordering::SeqCst);
 
     let instance_count = state.instances.read().await.len();
     // 无实例且非强制：更新代号后不建任务，避免空批次刷历史
     if instance_count == 0 && !forced {
+        LAST_REVISION.store(snapshot.revision, Ordering::SeqCst);
+        LAST_INSTANCE_FP.store(fp, Ordering::SeqCst);
         return;
     }
-    let job_id = create_job(
+    let job_id = match create_job(
         state,
         NewJob {
             kind: JOB_KIND.into(),
@@ -171,7 +172,14 @@ async fn run_batch(state: &AppState, forced: bool) {
             user_id: None,
             operation_id: None,
         },
-    );
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            FORCE.store(true, Ordering::SeqCst);
+            tracing::error!(%error, "白名单同步任务登记失败，等待重试");
+            return;
+        }
+    };
     log_job(
         state,
         &job_id,
@@ -181,6 +189,8 @@ async fn run_batch(state: &AppState, forced: bool) {
         ),
     );
     let report = reconcile_snapshot(state, &snapshot).await;
+    LAST_REVISION.store(snapshot.revision, Ordering::SeqCst);
+    LAST_INSTANCE_FP.store(fp, Ordering::SeqCst);
     for o in &report.outcomes {
         log_job(state, &job_id, outcome_summary(o));
     }

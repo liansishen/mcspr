@@ -133,6 +133,7 @@ fn job_view(job: &Job, admin: bool) -> Value {
         "progress": job.progress,
         "logs": logs,
         "instance_id": job.instance_id,
+        "operation_id": job.operation_id,
         "kind": job.kind,
         "title": job.title,
         "user_id": job.user_id,
@@ -314,16 +315,27 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         };
         (fp, Request::from_parts(parts, body), path_guard)
     } else {
-        // 其它流式请求（无已知正文类型）：仅按路由与查询参数登记
-        let fp = crate::operations::fingerprint(
-            &state,
-            &identity.user_id,
-            method.as_str(),
-            &path,
-            &query,
-            None,
-        );
-        (fp, req, None)
+        // 其它请求（含无 Content-Type）：读取实际正文并按原始字节指纹，空正文也参与哈希
+        let (parts, body) = req.into_parts();
+        match axum::body::to_bytes(body, MAX_FINGERPRINT_BODY).await {
+            Ok(bytes) => {
+                let fp = crate::operations::fingerprint(
+                    &state,
+                    &identity.user_id,
+                    method.as_str(),
+                    &path,
+                    &query,
+                    Some(&bytes),
+                );
+                (fp, Request::from_parts(parts, Body::from(bytes)), None)
+            }
+            Err(_) => {
+                return super::api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "请求体过大，无法登记操作编号",
+                );
+            }
+        }
     };
 
     match crate::operations::reserve(
@@ -334,12 +346,37 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
         &path,
         &fingerprint,
     ) {
-        crate::operations::Reserve::Reserved => {
+        Ok(crate::operations::Reserve::Reserved) => {
+            // 统一任务中心：为本次写操作登记任务（尽力而为，失败不阻断请求）
+            let (kind, title, inst) = op_meta(&method, &path);
+            let op_job = match crate::jobs::create_job(
+                &state,
+                crate::jobs::NewJob {
+                    kind,
+                    title,
+                    instance_id: inst,
+                    user_id: Some(identity.user_id.clone()),
+                    operation_id: Some(op_id.clone()),
+                },
+            ) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!("操作任务登记失败: {e}");
+                    None
+                }
+            };
             // 在独立任务中执行：客户端断连、请求 future 被丢弃时仍会完成并登记结果
             let task_state = state.clone();
             let task_op = op_id.clone();
+            let principal = identity.user_id.clone();
+            let audit = AuditContext {
+                method: method.as_str().to_string(),
+                path: path.clone(),
+                actor: crate::audit::AuditActor::from_identity(&identity),
+            };
             let handle = tokio::spawn(async move {
-                execute_and_record(task_state, task_op, spool, next.run(req)).await
+                execute_and_record(task_state, task_op, op_job, principal, audit, spool, next.run(req))
+                    .await
             });
             match handle.await {
                 Ok(resp) => resp,
@@ -349,28 +386,111 @@ pub async fn operation_mw(State(state): State<AppState>, req: Request, next: Nex
                 ),
             }
         }
-        crate::operations::Reserve::Replay(op) => {
+        Ok(crate::operations::Reserve::Replay(op)) => {
             remove_spool(spool).await;
             replay_response(&op)
         }
-        crate::operations::Reserve::Conflict => {
+        Ok(crate::operations::Reserve::Conflict) => {
             remove_spool(spool).await;
             super::api_error(
                 StatusCode::CONFLICT,
                 "操作编号已用于不同的请求内容，请使用新的操作编号",
             )
         }
-        crate::operations::Reserve::PrincipalConflict => {
+        Ok(crate::operations::Reserve::PrincipalConflict) => {
             remove_spool(spool).await;
             super::api_error(StatusCode::CONFLICT, "操作编号属于其他账户")
         }
+        Err(crate::operations::ReserveError::Storage(e)) => {
+            remove_spool(spool).await;
+            super::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("操作登记持久化失败，未执行任何变更，请稍后重试（{e}）"),
+            )
+        }
+        Err(crate::operations::ReserveError::Capacity) => {
+            remove_spool(spool).await;
+            super::api_error(StatusCode::SERVICE_UNAVAILABLE, "操作登记已满，请稍后重试")
+        }
     }
+}
+
+/// 审计上下文：在已接受操作的任务内记录一次，外层 audit_mw 通过 marker 跳过。
+struct AuditContext {
+    method: String,
+    path: String,
+    actor: crate::audit::AuditActor,
+}
+
+/// 幂等层内部已完成审计的响应标记，供 audit_mw 去重。
+#[derive(Clone)]
+pub struct OperationAudited;
+
+/// 根据方法与路径推导操作任务类型 / 中文标题 / 关联实例。
+fn op_meta(method: &Method, path: &str) -> (String, String, Option<String>) {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let segs = if segs.first() == Some(&"api") {
+        &segs[1..]
+    } else {
+        &segs[..]
+    };
+    let head = segs.first().copied().unwrap_or("");
+    let is_import = head == "instances" && segs.get(1) == Some(&"import");
+    let instance = if head == "instances" && !is_import {
+        segs.get(1).map(|s| s.to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    if is_import {
+        return ("modpack-import".to_string(), "导入实例".to_string(), None);
+    }
+    let sub = segs.get(2).copied().unwrap_or("");
+    let (kind, title) = match (head, sub) {
+        ("instances", "") => {
+            if method == Method::POST {
+                ("instance-create", "创建实例")
+            } else {
+                ("instance-update", "修改实例设置")
+            }
+        }
+        ("instances", "start") => ("instance-power", "启动实例"),
+        ("instances", "stop") => ("instance-power", "停止实例"),
+        ("instances", "restart") => ("instance-power", "重启实例"),
+        ("instances", "command") => ("console-command", "发送控制台命令"),
+        ("instances", "eula") => ("instance-eula", "同意 EULA"),
+        ("instances", "backups") => ("backup", "备份操作"),
+        ("instances", "game-backups") => ("game-backup", "游戏内备份操作"),
+        ("instances", "clone") => ("instance-clone", "克隆实例"),
+        ("instances", "reinstall") => ("instance-reinstall", "重装实例"),
+        ("instances", "modpack") => ("modpack", "整合包操作"),
+        ("instances", "mods") => ("mod-op", "模组操作"),
+        ("instances", "files") => ("file-op", "文件操作"),
+        ("instances", "worlds") => ("world-op", "世界操作"),
+        ("instances", "properties") => ("instance-props", "实例属性"),
+        ("instances", "icon") => ("instance-icon", "实例图标"),
+        ("instances", "tasks") => ("scheduled-task", "计划任务"),
+        ("instances", "announcement") => ("announcement", "保存公告"),
+        ("instances", "configs") => ("instance-config", "实例配置"),
+        ("instances", "users") => ("instance-users", "玩家管理"),
+        ("instances", _) => ("instance-op", "实例操作"),
+        ("accounts", _) => ("account", "账户操作"),
+        ("settings", _) => ("panel-settings", "面板设置"),
+        ("config", _) => ("config-io", "配置导入导出"),
+        ("javas", _) | ("java-install", _) => ("java-install", "Java 安装/扫描"),
+        ("moddb", _) => ("moddb", "模组市场操作"),
+        ("announcements", _) => ("announcement", "公告操作"),
+        _ => ("write", "写操作"),
+    };
+    (kind.to_string(), title.to_string(), instance)
 }
 
 /// 执行已登记的操作并把结果写回登记表；即使外层请求被取消也会运行到结束。
 async fn execute_and_record(
     state: AppState,
     op_id: String,
+    op_job: Option<String>,
+    principal: String,
+    audit: AuditContext,
     spool: Option<PathBuf>,
     fut: impl std::future::Future<Output = Response>,
 ) -> Response {
@@ -381,12 +501,21 @@ async fn execute_and_record(
     };
     remove_spool(spool).await;
     let status = resp.status();
-    let (parts, body) = resp.into_parts();
+    let (mut parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_REPLAY_BODY).await {
         Ok(b) => b,
         Err(_) => {
             // 响应体过大：登记状态但无法缓存响应体用于重放
             crate::operations::complete(&state, &op_id, status.as_u16(), None, None);
+            if let Some(oj) = &op_job {
+                crate::jobs::finish_operation_job(
+                    &state,
+                    oj,
+                    false,
+                    None,
+                    Some("响应体过大，无法缓存操作结果".into()),
+                );
+            }
             return super::api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "响应体过大，无法缓存操作结果",
@@ -399,7 +528,51 @@ async fn execute_and_record(
         .and_then(|v| v.get("job_id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+
+    // 统一任务中心：关联后台任务，并完成本次操作任务
+    if let Some(oj) = &op_job {
+        match &job_id {
+            Some(bg) => {
+                crate::jobs::attach_operation(&state, bg, &op_id, &principal);
+                crate::jobs::finish_operation_job(
+                    &state,
+                    oj,
+                    true,
+                    Some(json!({ "note": "已提交后台任务", "background_job_id": bg })),
+                    None,
+                );
+            }
+            None => {
+                let ok = status.as_u16() < 400;
+                let err = value
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                crate::jobs::finish_operation_job(
+                    &state,
+                    oj,
+                    ok,
+                    Some(json!({ "status_code": status.as_u16() })),
+                    err,
+                );
+            }
+        }
+    }
+
     crate::operations::complete(&state, &op_id, status.as_u16(), value, job_id);
+
+    // 审计：在已接受操作的独立任务内记录一次；即使客户端断连也会写入
+    crate::audit::record(
+        &state,
+        &audit.method,
+        &audit.path,
+        status.as_u16(),
+        Some(&audit.actor),
+        super::audit_target(&audit.path).as_deref(),
+    )
+    .await;
+    parts.extensions.insert(OperationAudited);
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -811,7 +984,8 @@ mod tests {
                 user_id: Some(admin.clone()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let alice_job = crate::jobs::create_job(
             &h.state,
             crate::jobs::NewJob {
@@ -820,7 +994,8 @@ mod tests {
                 user_id: Some(alice.clone()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         let (admin_cookie, _) = login(&h, "root").await;
         let (_, admin_list) = call(
@@ -969,10 +1144,17 @@ mod tests {
     async fn accepted_operation_completes_when_outer_request_dropped() {
         let h = setup().await;
         let fp = crate::operations::fingerprint(&h.state, "u1", "POST", "/api/slow", "", Some(b"{}"));
-        let _ = crate::operations::reserve(&h.state, "op-drop", "u1", "POST", "/api/slow", &fp);
+        let _ = crate::operations::reserve(&h.state, "op-drop", "u1", "POST", "/api/slow", &fp).unwrap();
         let handle = tokio::spawn(execute_and_record(
             h.state.clone(),
             "op-drop".into(),
+            None,
+            "u1".into(),
+            AuditContext {
+                method: "POST".into(),
+                path: "/api/slow".into(),
+                actor: crate::audit::AuditActor::default(),
+            },
             None,
             async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -999,10 +1181,11 @@ mod tests {
                 user_id: Some(admin.clone()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         crate::jobs::finish_job(&h.state, &job, Some("boom".into()), None);
         let fp = crate::operations::fingerprint(&h.state, &admin, "POST", "/api/x", "", Some(b"{}"));
-        let _ = crate::operations::reserve(&h.state, "op-retry", &admin, "POST", "/api/x", &fp);
+        let _ = crate::operations::reserve(&h.state, "op-retry", &admin, "POST", "/api/x", &fp).unwrap();
         crate::operations::complete(
             &h.state,
             "op-retry",
@@ -1028,5 +1211,45 @@ mod tests {
             crate::operations::lookup(&h.state, "op-retry", &admin, true).is_none(),
             "旧编号应可重新执行"
         );
+    }
+
+    #[tokio::test]
+    async fn write_operation_records_task_metadata() {
+        let h = setup().await;
+        let admin = create_user(&h, "root", Role::Admin, &[]).await;
+        add_instance(&h.state, "inst-a").await;
+        let (cookie, csrf) = login(&h, "root").await;
+
+        // 无正文的写操作（无 Content-Type）：应读取空正文并登记操作任务
+        let (status, body) = call(
+            &h,
+            req("POST", "/api/instances/inst-a/eula")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .header("x-operation-id", "op-meta-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+
+        let (_, list) = call(
+            &h,
+            req("GET", "/api/jobs")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let jobs = list["jobs"].as_array().unwrap();
+        let job = jobs
+            .iter()
+            .find(|j| j["operation_id"] == "op-meta-1")
+            .expect("写操作应登记任务中心记录");
+        assert_eq!(job["kind"], "instance-eula");
+        assert_eq!(job["title"], "同意 EULA");
+        assert_eq!(job["instance_id"], "inst-a");
+        assert_eq!(job["user_id"], admin);
+        assert_eq!(job["status"], "done");
     }
 }

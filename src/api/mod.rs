@@ -641,7 +641,8 @@ async fn java_install(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::bad_request)?;
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::spawn(async move {
@@ -737,6 +738,10 @@ async fn audit_mw(State(state): State<AppState>, req: Request, next: Next) -> Re
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let resp = next.run(req).await;
+    // 已由幂等任务内部记录审计（含客户端断连场景），避免重复
+    if resp.extensions().get::<jobs::OperationAudited>().is_some() {
+        return resp;
+    }
     let status = resp.status().as_u16();
     let mutating = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     if mutating || status >= 400 {
@@ -749,7 +754,7 @@ async fn audit_mw(State(state): State<AppState>, req: Request, next: Next) -> Re
 }
 
 /// 从路径提取审计目标（实例 / 账户 ID）。
-fn audit_target(path: &str) -> Option<String> {
+pub(crate) fn audit_target(path: &str) -> Option<String> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let i = if segs.first() == Some(&"api") { 1 } else { 0 };
     let kind = *segs.get(i)?;

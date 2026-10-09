@@ -33,9 +33,13 @@ pub struct Operation {
     pub created_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,
+    /// 终态结果是否已可靠落盘（落盘失败时为 false，重启后只能视为中断）
+    #[serde(default = "default_true")]
+    pub durable: bool,
 }
 
 /// 操作登记结果。
+#[derive(Debug)]
 pub enum Reserve {
     /// 首次登记，调用方可以执行副作用。
     Reserved,
@@ -45,6 +49,15 @@ pub enum Reserve {
     Conflict,
     /// 相同编号但属于其他账户。
     PrincipalConflict,
+}
+
+/// 登记失败原因。
+#[derive(Debug)]
+pub enum ReserveError {
+    /// 持久化失败：调用方必须拒绝执行副作用。
+    Storage(String),
+    /// 登记容量已满。
+    Capacity,
 }
 
 pub struct OperationStore {
@@ -68,6 +81,10 @@ impl OperationStore {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 操作编号仅允许 URL 安全字符，避免日志与持久化注入。
@@ -126,17 +143,24 @@ pub fn reserve(
     method: &str,
     route: &str,
     fingerprint: &str,
-) -> Reserve {
+) -> Result<Reserve, ReserveError> {
     {
         let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(op) = map.get(id) {
             if op.principal != principal {
-                return Reserve::PrincipalConflict;
+                return Ok(Reserve::PrincipalConflict);
             }
             if op.fingerprint != fingerprint {
-                return Reserve::Conflict;
+                return Ok(Reserve::Conflict);
             }
-            return Reserve::Replay(op.clone());
+            return Ok(Reserve::Replay(op.clone()));
+        }
+        // 容量：只裁剪终态记录，pending 绝不驱逐
+        if map.len() >= MAX_OPERATIONS {
+            prune(&mut map);
+        }
+        if map.len() >= MAX_OPERATIONS {
+            return Err(ReserveError::Capacity);
         }
         let ts = now_iso();
         map.insert(
@@ -154,11 +178,21 @@ pub fn reserve(
                 created_at: ts.clone(),
                 updated_at: ts,
                 finished_at: None,
+                durable: false,
             },
         );
     }
-    persist(state, true);
-    Reserve::Reserved
+    // 必须先持久化成功才允许执行副作用；失败则回滚内存登记并拒绝请求
+    if let Err(e) = persist(state) {
+        state
+            .operations
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+        return Err(ReserveError::Storage(e));
+    }
+    Ok(Reserve::Reserved)
 }
 
 pub fn complete(
@@ -175,12 +209,20 @@ pub fn complete(
             op.status_code = status_code;
             op.response = response;
             op.job_id = job_id;
+            op.durable = true;
             let ts = now_iso();
             op.updated_at = ts.clone();
             op.finished_at = Some(ts);
         }
     }
-    persist(state, true);
+    if let Err(e) = persist(state) {
+        // 不虚报可靠存储：标记未落盘，重启后该编号只会被视为中断
+        let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(op) = map.get_mut(id) {
+            op.durable = false;
+        }
+        tracing::error!("操作 {id} 结果落盘失败: {e}；重启后将仅标记为中断，不做重放");
+    }
 }
 
 /// 查询操作；普通账户仅能查询自己的操作。
@@ -206,20 +248,25 @@ pub fn forget(state: &AppState, id: &str) -> bool {
         map.remove(id).is_some()
     };
     if removed {
-        persist(state, true);
+        if let Err(e) = persist(state) {
+            tracing::warn!("解除操作登记持久化失败: {e}");
+        }
     }
     removed
 }
 
 /// 面板启动时恢复操作记录；未完成的操作标记为中断。
-pub fn restore(state: &AppState) {
+///
+/// 账本损坏时拒绝启动（fail-closed），避免默默清空幂等记录。
+pub fn restore(state: &AppState) -> Result<(), String> {
     let path = state.operations.dir.join("operations.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("读取操作账本失败: {e}")),
     };
-    let Ok(saved) = serde_json::from_str::<HashMap<String, Operation>>(&text) else {
-        return;
-    };
+    let saved = serde_json::from_str::<HashMap<String, Operation>>(&text)
+        .map_err(|e| format!("操作账本损坏，拒绝启动以免丢失幂等记录: {e}"))?;
     let ts = now_iso();
     let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
     for (id, mut op) in saved {
@@ -227,28 +274,35 @@ pub fn restore(state: &AppState) {
             op.status = "interrupted".into();
             op.updated_at = ts.clone();
             op.finished_at = Some(ts.clone());
+            op.durable = false;
         }
         map.insert(id, op);
     }
     prune(&mut map);
+    Ok(())
 }
 
-fn persist(state: &AppState, force: bool) {
-    if !force {
-        return;
-    }
+/// 快照 + 写入在 `persist_lock` 内串行，避免迟到旧快照覆盖新快照。
+fn persist(state: &AppState) -> Result<(), String> {
+    let _guard = state
+        .persist_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let json = {
         let mut map = state.operations.map.lock().unwrap_or_else(|p| p.into_inner());
         prune(&mut map);
-        serde_json::to_string(&*map).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string(&*map).map_err(|e| e.to_string())?
     };
-    let _ = crate::jobs::write_private(&state.operations.dir.join("operations.json"), json.as_bytes());
+    crate::jobs::write_private(&state.operations.dir.join("operations.json"), json.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
+/// 只裁剪终态记录：过期的、以及超出上限的最旧终态记录；pending 永不驱逐。
 fn prune(map: &mut HashMap<String, Operation>) {
     let now = chrono::Utc::now();
     let mut remove: Vec<String> = map
         .iter()
+        .filter(|(_, op)| op.status != "pending")
         .filter(|(_, op)| {
             chrono::DateTime::parse_from_rfc3339(&op.updated_at)
                 .map(|d| (now - d.with_timezone(&chrono::Utc)).num_hours() > RETENTION_HOURS)
@@ -256,16 +310,18 @@ fn prune(map: &mut HashMap<String, Operation>) {
         })
         .map(|(id, _)| id.clone())
         .collect();
-    if map.len().saturating_sub(remove.len()) > MAX_OPERATIONS {
-        let mut rest: Vec<(String, String)> = map
-            .iter()
-            .filter(|(id, _)| !remove.contains(id))
-            .map(|(id, op)| (id.clone(), op.updated_at.clone()))
-            .collect();
-        rest.sort_by(|a, b| a.1.cmp(&b.1));
-        let excess = rest.len().saturating_sub(MAX_OPERATIONS);
-        remove.extend(rest.into_iter().take(excess).map(|(id, _)| id));
+    let mut terminal: Vec<(String, String)> = map
+        .iter()
+        .filter(|(id, op)| op.status != "pending" && !remove.contains(id))
+        .map(|(id, op)| (id.clone(), op.updated_at.clone()))
+        .collect();
+    if terminal.len() > MAX_OPERATIONS {
+        terminal.sort_by(|a, b| a.1.cmp(&b.1));
+        let excess = terminal.len() - MAX_OPERATIONS;
+        remove.extend(terminal.into_iter().take(excess).map(|(id, _)| id));
     }
+    remove.sort();
+    remove.dedup();
     for id in remove {
         map.remove(&id);
     }
@@ -357,23 +413,23 @@ mod tests {
         let (state, dir) = test_state("reserve").await;
         let fp1 = fingerprint(&state, "u1", "POST", "/api/instances/x/start", "", Some(b"{}"));
         assert!(matches!(
-            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp1),
+            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp1).unwrap(),
             Reserve::Reserved
         ));
         // 相同编号 + 相同内容：重放
         assert!(matches!(
-            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp1),
+            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp1).unwrap(),
             Reserve::Replay(_)
         ));
         // 相同编号 + 不同内容：冲突
         let fp2 = fingerprint(&state, "u1", "POST", "/api/instances/x/start", "", Some(b"{\"a\":1}"));
         assert!(matches!(
-            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp2),
+            reserve(&state, "op-1", "u1", "POST", "/api/instances/x/start", &fp2).unwrap(),
             Reserve::Conflict
         ));
         // 相同编号 + 其他账户：拒绝
         assert!(matches!(
-            reserve(&state, "op-1", "u2", "POST", "/api/instances/x/start", &fp1),
+            reserve(&state, "op-1", "u2", "POST", "/api/instances/x/start", &fp1).unwrap(),
             Reserve::PrincipalConflict
         ));
         let _ = std::fs::remove_dir_all(dir);
@@ -383,10 +439,11 @@ mod tests {
     async fn completed_operation_keeps_response_and_lookup_filters() {
         let (state, dir) = test_state("complete").await;
         let fp = fingerprint(&state, "u1", "POST", "/api/instances", "", Some(b"{}"));
-        let _ = reserve(&state, "op-2", "u1", "POST", "/api/instances", &fp);
+        let _ = reserve(&state, "op-2", "u1", "POST", "/api/instances", &fp).unwrap();
         complete(&state, "op-2", 200, Some(serde_json::json!({"ok": true})), Some("job-9".into()));
         let op = lookup(&state, "op-2", "u1", false).unwrap();
         assert_eq!(op.status, "done");
+        assert!(op.durable, "成功落盘后应标记 durable");
         assert_eq!(op.job_id.as_deref(), Some("job-9"));
         assert_eq!(op.response.unwrap()["ok"], true);
         // 其他账户不可见
@@ -399,8 +456,7 @@ mod tests {
     async fn pending_operations_become_interrupted_after_restart() {
         let (state, dir) = test_state("restart").await;
         let fp = fingerprint(&state, "u1", "POST", "/api/x", "", None);
-        let _ = reserve(&state, "op-3", "u1", "POST", "/api/x", &fp);
-        persist(&state, true);
+        let _ = reserve(&state, "op-3", "u1", "POST", "/api/x", &fp).unwrap();
         // 释放账户存储文件锁，模拟重启
         drop(state);
         let cfg = PanelConfig {
@@ -412,6 +468,65 @@ mod tests {
         let op = lookup(&restarted, "op-3", "u1", false).unwrap();
         assert_eq!(op.status, "interrupted");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn storage_failure_rejects_reserve_without_side_effect() {
+        let (state, dir) = test_state("storage").await;
+        // 用目录占位 operations.json，使 rename 失败
+        std::fs::create_dir_all(dir.join("tasks/operations.json")).unwrap();
+        let fp = fingerprint(&state, "u1", "POST", "/api/x", "", Some(b"{}"));
+        let err = reserve(&state, "op-fail", "u1", "POST", "/api/x", &fp).unwrap_err();
+        assert!(matches!(err, ReserveError::Storage(_)));
+        // 内存登记已回滚
+        assert!(lookup(&state, "op-fail", "u1", false).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fails_closed() {
+        let (state, dir) = test_state("corrupt").await;
+        drop(state);
+        std::fs::write(dir.join("tasks/operations.json"), b"{not json").unwrap();
+        let cfg = PanelConfig {
+            data_dir: dir.to_string_lossy().to_string(),
+            token: "test".into(),
+            ..Default::default()
+        };
+        assert!(AppState::new(cfg).await.is_err(), "损坏账本必须拒绝启动");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_never_evicts_pending() {
+        let mut map: HashMap<String, Operation> = HashMap::new();
+        let ts = now_iso();
+        let make = |id: &str, status: &str| Operation {
+            id: id.to_string(),
+            principal: "u".into(),
+            method: "POST".into(),
+            route: "/api/x".into(),
+            fingerprint: "f".into(),
+            status: status.into(),
+            status_code: if status == "pending" { 0 } else { 200 },
+            job_id: None,
+            response: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            finished_at: if status == "pending" { None } else { Some(ts.clone()) },
+            durable: status != "pending",
+        };
+        for i in 0..50 {
+            map.insert(format!("pending-{i}"), make(&format!("pending-{i}"), "pending"));
+        }
+        for i in 0..(MAX_OPERATIONS + 10) {
+            map.insert(format!("done-{i}"), make(&format!("done-{i}"), "done"));
+        }
+        prune(&mut map);
+        let pending = map.values().filter(|op| op.status == "pending").count();
+        assert_eq!(pending, 50, "pending 记录不得被裁剪");
+        let terminal = map.values().filter(|op| op.status != "pending").count();
+        assert!(terminal <= MAX_OPERATIONS, "终态记录应有界: {terminal}");
     }
 
     #[test]

@@ -164,7 +164,8 @@ pub async fn create(
                 user_id: Some(identity.user_id.clone()),
                 operation_id: None,
             },
-        );
+        )
+        .map_err(ApiError::bad_request)?;
         let st2 = state.clone();
         let jid = job_id.clone();
         let iid = id.clone();
@@ -184,7 +185,8 @@ pub async fn create(
                 user_id: Some(identity.user_id.clone()),
                 operation_id: None,
             },
-        );
+        )
+        .map_err(ApiError::bad_request)?;
         let st2 = state.clone();
         let jid = job_id.clone();
         let iid = id.clone();
@@ -617,7 +619,8 @@ pub async fn import_path(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::bad_request)?;
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::task::spawn_blocking(move || {
@@ -679,7 +682,8 @@ pub async fn import_upload(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::bad_request)?;
     let st2 = state.clone();
     let jid = job_id.clone();
     tokio::task::spawn_blocking(move || {
@@ -768,7 +772,8 @@ pub async fn modpack_apply(
             user_id: Some(identity.user_id.clone()),
             operation_id: None,
         },
-    );
+    )
+    .map_err(ApiError::bad_request)?;
     let st2 = state.clone();
     let jid = job_id.clone();
     let iid = id.clone();

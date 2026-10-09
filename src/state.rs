@@ -19,6 +19,8 @@ pub struct AppStateInner {
     pub job_persist_at: std::sync::atomic::AtomicU64,
     /// 写操作幂等登记（X-Operation-ID）
     pub operations: crate::operations::OperationStore,
+    /// 任务 / 操作落盘串行锁：保证快照 + 写入不被交叠，避免旧快照覆盖新快照
+    pub persist_lock: std::sync::Mutex<()>,
     pub sys: std::sync::Mutex<sysinfo::System>,
     pub http: reqwest::Client,
     pub mc_versions: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>,
@@ -82,6 +84,11 @@ impl AppState {
         let data_dir = cfg.data_dir.clone();
         let tasks_dir = std::path::Path::new(&data_dir).join("tasks");
         std::fs::create_dir_all(&tasks_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o700));
+        }
         let auth = crate::auth::AuthStore::load(&data_dir)?;
         let instances = crate::instance::scan_instances(&cfg.instances_dir(), cfg.console_buffer_lines);
         tracing::info!("已加载 {} 个实例", instances.len());
@@ -96,6 +103,7 @@ impl AppState {
             tasks_dir,
             job_persist_at: std::sync::atomic::AtomicU64::new(0),
             operations: crate::operations::OperationStore::load(&data_dir),
+            persist_lock: std::sync::Mutex::new(()),
             sys: std::sync::Mutex::new(sysinfo::System::new()),
             http,
             mc_versions: std::sync::Mutex::new(None),
@@ -105,9 +113,9 @@ impl AppState {
             alert_dedup: std::sync::Mutex::new(HashMap::new()),
             busy: std::sync::Mutex::new(std::collections::HashSet::new()),
         }));
-        // 崩溃恢复：运行中任务/操作标记为中断，不自动重放
-        crate::jobs::restore(&state);
-        crate::operations::restore(&state);
+        // 崩溃恢复：运行中任务标记中断；操作账本损坏时拒绝启动（fail-closed）
+        crate::jobs::restore(&state).map_err(|e| anyhow::anyhow!(e))?;
+        crate::operations::restore(&state).map_err(|e| anyhow::anyhow!(e))?;
         // 清理上次运行遗留的上传缓存
         crate::jobs::cleanup_stale_uploads(&state);
         Ok(state)
