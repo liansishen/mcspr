@@ -14,7 +14,7 @@ function extractFn(name) {
 }
 
 function run(names, context) {
-  const ctx = vm.createContext({ sessionGeneration: 0, loginAttempt: 0, routeToken: 0, ...context });
+  const ctx = vm.createContext({ sessionGeneration: 0, loginAttempt: 0, routeToken: 0, newOperationId: () => 'op-test', queryOperation: async () => null, setTopbarTitle() {}, closeDrawer() {}, closeAccountMenu() {}, stopTaskPolling() {}, renderRegister() {}, renderApplicationStatus() {}, renderProfile() {}, PAGE_TITLES: {}, pendingApprovals: 0, ...context });
   vm.runInContext(names.map(extractFn).join('\n'), ctx);
   return ctx;
 }
@@ -145,12 +145,15 @@ test('doLogin sends an admin to the dashboard and reports failures without leavi
 
 function routeCtx({ role, hash }) {
   const calls = [];
-  const main = { classList: { toggle() {} } };
+  const main = { classList: { toggle() {}, remove() {} } };
   const ctx = run(['route'], {
     routeToken: 0,
     currentUser: role ? { role } : null,
     location: { hash },
-    document: { body: { classList: { toggle() {} } } },
+    document: { body: { classList: { toggle() {}, remove() {}, contains: () => false } } },
+    closeDrawer() {}, closeAccountMenu() {}, setTopbarTitle() {},
+    renderRegister() {}, renderApplicationStatus() {},
+    renderProfile: () => calls.push(['profile']), PAGE_TITLES: {},
     clearTimers() {},
     navActiveKey: () => 'x',
     $: () => main,
@@ -240,7 +243,8 @@ test('teardownSession clears timers, websocket, cached DOM data and role state',
     usersData: {}, usersInstanceId: 'i1', modsCache: {}, modDL: {}, mpUp: {},
     filesEntriesCache: [], currentGameBackupProvider: {}, accountsData: {},
     $: sel => ({ '#main': main, '#modal-root': modal }[sel]),
-    document: { body: { classList: { remove() {} } } },
+    document: { body: { classList: { remove() {}, contains: () => false } }, getElementById: () => null },
+    stopTaskPolling() {}, closeDrawer() {}, closeAccountMenu() {},
   });
 
   ctx.teardownSession();

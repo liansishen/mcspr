@@ -32,6 +32,316 @@ let curPath = '';
 let importTab = 'upload';
 let propEntries = [];
 
+/* ---------------- 全局操作登记 / 任务中心 / 侧栏与账户菜单状态 ---------------- */
+// 游戏名校验：与离线模式兼容的 1-16 位字母、数字或下划线
+const MC_NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
+const TASK_TERMINAL = ['done', 'error', 'failed', 'interrupted', 'cancelled'];
+const TASK_ACTIVE = ['running', 'queued', 'pending', 'starting'];
+const PAGE_TITLES = { dashboard: '仪表盘', instances: '实例管理', accounts: '账户管理', settings: '面板设置', 'my-instances': '我的实例', profile: '个人资料' };
+
+let opInFlight = new Map();
+let taskJobs = new Map();
+let taskPollTimer = null;
+let taskCenterOpen = false;
+let pendingApprovals = 0;
+let turnstileWidgetId = null;
+let turnstileScriptPromise = null;
+let turnstileToken = '';
+let turnstileSiteKey = '';
+let statusCredentials = null;
+let profileData = null;
+let accountsTab = 'accounts';
+let applicationsData = null;
+let permState = null;
+
+// 为每次逻辑写入生成稳定编号；调用方重试时可复用同一编号保证幂等。
+function newOperationId() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch {}
+  return 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+}
+
+function isBusy(key) { return opInFlight.has(key); }
+
+function beginBusy(key) {
+  if (!key || opInFlight.has(key)) return false;
+  opInFlight.set(key, true);
+  return true;
+}
+
+function endBusy(key) { if (key) opInFlight.delete(key); }
+
+// 统一忙碌登记：立即禁用触发控件，完成后恢复；重复点击 / 回车直接忽略。
+async function withBusy(key, control, fn) {
+  if (!beginBusy(key)) return undefined;
+  let prevDisabled = null, hadAria = false, prevAria = null;
+  if (control) {
+    try {
+      if ('disabled' in control) { prevDisabled = control.disabled; control.disabled = true; }
+      if (control.setAttribute) { hadAria = !!(control.hasAttribute && control.hasAttribute('aria-busy')); prevAria = control.getAttribute ? control.getAttribute('aria-busy') : null; control.setAttribute('aria-busy', 'true'); }
+    } catch {}
+  }
+  try {
+    return await fn();
+  } finally {
+    endBusy(key);
+    if (control) {
+      try {
+        if (prevDisabled !== null && 'disabled' in control) control.disabled = prevDisabled;
+        if (control.removeAttribute) {
+          if (hadAria && prevAria != null) control.setAttribute('aria-busy', prevAria);
+          else control.removeAttribute('aria-busy');
+        }
+      } catch {}
+    }
+  }
+}
+
+// 断网或超时后凭操作编号回查结果，避免把“结果待确认”当成失败。
+async function queryOperation(operationId) {
+  if (!operationId) return null;
+  try {
+    const r = await fetch('/api/operations/' + encodeURIComponent(operationId), { credentials: 'same-origin' });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j && (j.status === 'done' || j.status === 'error')) return j.result !== undefined ? j.result : null;
+  } catch {}
+  return null;
+}
+
+function taskStatusText(status) {
+  return ({ running: '进行中', queued: '排队中', pending: '等待中', starting: '启动中', done: '已完成', error: '失败', failed: '失败', interrupted: '已中断', cancelled: '已取消' })[status] || status || '未知';
+}
+
+function taskActiveCount() {
+  let n = 0;
+  for (const j of taskJobs.values()) if (TASK_ACTIVE.includes(j.status)) n++;
+  return n;
+}
+
+function upsertTask(job) {
+  if (!job || job.id === undefined || job.id === null) return;
+  const prev = taskJobs.get(job.id) || {};
+  taskJobs.set(job.id, { ...prev, ...job });
+  renderTaskBadge();
+  if (taskCenterOpen) renderTaskCenter();
+}
+
+function renderTaskBadge() {
+  const el = document.getElementById('task-count');
+  if (!el) return;
+  const n = taskActiveCount();
+  el.textContent = String(n);
+  el.hidden = n === 0;
+}
+
+async function refreshTasks() {
+  if (!currentUser) return;
+  try {
+    const d = await api('/jobs', { skipAuthRedirect: true });
+    const list = (d && d.jobs) || [];
+    const seen = new Set();
+    for (const j of list) { seen.add(String(j.id)); upsertTask(j); }
+    for (const id of [...taskJobs.keys()]) if (!seen.has(String(id))) taskJobs.delete(id);
+    renderTaskBadge();
+    if (taskCenterOpen) renderTaskCenter();
+  } catch {}
+}
+
+// 任务中心使用独立定时器，不随页面路由清理，刷新后从 /jobs 恢复。
+function startTaskPolling() {
+  if (taskPollTimer) return;
+  refreshTasks();
+  taskPollTimer = setInterval(refreshTasks, 5000);
+}
+
+function stopTaskPolling() {
+  if (taskPollTimer) { clearInterval(taskPollTimer); taskPollTimer = null; }
+  taskJobs.clear();
+  renderTaskBadge();
+  closeTaskCenter();
+}
+
+function toggleTaskCenter() { if (taskCenterOpen) closeTaskCenter(); else openTaskCenter(); }
+
+function openTaskCenter() {
+  taskCenterOpen = true;
+  const panel = document.getElementById('task-panel');
+  const btn = document.getElementById('task-btn');
+  if (panel) panel.hidden = false;
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+  refreshTasks();
+  renderTaskCenter();
+}
+
+function closeTaskCenter() {
+  taskCenterOpen = false;
+  const panel = document.getElementById('task-panel');
+  const btn = document.getElementById('task-btn');
+  if (panel) panel.hidden = true;
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function renderTaskCenter() {
+  const panel = document.getElementById('task-panel');
+  if (!panel) return;
+  const list = [...taskJobs.values()].sort((a, b) => String(b.updated_at || b.started_at || b.finished_at || '').localeCompare(String(a.updated_at || a.started_at || a.finished_at || '')));
+  const head = '<div class="row between"><h3 style="margin:0">任务中心</h3><button class="btn small ghost" onclick="refreshTasks()">刷新</button></div>';
+  if (!list.length) { panel.innerHTML = head + '<div class="task-empty">暂无任务。上传、导入、备份等长时间操作会在这里持续显示。</div>'; return; }
+  panel.innerHTML = head + list.map(j => {
+    const active = TASK_ACTIVE.includes(j.status);
+    const pct = Number(j.progress) || 0;
+    const logs = (j.logs || []).slice(-3).join('\n');
+    const err = j.error ? '<div class="rejection-box">' + esc(j.error) + '</div>' : '';
+    const link = j.instance_id ? '<a href="#/instance/' + esc(j.instance_id) + '/tasks">实例任务</a>' : '';
+    const pill = j.status === 'done' ? 'st-running' : (active ? 'st-starting' : 'st-warn');
+    return '<div class="task-item">' +
+      '<div class="task-line"><span class="task-title">' + esc(j.title || j.kind || ('任务 ' + j.id)) + '</span><span class="pill ' + pill + '">' + esc(taskStatusText(j.status)) + '</span></div>' +
+      '<div class="task-meta">' + (j.instance_id ? '实例 ' + esc(j.instance_id) + ' · ' : '') + esc(j.stage || j.kind || '') + '</div>' +
+      (active && pct > 0 ? '<div class="bar"><i style="width:' + Math.min(100, pct) + '%"></i></div>' : '') +
+      (logs ? '<div class="task-log">' + esc(logs) + '</div>' : '') + err +
+      '<div class="task-meta">' + esc(j.started_at || '') + (j.finished_at ? ' → ' + esc(j.finished_at) : '') + ' ' + link + '</div></div>';
+  }).join('');
+}
+
+function setTopbarTitle(text) {
+  const el = document.getElementById('topbar-title');
+  if (el) el.textContent = text || '';
+}
+
+function navigate(hash) {
+  if (location.hash === hash) route();
+  else location.hash = hash;
+}
+
+function openDrawer() {
+  document.body.classList.add('drawer-open');
+  const bd = document.getElementById('sidebar-backdrop');
+  if (bd) bd.hidden = false;
+  const btn = document.getElementById('menu-btn');
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+  const first = document.querySelector('#nav a');
+  if (first) first.focus();
+}
+
+function closeDrawer() {
+  if (!document.body.classList.contains('drawer-open')) return;
+  document.body.classList.remove('drawer-open');
+  const bd = document.getElementById('sidebar-backdrop');
+  if (bd) bd.hidden = true;
+  const btn = document.getElementById('menu-btn');
+  if (btn) { btn.setAttribute('aria-expanded', 'false'); btn.focus(); }
+}
+
+function toggleDrawer() {
+  if (document.body.classList.contains('drawer-open')) closeDrawer();
+  else openDrawer();
+}
+
+function toggleSidebar() {
+  const collapsed = document.documentElement.classList.toggle('sidebar-collapsed');
+  try { localStorage.setItem('mcspr.sidebar', collapsed ? 'collapsed' : 'expanded'); } catch {}
+  const btn = document.getElementById('sidebar-toggle');
+  if (btn) {
+    btn.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+    const label = btn.querySelector('.toggle-label');
+    if (label) label.textContent = collapsed ? '展开侧栏' : '收起侧栏';
+  }
+}
+
+function toggleAccountMenu(event) {
+  if (event && event.stopPropagation) event.stopPropagation();
+  const dd = document.getElementById('acct-dropdown');
+  if (!dd) return;
+  const willOpen = dd.hidden;
+  dd.hidden = !willOpen;
+  const trig = document.getElementById('acct-trigger');
+  if (trig) trig.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+
+function closeAccountMenu() {
+  const dd = document.getElementById('acct-dropdown');
+  if (dd) dd.hidden = true;
+  const trig = document.getElementById('acct-trigger');
+  if (trig) trig.setAttribute('aria-expanded', 'false');
+}
+
+function loadTurnstileScript() {
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    if (typeof window !== 'undefined' && window.turnstile) { resolve(window.turnstile); return; }
+    const s = document.createElement('script');
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    s.async = true;
+    s.defer = true;
+    s.onload = () => resolve(window.turnstile);
+    s.onerror = () => { turnstileScriptPromise = null; reject(new Error('人机验证脚本加载失败，请检查网络后重试')); };
+    document.head.appendChild(s);
+  });
+  return turnstileScriptPromise;
+}
+
+function resetTurnstile() {
+  turnstileToken = '';
+  try { if (typeof window !== 'undefined' && window.turnstile && turnstileWidgetId !== null) window.turnstile.reset(turnstileWidgetId); } catch {}
+}
+
+async function mountTurnstile(slotId, siteKey, testMode) {
+  turnstileToken = '';
+  turnstileWidgetId = null;
+  const slot = document.getElementById(slotId);
+  if (!slot) return;
+  slot.innerHTML = '';
+  if (testMode) {
+    slot.innerHTML = '<div class="auth-note">当前为人机验证测试模式，提交时不进行真实验证。</div>';
+    turnstileToken = 'test-mode';
+    return;
+  }
+  if (!siteKey) { slot.innerHTML = '<div class="banner warn">未配置人机验证站点密钥，无法继续提交。</div>'; return; }
+  try {
+    const ts = await loadTurnstileScript();
+    if (!ts || typeof ts.render !== 'function') throw new Error('人机验证组件不可用');
+    turnstileWidgetId = ts.render(slot, {
+      sitekey: siteKey,
+      callback: token => { turnstileToken = token; },
+      'expired-callback': () => { turnstileToken = ''; },
+      'error-callback': () => { turnstileToken = ''; },
+    });
+  } catch (e) {
+    slot.innerHTML = '<div class="banner warn">' + esc(e.message) + ' <button class="btn small" type="button" onclick="mountTurnstile(\'' + slotId + '\',\'' + esc(siteKey) + '\',false)">重试</button></div>';
+  }
+}
+
+function captchaTokenOrNull() { return turnstileToken || null; }
+
+async function refreshApprovalCount() {
+  if (!currentUser || currentUser.role !== 'admin') { pendingApprovals = 0; renderNav(); return; }
+  try {
+    const d = await api('/applications', { skipAuthRedirect: true });
+    const list = (d && d.applications) || [];
+    pendingApprovals = list.filter(a => (a.status || 'pending') === 'pending').length;
+  } catch { pendingApprovals = 0; }
+  renderNav();
+}
+
+function initGlobalUi() {
+  document.addEventListener('click', e => {
+    const t = e.target;
+    if (!t || !t.closest || !t.closest('.account-box')) closeAccountMenu();
+    if (!t || !t.closest || (!t.closest('.task-panel') && !t.closest('#task-btn'))) closeTaskCenter();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { closeDrawer(); closeAccountMenu(); closeTaskCenter(); }
+  });
+  const bd = document.getElementById('sidebar-backdrop');
+  if (bd) bd.addEventListener('click', closeDrawer);
+  window.addEventListener('resize', () => { if (window.innerWidth > 900) closeDrawer(); });
+  const toggle = document.getElementById('sidebar-toggle');
+  if (toggle) toggle.setAttribute('aria-pressed', document.documentElement.classList.contains('sidebar-collapsed') ? 'true' : 'false');
+  renderTaskBadge();
+}
+
 function every(ms, fn) { timers.push(setInterval(fn, ms)); }
 function clearTimers() {
   timers.forEach(t => clearInterval(t));
@@ -63,7 +373,23 @@ async function api(path, opts = {}) {
   if (method !== 'GET' && method !== 'HEAD' && csrfToken && !opts.noCsrf) {
     h['X-CSRF-Token'] = csrfToken;
   }
-  const r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
+  // 每次逻辑写入携带稳定操作编号，便于断网后凭编号回查结果
+  const write = method !== 'GET' && method !== 'HEAD';
+  const operationId = write ? (opts.operationId || newOperationId()) : null;
+  if (operationId) h['X-Operation-ID'] = operationId;
+  let r;
+  try {
+    r = await fetch('/api' + path, { method, headers: h, body, credentials: 'same-origin' });
+  } catch (netError) {
+    // 网络歧义：请求可能已被服务端接受，凭操作编号回查真实结果
+    if (operationId && typeof queryOperation === 'function') {
+      const confirmed = await queryOperation(operationId);
+      if (confirmed !== null && confirmed !== undefined) return confirmed;
+    }
+    const err = new Error('网络错误：结果待确认，请稍后重试或在任务中心查看');
+    err.network = true;
+    throw err;
+  }
   if (r.status === 401 && !opts.skipAuthRedirect && gen === sessionGeneration) onSessionExpired();
   if (!r.ok) {
     let msg = r.statusText;
@@ -209,6 +535,13 @@ function teardownSession() {
   filesEntriesCache = null;
   currentGameBackupProvider = null;
   accountsData = null;
+  applicationsData = null;
+  permState = null;
+  profileData = null;
+  statusCredentials = null;
+  stopTaskPolling();
+  closeDrawer();
+  closeAccountMenu();
   const main = $('#main');
   if (main) {
     main.innerHTML = '';
@@ -231,15 +564,18 @@ function onSessionExpired() {
 
 function navItems() {
   if (currentUser && currentUser.role === 'admin') {
-    return [['dashboard', '📊 仪表盘'], ['instances', '🗂 实例管理'], ['accounts', '👥 账户管理'], ['settings', '⚙️ 面板设置']];
+    return [['dashboard', '📊', '仪表盘'], ['instances', '🗂', '实例管理'], ['accounts', '👥', '账户管理'], ['settings', '⚙️', '面板设置']];
   }
-  return [['my-instances', '🗂 我的实例']];
+  return [['my-instances', '🗂', '我的实例']];
 }
 
 function renderNav() {
   const box = $('#nav-links');
   if (!box) return;
-  box.innerHTML = navItems().map(([k, label]) => `<a href="#/${k}" data-nav="${k}">${label}</a>`).join('');
+  box.innerHTML = navItems().map(([k, icon, label]) => {
+    const badge = (k === 'accounts' && pendingApprovals > 0) ? `<span class="nav-badge" title="待审批申请">${pendingApprovals}</span>` : '';
+    return `<a href="#/${k}" data-nav="${k}" title="${esc(label)}"><span class="nav-icon" aria-hidden="true">${icon}</span><span class="nav-label">${esc(label)}</span>${badge}</a>`;
+  }).join('');
 }
 
 function navActiveKey(parts) {
@@ -251,11 +587,18 @@ function renderAccountBox() {
   const box = $('#account-box');
   if (!box) return;
   if (!currentUser) { box.innerHTML = ''; return; }
-  box.innerHTML = `<div class="acct-name" title="${esc(currentUser.username)}">${esc(currentUser.username)}</div>
-    <div class="muted small">${currentUser.role === 'admin' ? '管理员' : '普通用户'}</div>
-    <div class="row" style="margin-top:8px;gap:6px">
-      <button class="btn small ghost" onclick="showChangePassword()">修改密码</button>
-      <button class="btn small" onclick="doLogout()">退出</button>
+  const role = currentUser.role === 'admin' ? '管理员' : '普通用户';
+  const mc = currentUser.minecraft_name ? ` · ${esc(currentUser.minecraft_name)}` : '';
+  const st = currentUser.status ? ` · ${esc(currentUser.status)}` : '';
+  box.innerHTML = `<button id="acct-trigger" class="btn small ghost acct-trigger" type="button" onclick="toggleAccountMenu(event)" aria-haspopup="true" aria-expanded="false" aria-controls="acct-dropdown" title="${esc(currentUser.username)}">
+      <span class="acct-name">${esc(currentUser.username)}</span><span class="caret" aria-hidden="true">▾</span>
+    </button>
+    <div id="acct-dropdown" class="acct-dropdown" hidden role="menu">
+      <div class="acct-head"><div class="acct-name-full">${esc(currentUser.username)}</div><div class="muted small">${role}${mc}${st}</div></div>
+      <button type="button" role="menuitem" onclick="closeAccountMenu();navigate('#/profile')">个人资料 / 游戏名变更</button>
+      ${currentUser.role === 'admin' && pendingApprovals > 0 ? `<button type="button" role="menuitem" onclick="closeAccountMenu();navigate('#/accounts')">待审批申请（${pendingApprovals}）</button>` : ''}
+      <button type="button" role="menuitem" onclick="closeAccountMenu();showChangePassword()">修改密码</button>
+      <button type="button" role="menuitem" onclick="closeAccountMenu();doLogout()">退出登录</button>
     </div>`;
 }
 
@@ -381,17 +724,30 @@ window.addEventListener('hashchange', route);
 async function route() {
   const t = ++routeToken;
   clearTimers();
-  if (!currentUser) { renderLogin(); return; }
-  const isAdmin = currentUser.role === 'admin';
+  closeDrawer();
+  closeAccountMenu();
   const hash = location.hash.replace(/^#/, '');
   const parts = hash.split('/').filter(Boolean);
+  if (!currentUser) {
+    document.body.classList.remove('detail-view');
+    $('#main').classList.remove('detail-layout');
+    if (parts[0] === 'register') { setTopbarTitle('注册账户'); renderRegister(); return; }
+    if (parts[0] === 'status') { setTopbarTitle('申请状态'); renderApplicationStatus(); return; }
+    setTopbarTitle('登录');
+    renderLogin();
+    return;
+  }
+  const isAdmin = currentUser.role === 'admin';
   const detail = parts[0] === 'instance' && !!parts[1];
   document.body.classList.toggle('detail-view', detail);
   $('#main').classList.toggle('detail-layout', detail);
+  setTopbarTitle(detail ? '实例详情' : (PAGE_TITLES[parts[0]] || ''));
   const activeKey = navActiveKey(parts);
   $$('#nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === activeKey));
   try {
-    if (parts[0] === 'instance' && parts[1]) {
+    if (parts[0] === 'profile') {
+      await renderProfile(t);
+    } else if (parts[0] === 'instance' && parts[1]) {
       if (isAdmin) {
         const allowed = ADMIN_TABS.map(x => x[0]);
         const tab = parts[2] || 'console';
@@ -766,9 +1122,10 @@ function pollJob(jobId, onUpdate) {
     const timer = setInterval(async () => {
       try {
         const j = await api(`/jobs/${jobId}`);
+        upsertTask(j);
         if (onUpdate) onUpdate(j);
         if (j.status === 'done') { clearInterval(timer); resolve(j); }
-        if (j.status === 'error') { clearInterval(timer); reject(new Error(j.logs.slice(-1)[0] || '操作失败')); }
+        else if (['error', 'failed', 'interrupted', 'cancelled'].includes(j.status)) { clearInterval(timer); reject(new Error(j.error || (j.logs && j.logs.slice(-1)[0]) || '操作失败')); }
       } catch (e) { clearInterval(timer); reject(e); }
     }, 700);
   });
@@ -848,63 +1205,37 @@ function switchImportTab(t) {
   $('#imp-path').style.display = t === 'path' ? '' : 'none';
 }
 async function doImport() {
-  $('#imp-progress').style.display = '';
-  $('#imp-go').disabled = true;
-  const poll = jobId => new Promise((resolve, reject) => {
-    const timer = setInterval(async () => {
-      try {
-        const j = await api(`/jobs/${jobId}`);
-        $('#imp-log').textContent = j.logs.join('\n');
-        $('#imp-log').scrollTop = 1e6;
-        if (j.status === 'done') { clearInterval(timer); resolve(j); }
-        if (j.status === 'error') { clearInterval(timer); reject(new Error('导入失败，详见日志')); }
-      } catch (e) { clearInterval(timer); reject(e); }
-    }, 800);
-  });
-  try {
-    let jobId;
-    if (importTab === 'upload') {
-      const fileEl = $('#im-file');
-      if (!fileEl.files[0]) throw new Error('请选择 ZIP 文件');
-      const fd = new FormData();
-      if ($('#im-name').value.trim()) fd.append('name', $('#im-name').value.trim());
-      fd.append('file', fileEl.files[0]);
-      $('#imp-log').textContent = '上传中…';
-      const r = await uploadWithProgress('/instances/import/upload', fd, p => {
-        $('#imp-log').textContent = `上传中… ${p}%`;
-      });
-      jobId = r.job_id;
-    } else {
-      const body = { path: $('#ip-path').value.trim() };
-      if ($('#ip-name').value.trim()) body.name = $('#ip-name').value.trim();
-      const r = await api('/instances/import/path', { method: 'POST', body });
-      jobId = r.job_id;
+  const progress = $('#imp-progress');
+  if (progress) progress.style.display = '';
+  await withBusy('import', $('#imp-go'), async () => {
+    const log = text => { const el = $('#imp-log'); if (el) { el.textContent = text; el.scrollTop = 1e6; } };
+    try {
+      let jobId;
+      if (importTab === 'upload') {
+        const fileEl = $('#im-file');
+        if (!fileEl || !fileEl.files[0]) throw new Error('请选择 ZIP 文件');
+        const fd = new FormData();
+        const nameVal = $('#im-name') ? $('#im-name').value.trim() : '';
+        if (nameVal) fd.append('name', nameVal);
+        fd.append('file', fileEl.files[0]);
+        log('上传中… 0%');
+        const r = await xhrUpload({ path: '/instances/import/upload', body: fd, onProgress: p => log(`上传中… ${p}%`), onPhase: phase => { if (phase === 'processing') log('上传完成，服务器处理中…'); } });
+        jobId = r.job_id;
+      } else {
+        const body = { path: $('#ip-path').value.trim() };
+        const nameVal = $('#ip-name') ? $('#ip-name').value.trim() : '';
+        if (nameVal) body.name = nameVal;
+        const r = await api('/instances/import/path', { method: 'POST', body });
+        jobId = r.job_id;
+      }
+      const j = await pollJob(jobId, jj => log((jj.logs || []).join('\n')));
+      toast('导入完成');
+      setTimeout(() => { closeModal(); location.hash = `#/instance/${j.instance_id}/console`; }, 500);
+    } catch (e) {
+      const cur = $('#imp-log');
+      log((cur ? cur.textContent : '') + `\n[错误] ${e.message}`);
+      toast('导入失败: ' + e.message, false);
     }
-    const j = await poll(jobId);
-    toast('导入完成');
-    setTimeout(() => { closeModal(); location.hash = `#/instance/${j.instance_id}/console`; }, 500);
-  } catch (e) {
-    $('#imp-log').textContent += `\n[错误] ${e.message}`;
-    toast('导入失败: ' + e.message, false);
-    $('#imp-go').disabled = false;
-  }
-}
-function uploadWithProgress(path, fd, onProg) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api' + path);
-    xhr.withCredentials = true;
-    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
-    xhr.upload.onprogress = e => { if (e.lengthComputable) onProg(Math.round(e.loaded / e.total * 100)); };
-    xhr.onload = () => {
-      try {
-        const j = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300) resolve(j);
-        else { if (xhr.status === 401) onSessionExpired(); reject(new Error(j.error || xhr.statusText)); }
-      } catch { reject(new Error('响应解析失败')); }
-    };
-    xhr.onerror = () => reject(new Error('网络错误'));
-    xhr.send(fd);
   });
 }
 
@@ -939,7 +1270,7 @@ async function acceptEula(id) {
 }
 
 /* ---------------- 实例详情页 ---------------- */
-const ADMIN_TABS = [['console', '控制台'], ['monitor', '监控'], ['announcement', '公告'], ['mods', '模组'], ['backups', '备份'], ['game-backups', '游戏内备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['settings', '实例设置']];
+const ADMIN_TABS = [['console', '控制台'], ['monitor', '监控'], ['announcement', '公告'], ['mods', '模组'], ['backups', '备份'], ['game-backups', '游戏内备份'], ['worlds', '世界'], ['tasks', '计划任务'], ['files', '文件'], ['props', '服务器设置'], ['permissions', '用户权限'], ['settings', '实例设置']];
 const USER_VIEW_TABS = [['announcement', '公告'], ['overview', '运行信息']];
 
 function instanceRuntimeText(s) {
@@ -954,6 +1285,7 @@ async function renderInstance(id, tab, t = ++routeToken) {
   catch (e) { if (t === routeToken) $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
   if (t !== routeToken) return;
   currentInstanceInfo = s;
+  setTopbarTitle(s.name);
   const main = $('#main');
   if (main.dataset.instanceId === String(id) && main.dataset.viewRole === 'admin' && $('#tab-body')) {
     $$('#main > .detail-tabs .tab').forEach(a => a.classList.toggle('active', a.getAttribute('href') === `#/instance/${id}/${tab}`));
@@ -984,6 +1316,7 @@ async function renderInstance(id, tab, t = ++routeToken) {
   else if (tab === 'files') renderTabFiles(id, body, t);
   else if (tab === 'props') renderTabProps(id, body, t);
   else if (tab === 'game-backups') renderTabGameBackups(id, body, t);
+  else if (tab === 'permissions') renderTabPermissions(id, body, t);
   else renderTabSettings(id, body);
 
   const upd = async () => {
@@ -1026,10 +1359,18 @@ function actionButtons(id, status) {
 let accountsData = null;
 
 async function renderAccounts(t = ++routeToken) {
+  accountsTab = 'accounts';
   $('#main').innerHTML = `<div class="page-head"><h1>账户管理</h1><div class="row"><button class="btn primary" onclick="showCreateAccount()">＋ 新建账户</button></div></div>
-    <p class="muted small">管理员可创建账户、启用 / 禁用、重置密码、删除账户，并为普通用户分配可查看的实例。</p>
-    <div id="accounts-body"><div class="empty">加载中…</div></div>`;
+    <p class="muted small">管理员可创建账户、启用 / 禁用、重置密码、删除账户，并为普通用户分配可查看的实例；待审批申请在下方标签页处理。</p>
+    <div class="tabs small" id="acct-tabs">
+      <button class="tab active" data-t="accounts" onclick="setAccountsTab('accounts')">账户</button>
+      <button class="tab" data-t="approvals" onclick="setAccountsTab('approvals')">注册 / 改名申请<span id="acct-appr-count" class="count-badge" hidden></span></button>
+    </div>
+    <div id="accounts-body"><div class="empty">加载中…</div></div>
+    <div id="approvals-body" hidden></div>`;
   await loadAccounts(t);
+  const badge = document.getElementById('acct-appr-count');
+  if (badge && pendingApprovals > 0) { badge.textContent = String(pendingApprovals); badge.hidden = false; }
 }
 
 async function loadAccounts(t = routeToken) {
@@ -1226,6 +1567,7 @@ async function renderUserInstance(id, tab, t = ++routeToken) {
   try { s = await api(`/instances/${id}`); }
   catch (e) { if (t === routeToken) showInstanceError(e); return; }
   if (t !== routeToken) return;
+  setTopbarTitle(s.name);
   const main = $('#main');
   const reuse = main.dataset.instanceId === String(id) && main.dataset.viewRole === 'user' && $('#tab-body');
   if (reuse) {
@@ -2889,14 +3231,17 @@ async function deleteBackup(id, name) {
 }
 
 async function doUploadMod(id) {
-  const files = $('#mod-file').files;
-  if (!files.length) return toast('请选择文件', false);
-  const fd = new FormData();
-  for (const f of files) fd.append('file', f);
-  try {
-    await api(`/instances/${id}/mods/upload`, { method: 'POST', body: fd });
-    closeModal(); toast('上传成功'); refresh();
-  } catch (e) { toast(e.message, false); }
+  const fileEl = $('#mod-file');
+  const files = fileEl ? fileEl.files : null;
+  if (!files || !files.length) return toast('请选择文件', false);
+  await withBusy('mod-upload:' + id, fileEl, async () => {
+    const fd = new FormData();
+    for (const f of files) fd.append('file', f);
+    try {
+      await xhrUpload({ path: `/instances/${id}/mods/upload`, body: fd });
+      closeModal(); toast('上传成功'); refresh();
+    } catch (e) { toast(e.message, false); }
+  });
 }
 
 /* ---------------- 文件管理 ---------------- */
@@ -3022,14 +3367,21 @@ function filesUpload(id) {
     <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" onclick="doFilesUpload('${id}')">上传</button></div>`);
 }
 async function doFilesUpload(id) {
-  const files = $('#up-file').files;
-  if (!files.length) return toast('请选择文件', false);
-  const fd = new FormData();
-  for (const f of files) fd.append('file', f);
-  try {
-    await api(`/instances/${id}/files/upload?path=${encodeURIComponent(curPath)}`, { method: 'POST', body: fd });
-    closeModal(); toast('上传成功'); loadFiles(id, routeToken, curPath);
-  } catch (e) { toast(e.message, false); }
+  const fileEl = $('#up-file');
+  const files = fileEl ? fileEl.files : null;
+  if (!files || !files.length) return toast('请选择文件', false);
+  // 捕获开始时的目录与会话代际，切页或重登后结果只更新正确资源
+  const path = curPath;
+  const gen = sessionGeneration;
+  await withBusy('files-upload:' + id, fileEl, async () => {
+    const fd = new FormData();
+    for (const f of files) fd.append('file', f);
+    try {
+      await xhrUpload({ path: `/instances/${id}/files/upload?path=${encodeURIComponent(path)}`, body: fd });
+      if (gen !== sessionGeneration) return;
+      closeModal(); toast('上传成功'); loadFiles(id, routeToken, path);
+    } catch (e) { toast(e.message, false); }
+  });
 }
 
 /* ---------------- server.properties ---------------- */
@@ -3377,6 +3729,8 @@ async function renderPanelSettings(t = ++routeToken) {
   if (t !== routeToken) return;
   const [linesMin, linesMax] = c.console_lines_range || [100, 20000];
   const [bufMin, bufMax] = c.console_buffer_range || [500, 200000];
+  const hostsRaw = c.turnstile_allowed_hostnames;
+  const hosts = Array.isArray(hostsRaw) ? hostsRaw.join(', ') : (hostsRaw || '');
   $('#main').innerHTML = `<h1>面板设置</h1>
     <div class="form card">
       <label>监听地址<input id="ps-listen" value="${esc(c.listen)}" placeholder="127.0.0.1:8080">
@@ -3390,6 +3744,18 @@ async function renderPanelSettings(t = ++routeToken) {
       <label>控制台缓存行数<input id="ps-console-buffer" type="number" min="${bufMin}" max="${bufMax}" value="${c.console_buffer_lines}">
         <div class="muted small">面板在内存中保留的日志行数，也是历史日志回放与「下载日志」的上限（${bufMin} ~ ${bufMax}）；保存后立即对运行中的实例生效。</div></label>
       <div class="row right"><button class="btn primary" onclick="savePanelSettings()">保存</button></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="row between"><h2 style="margin:0">注册与人机验证（Cloudflare Turnstile）</h2></div>
+      <div class="form" style="margin-top:10px">
+        <label class="check full"><input type="checkbox" id="ps-reg-enabled" ${c.registration_enabled ? 'checked' : ''}> 开放公开注册（注册后仍需管理员审批）</label>
+        <label>Turnstile 站点密钥<input id="ps-ts-site" value="${esc(c.turnstile_site_key || '')}" placeholder="Site Key（可公开）"></label>
+        <label>Turnstile 服务端密钥<input id="ps-ts-secret" value="" placeholder="${c.turnstile_secret_key_set ? '已设置（留空保持不变）' : 'Secret Key（保密）'}">
+          <div class="muted small">服务端密钥仅保存、不回显；留空保存即保持不变。</div></label>
+        <label class="full">允许的主机名<input id="ps-ts-hosts" value="${esc(hosts)}" placeholder="panel.example.com, localhost">
+          <div class="muted small">多个主机名用逗号分隔；仅这些来源的验证请求会被接受。</div></label>
+        <label class="check full"><input type="checkbox" id="ps-ts-test" ${c.turnstile_test_mode ? 'checked' : ''}> 人机验证测试模式（正式环境请关闭并使用真实密钥）</label>
+      </div>
     </div>
     <div class="card" style="margin-top:16px">
       <div class="row between"><h2 style="margin:0">Java 环境</h2>
@@ -3444,6 +3810,11 @@ async function savePanelSettings() {
         curseforge_api_key: $('#ps-cfkey').value,
         console_max_lines: +$('#ps-console-lines').value || undefined,
         console_buffer_lines: +$('#ps-console-buffer').value || undefined,
+        registration_enabled: !!$('#ps-reg-enabled')?.checked,
+        turnstile_site_key: $('#ps-ts-site')?.value || '',
+        turnstile_secret_key: $('#ps-ts-secret')?.value || '',
+        turnstile_allowed_hostnames: ($('#ps-ts-hosts')?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+        turnstile_test_mode: !!$('#ps-ts-test')?.checked,
       },
     });
     const n = Number($('#ps-console-lines').value);
@@ -3452,8 +3823,440 @@ async function savePanelSettings() {
   } catch (e) { toast(e.message, false); }
 }
 
+
+/* ---------------- 公开注册 / 申请状态 / 个人资料 ---------------- */
+function showStatusPage() { navigate('#/status'); }
+
+async function renderRegister() {
+  document.body.classList.add('auth-view');
+  document.body.classList.remove('detail-view');
+  $('#main').innerHTML = `<div class="login-wrap auth-card"><div class="card login-card">
+    <h1>注册账户</h1>
+    <p class="muted small">注册后需管理员审批；审批通过前只能查询申请状态。游戏名仅用于白名单识别，不验证账号所有权。</p>
+    <div id="reg-config" class="auth-note">正在加载注册配置…</div>
+    <label>用户名<input id="reg-user" autocomplete="username" autocapitalize="off" autocorrect="off" placeholder="登录用，注册后不可修改"></label>
+    <label>密码<input id="reg-pass" type="password" autocomplete="new-password" placeholder="至少 8 位"></label>
+    <label>确认密码<input id="reg-pass2" type="password" autocomplete="new-password"></label>
+    <label>Minecraft 游戏名<input id="reg-mc" autocapitalize="off" autocorrect="off" placeholder="1-16 位字母、数字或下划线"></label>
+    <label>申请理由<textarea id="reg-reason" rows="3" maxlength="500" placeholder="简要说明用途，便于管理员审核"></textarea></label>
+    <div id="reg-turnstile" class="turnstile-slot"></div>
+    <div id="reg-err" class="login-err" role="alert"></div>
+    <div class="row"><button class="btn ghost" type="button" onclick="showStatusPage()">查询申请状态</button><button class="btn primary" id="reg-go" type="button" disabled onclick="doRegister()">提交注册</button></div>
+    <div class="auth-links"><a href="#/login" onclick="renderLogin();return false;">已有账户？返回登录</a></div>
+  </div></div>`;
+  try {
+    const cfg = await api('/auth/registration-config', { skipAuthRedirect: true });
+    turnstileSiteKey = (cfg && cfg.site_key) || '';
+    const note = document.getElementById('reg-config');
+    const enabled = !!(cfg && cfg.enabled);
+    if (note) note.textContent = enabled ? '公开注册已启用。' : '当前未开放公开注册，请联系管理员创建账户。';
+    const btn = document.getElementById('reg-go');
+    if (btn) btn.disabled = !enabled;
+    if (enabled) await mountTurnstile('reg-turnstile', turnstileSiteKey, !!(cfg && cfg.test_mode));
+  } catch (e) {
+    const note = document.getElementById('reg-config');
+    if (note) note.textContent = '注册配置加载失败：' + (e.message || '请稍后重试');
+  }
+}
+
+async function doRegister() {
+  const username = ($('#reg-user')?.value || '').trim();
+  const password = $('#reg-pass')?.value || '';
+  const password2 = $('#reg-pass2')?.value || '';
+  const minecraft_name = ($('#reg-mc')?.value || '').trim();
+  const reason = ($('#reg-reason')?.value || '').trim();
+  const err = $('#reg-err');
+  if (!username) { if (err) err.textContent = '请输入用户名'; return; }
+  if (password.length < 8) { if (err) err.textContent = '密码至少 8 位'; return; }
+  if (password !== password2) { if (err) err.textContent = '两次输入的密码不一致'; return; }
+  if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
+  if (!reason) { if (err) err.textContent = '请填写申请理由'; return; }
+  await withBusy('auth:register', $('#reg-go'), async () => {
+    try {
+      await api('/auth/register', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username, password, minecraft_name, reason, captcha_token: captchaTokenOrNull() } });
+      if (err) err.textContent = '';
+      showModal(`<h2>申请已提交</h2><p class="muted" style="margin:10px 0">账户「${esc(username)}」已提交，等待管理员审批。审批通过后即可登录。</p><div class="row right"><button class="btn" onclick="closeModal();navigate('#/status')">查询申请状态</button><button class="btn primary" onclick="closeModal();renderLogin()">返回登录</button></div>`);
+    } catch (e) {
+      if (err) err.textContent = e.message || '注册失败';
+      resetTurnstile();
+    }
+  });
+}
+
+async function renderApplicationStatus() {
+  document.body.classList.add('auth-view');
+  document.body.classList.remove('detail-view');
+  $('#main').innerHTML = `<div class="login-wrap auth-card"><div class="card login-card">
+    <h1>查询申请状态</h1>
+    <p class="muted small">使用注册时的用户名和密码查询审批进度与拒绝理由。</p>
+    <label>用户名<input id="st-user" autocomplete="username" autocapitalize="off" autocorrect="off"></label>
+    <label>密码<input id="st-pass" type="password" autocomplete="current-password"></label>
+    <div id="st-err" class="login-err" role="alert"></div>
+    <div class="row"><button class="btn ghost" type="button" onclick="renderRegister()">去注册</button><button class="btn primary" id="st-go" type="button" onclick="doStatusQuery()">查询</button></div>
+    <div id="status-result" style="margin-top:16px"></div>
+    <div class="auth-links"><a href="#/login" onclick="renderLogin();return false;">返回登录</a></div>
+  </div></div>`;
+  try {
+    const cfg = await api('/auth/registration-config', { skipAuthRedirect: true });
+    turnstileSiteKey = (cfg && cfg.site_key) || '';
+  } catch {}
+}
+
+async function doStatusQuery() {
+  const username = ($('#st-user')?.value || '').trim();
+  const password = $('#st-pass')?.value || '';
+  const err = $('#st-err');
+  if (!username || !password) { if (err) err.textContent = '请输入用户名和密码'; return; }
+  await withBusy('auth:status', $('#st-go'), async () => {
+    try {
+      const r = await api('/auth/application/status', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username, password } });
+      // 凭据仅保存在本次页面内存，不写入浏览器存储
+      statusCredentials = { username, password };
+      if (err) err.textContent = '';
+      renderApplicationResult(r && r.application);
+    } catch (e) {
+      statusCredentials = null;
+      if (err) err.textContent = e.message || '查询失败';
+      renderApplicationResult(null);
+    }
+  });
+}
+
+function renderApplicationResult(app) {
+  const box = document.getElementById('status-result');
+  if (!box) return;
+  if (!app) { box.innerHTML = '<div class="empty">未查询到申请记录。</div>'; return; }
+  const status = app.status || 'pending';
+  const label = ({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[status] || status;
+  const pill = status === 'approved' ? 'st-running' : status === 'rejected' ? 'st-stopped' : 'st-starting';
+  let html = `<div class="status-pill-row"><span class="pill ${pill}">${esc(label)}</span><span class="muted small">申请编号 ${esc(app.id || '-')} · 修订 ${esc(String(app.revision ?? '-'))}</span></div>
+    <div class="reason-box"><b>用户名：</b>${esc(app.username || '')}<br><b>游戏名：</b>${esc(app.minecraft_name || '未填写')}<br><b>申请理由：</b>${esc(app.reason || '无')}</div>`;
+  if (status === 'rejected') {
+    html += `<div class="rejection-box">拒绝理由：${esc(app.rejection_reason || '管理员未填写理由')}</div>
+      <h3>修改资料后重新提交</h3>
+      <label>Minecraft 游戏名<input id="rs-mc" autocapitalize="off" autocorrect="off" value="${esc(app.minecraft_name || '')}"></label>
+      <label>申请理由<textarea id="rs-reason" rows="3" maxlength="500">${esc(app.reason || '')}</textarea></label>
+      <div id="rs-turnstile" class="turnstile-slot"></div>
+      <div id="rs-err" class="login-err" role="alert"></div>
+      <div class="row"><button class="btn primary" id="rs-go" type="button" onclick="doResubmit()">重新提交</button></div>`;
+    box.innerHTML = html;
+    mountTurnstile('rs-turnstile', turnstileSiteKey, false);
+    return;
+  }
+  if (status === 'approved') {
+    html += '<div class="auth-note">你的申请已通过审批，可以返回登录页面使用用户名和密码登录。</div><div class="row"><button class="btn primary" type="button" onclick="renderLogin()">返回登录</button></div>';
+  } else {
+    html += '<div class="auth-note">申请正在等待管理员审批，请稍后再查询。</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function doResubmit() {
+  if (!statusCredentials) { toast('请先查询申请状态', false); return; }
+  const minecraft_name = ($('#rs-mc')?.value || '').trim();
+  const reason = ($('#rs-reason')?.value || '').trim();
+  const err = $('#rs-err');
+  if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
+  if (!reason) { if (err) err.textContent = '请填写申请理由'; return; }
+  await withBusy('auth:resubmit', $('#rs-go'), async () => {
+    try {
+      const r = await api('/auth/application/resubmit', { method: 'POST', noCsrf: true, skipAuthRedirect: true, body: { username: statusCredentials.username, password: statusCredentials.password, minecraft_name, reason, captcha_token: captchaTokenOrNull() } });
+      toast('已重新提交，等待审批');
+      renderApplicationResult(r && r.application);
+    } catch (e) {
+      if (err) err.textContent = e.message || '提交失败';
+      resetTurnstile();
+    }
+  });
+}
+
+async function renderProfile(t = ++routeToken) {
+  $('#main').innerHTML = '<div class="page-head"><h1>个人资料</h1></div><div id="profile-body"><div class="empty">加载中…</div></div>';
+  try {
+    const d = await api('/auth/profile');
+    if (t !== routeToken) return;
+    profileData = d;
+    renderProfileBody(d);
+  } catch (e) {
+    const el = document.getElementById('profile-body');
+    if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function renderProfileBody(d) {
+  const el = document.getElementById('profile-body');
+  if (!el) return;
+  const user = (d && d.user) || d || {};
+  const app = d && d.application;
+  const req = (d && (d.name_request || d.name_change)) || user.name_request || null;
+  const statusLabel = ({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[user.status] || user.status || '';
+  el.innerHTML = `<div class="card">
+    <div class="reason-box"><b>用户名：</b>${esc(user.username || '')} <span class="muted small">（注册后不可修改）</span><br>
+      <b>角色：</b>${user.role === 'admin' ? '管理员' : '普通用户'}<br>
+      <b>当前游戏名：</b>${esc(user.minecraft_name || '未绑定')}${statusLabel ? ' · ' + esc(statusLabel) : ''}</div>
+    ${app ? `<div class="auth-note">注册申请状态：${esc(({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[app.status] || app.status || '')}${app.rejection_reason ? ' · ' + esc(app.rejection_reason) : ''}</div>` : ''}
+    ${req ? `<div class="sync-warning"><span>改名申请审批中：新游戏名 ${esc(req.minecraft_name || '')}。审批期间旧游戏名继续生效。</span><button class="btn small" type="button" onclick="withdrawNameRequest('${esc(req.id || '')}')">撤回申请</button></div>` : ''}
+    <h3 style="margin-top:14px">申请修改游戏名</h3>
+    <p class="muted small">提交后需管理员审批；等待期间保留登录与旧游戏名，批准后更新相关实例白名单。</p>
+    <label>新游戏名<input id="prof-mc" autocapitalize="off" autocorrect="off" placeholder="1-16 位字母、数字或下划线"></label>
+    <label>变更理由<textarea id="prof-reason" rows="3" maxlength="500"></textarea></label>
+    <div id="prof-err" class="login-err" role="alert"></div>
+    <div class="row"><button class="btn primary" id="prof-go" type="button" onclick="doRequestNameChange()">提交改名申请</button></div>
+  </div>`;
+}
+
+async function doRequestNameChange() {
+  const minecraft_name = ($('#prof-mc')?.value || '').trim();
+  const reason = ($('#prof-reason')?.value || '').trim();
+  const err = $('#prof-err');
+  if (!MC_NAME_RE.test(minecraft_name)) { if (err) err.textContent = '游戏名需为 1-16 位字母、数字或下划线'; return; }
+  if (!reason) { if (err) err.textContent = '请填写变更理由'; return; }
+  await withBusy('profile:name', $('#prof-go'), async () => {
+    try {
+      await api('/auth/minecraft-name-requests', { method: 'POST', body: { minecraft_name, reason } });
+      toast('改名申请已提交，审批期间旧游戏名继续生效');
+      renderProfile();
+    } catch (e) {
+      if (err) err.textContent = e.message || '提交失败';
+    }
+  });
+}
+
+async function withdrawNameRequest(id) {
+  if (!id) { toast('缺少申请编号', false); return; }
+  if (!(await appConfirm('确定撤回该改名申请？'))) return;
+  try {
+    await api('/auth/minecraft-name-requests/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('已撤回改名申请');
+    renderProfile();
+  } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 实例用户权限 ---------------- */
+async function renderTabPermissions(id, el, t) {
+  el.innerHTML = `<div class="row between"><h2 style="margin:0">用户权限</h2>
+      <div class="row"><input id="perm-search" class="perm-search" placeholder="搜索用户名 / 游戏名…" oninput="filterPermissionRows()"><button class="btn primary" id="perm-save" type="button" onclick="savePermissions('${id}')">保存授权</button></div></div>
+    <p class="muted small">勾选可查看该实例的普通用户；管理员默认拥有全部实例权限。撤权后白名单同步可能延迟，将以提示单独显示。</p>
+    <div id="perm-sync"></div>
+    <div id="perm-body"><div class="empty">加载中…</div></div>`;
+  permState = null;
+  try {
+    const d = await api(`/instances/${id}/permissions`);
+    if (t !== routeToken) return;
+    permState = { revision: d.revision, users: d.users || [], whitelist_enabled: d.whitelist_enabled };
+    renderPermissionRows();
+    loadWhitelistSync(id, t);
+  } catch (e) {
+    const body = document.getElementById('perm-body');
+    if (body) body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function renderPermissionRows() {
+  const body = document.getElementById('perm-body');
+  if (!body || !permState) return;
+  const q = (document.getElementById('perm-search')?.value || '').trim().toLowerCase();
+  const list = permState.users.filter(u => !q || (u.username || '').toLowerCase().includes(q) || (u.minecraft_name || '').toLowerCase().includes(q));
+  if (!list.length) { body.innerHTML = '<div class="empty">没有匹配的账户</div>'; return; }
+  body.innerHTML = `<div class="table-wrap"><table class="table perm-table"><thead><tr><th>授权</th><th>用户名</th><th>游戏名</th><th>角色</th><th>状态</th><th>白名单</th></tr></thead><tbody>${list.map(u => {
+    const admin = u.role === 'admin';
+    const checked = admin || u.granted;
+    const mc = u.minecraft_name ? esc(u.minecraft_name) : '<span class="muted">未绑定</span>';
+    const status = u.enabled === false ? '<span class="pill st-stopped">禁用</span>' : (u.status ? `<span class="pill st-${u.status === 'approved' ? 'running' : u.status === 'rejected' ? 'stopped' : 'starting'}">${esc(u.status)}</span>` : '<span class="muted">-</span>');
+    return `<tr>
+      <td><input type="checkbox" class="perm-user" value="${esc(u.id)}" ${checked ? 'checked' : ''} ${admin ? 'disabled' : ''}></td>
+      <td><b>${esc(u.username)}</b></td>
+      <td>${mc}</td>
+      <td>${admin ? '管理员' : '普通用户'}</td>
+      <td>${status}</td>
+      <td>${checked ? '<span class="granted-yes">已授权</span>' : '<span class="granted-no">未授权</span>'}</td>
+    </tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+function filterPermissionRows() { renderPermissionRows(); }
+
+function readPermissionChecks() {
+  const checks = $$('.perm-user:checked');
+  return checks.map(c => c.value);
+}
+
+async function savePermissions(id) {
+  if (!permState) return;
+  const user_ids = readPermissionChecks();
+  await withBusy('perm:' + id, $('#perm-save'), async () => {
+    try {
+      const d = await api(`/instances/${id}/permissions`, { method: 'PUT', body: { revision: permState.revision, user_ids } });
+      permState = { revision: d.revision, users: d.users || permState.users, whitelist_enabled: d.whitelist_enabled !== undefined ? d.whitelist_enabled : permState.whitelist_enabled };
+      renderPermissionRows();
+      toast('实例授权已保存');
+      refreshApprovalCount();
+    } catch (e) {
+      if (e.status === 409) {
+        toast('授权已被其他管理员修改，已刷新最新数据', false);
+        renderTabPermissions(id, document.getElementById('tab-body'), routeToken);
+      } else {
+        toast(e.message, false);
+      }
+    }
+  });
+}
+
+async function loadWhitelistSync(id, t) {
+  const box = document.getElementById('perm-sync');
+  if (!box) return;
+  try {
+    const d = await api(`/instances/${id}/whitelist-sync`);
+    if (t !== routeToken || !box) return;
+    const pending = !!(d && (d.pending || d.status === 'pending' || (d.failures && d.failures.length)));
+    box.innerHTML = pending ? `<div class="sync-warning"><span>白名单同步待处理：${esc(d.detail || d.message || '部分实例尚未同步，请稍后重试')}</span><button class="btn small" type="button" onclick="loadWhitelistSync('${id}',routeToken)">重新检查</button></div>` : '';
+  } catch { if (box) box.innerHTML = ''; }
+}
+
+/* ---------------- 管理员：注册申请与游戏名变更审批 ---------------- */
+function applicationById(id) {
+  const list = (applicationsData && applicationsData.applications) || [];
+  return list.find(a => String(a.id) === String(id)) || null;
+}
+
+function setAccountsTab(tab) {
+  accountsTab = tab;
+  $$('#acct-tabs .tab').forEach(b => b.classList.toggle('active', b.dataset.t === tab));
+  const a = document.getElementById('accounts-body');
+  const b = document.getElementById('approvals-body');
+  if (a) a.hidden = tab !== 'accounts';
+  if (b) b.hidden = tab !== 'approvals';
+  if (tab === 'approvals') loadApprovals(routeToken);
+}
+
+async function loadApprovals(t = routeToken) {
+  const body = document.getElementById('approvals-body');
+  if (body) body.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const d = await api('/applications');
+    if (t !== routeToken) return;
+    applicationsData = { applications: (d && d.applications) || [] };
+    renderApprovals();
+    pendingApprovals = applicationsData.applications.filter(a => (a.status || 'pending') === 'pending').length;
+    const badge = document.getElementById('acct-appr-count');
+    if (badge) { badge.textContent = String(pendingApprovals); badge.hidden = pendingApprovals === 0; }
+    renderNav();
+  } catch (e) {
+    if (body) body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function renderApprovals() {
+  const body = document.getElementById('approvals-body');
+  if (!body || !applicationsData) return;
+  const list = applicationsData.applications;
+  if (!list.length) { body.innerHTML = '<div class="empty">暂无申请</div>'; return; }
+  const kindLabel = k => (k === 'name_change' || k === 'minecraft_name' || k === 'name' ? '游戏名变更' : '注册申请');
+  body.innerHTML = `<div class="table-wrap"><table class="table"><thead><tr><th>类型</th><th>用户名</th><th>游戏名</th><th>理由</th><th>状态</th><th>操作</th></tr></thead><tbody>${list.map(a => {
+    const status = a.status || 'pending';
+    const pill = status === 'approved' ? 'st-running' : status === 'rejected' ? 'st-stopped' : 'st-starting';
+    const actions = status === 'pending'
+      ? `<button class="btn small primary" onclick="approveApplication('${esc(String(a.id))}')">批准</button> <button class="btn small danger" onclick="rejectApplication('${esc(String(a.id))}')">拒绝</button>`
+      : `<span class="muted small">${esc(status === 'approved' ? '已批准' : '已拒绝')}</span>`;
+    return `<tr>
+      <td>${esc(kindLabel(a.kind))}</td>
+      <td><b>${esc(a.username || '')}</b></td>
+      <td>${esc(a.minecraft_name || '-')}</td>
+      <td class="approval-reason">${esc(a.reason || '-')}${a.rejection_reason ? `<div class="muted small">拒绝：${esc(a.rejection_reason)}</div>` : ''}</td>
+      <td><span class="pill ${pill}">${esc(({ pending: '待审批', approved: '已批准', rejected: '已拒绝' })[status] || status)}</span></td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+async function approveApplication(id) {
+  const app = applicationById(id);
+  if (!app) return;
+  const isNameChange = app.kind === 'name_change' || app.kind === 'minecraft_name' || app.kind === 'name';
+  const inst = (accountsData && accountsData.instances) || [];
+  const box = isNameChange ? '' : `<h3>分配实例（可留空）</h3><div>${inst.length ? inst.map(i => `<label class="check"><input type="checkbox" class="appr-inst" value="${esc(i.id)}"> ${esc(i.name)}</label>`).join('') : '<span class="muted small">暂无实例</span>'}</div>`;
+  showModal(`<h2>批准申请</h2>
+    <p class="muted small">${esc(app.username || '')} · ${esc(app.minecraft_name || '未填写游戏名')} · ${isNameChange ? '游戏名变更' : '注册申请'}</p>
+    <div class="reason-box" style="margin:10px 0">${esc(app.reason || '无申请理由')}</div>
+    ${box}
+    <div id="appr-err" class="login-err" role="alert"></div>
+    <div class="row right"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn primary" id="appr-go" onclick="doApproveApplication('${esc(String(id))}')">确认批准</button></div>`);
+}
+
+async function doApproveApplication(id) {
+  const app = applicationById(id);
+  if (!app) return;
+  const instance_ids = $$('.appr-inst:checked').map(c => c.value);
+  const err = document.getElementById('appr-err');
+  await withBusy('approve:' + id, document.getElementById('appr-go'), async () => {
+    try {
+      await api('/applications/' + encodeURIComponent(id) + '/approve', { method: 'POST', body: { revision: app.revision, instance_ids } });
+      closeModal();
+      toast('已批准');
+      loadApprovals(routeToken);
+      if (accountsTab === 'accounts') loadAccounts(routeToken);
+      refreshApprovalCount();
+      refreshTasks();
+    } catch (e) {
+      if (err) err.textContent = e.message || '批准失败';
+    }
+  });
+}
+
+async function rejectApplication(id) {
+  const app = applicationById(id);
+  if (!app) return;
+  const reason = await appPrompt('请填写拒绝理由（会展示给申请人）', '', { title: '拒绝申请' });
+  if (reason === null) return;
+  if (!reason.trim()) { toast('拒绝必须填写理由', false); return; }
+  try {
+    await api('/applications/' + encodeURIComponent(id) + '/reject', { method: 'POST', body: { revision: app.revision, reason: reason.trim() } });
+    toast('已拒绝');
+    loadApprovals(routeToken);
+    refreshApprovalCount();
+  } catch (e) { toast(e.message, false); }
+}
+
+/* ---------------- 统一 XHR 上传（进度 + 100% 处理中 + 会话代际） ---------------- */
+function xhrUpload(opts) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const gen = sessionGeneration;
+    const operationId = opts.operationId || newOperationId();
+    xhr.open(opts.method || 'POST', '/api' + opts.path);
+    xhr.withCredentials = true;
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.setRequestHeader('X-Operation-ID', operationId);
+    if (opts.onProgress) xhr.upload.onprogress = e => { if (e.lengthComputable) opts.onProgress(Math.round(e.loaded / e.total * 100)); };
+    xhr.upload.onload = () => {
+      if (opts.onProgress) opts.onProgress(100);
+      if (opts.onPhase) opts.onPhase('processing');
+    };
+    xhr.onload = () => {
+      if (gen !== sessionGeneration) { reject(new Error('会话已切换，本次结果已丢弃')); return; }
+      let j = {};
+      try { j = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(j); return; }
+      if (xhr.status === 401) onSessionExpired();
+      const err = new Error(j.error || xhr.statusText || ('请求失败 (' + xhr.status + ')'));
+      err.status = xhr.status;
+      reject(err);
+    };
+    xhr.onerror = () => {
+      if (opts.onPhase) opts.onPhase('error');
+      const err = new Error('网络错误：上传结果待确认');
+      err.network = true;
+      reject(err);
+    };
+    xhr.ontimeout = () => reject(new Error('上传超时：结果待确认'));
+    if (opts.onStart) opts.onStart(xhr, operationId);
+    xhr.send(opts.body);
+  });
+}
+
 /* ---------------- 启动 ---------------- */
 async function bootstrap() {
+  initGlobalUi();
   try {
     const me = await api('/auth/me', { skipAuthRedirect: true });
     currentUser = me.user;
@@ -3468,6 +4271,8 @@ async function bootstrap() {
   document.body.classList.remove('auth-view');
   renderNav();
   renderAccountBox();
+  startTaskPolling();
+  refreshApprovalCount();
   route();
 }
 bootstrap();
@@ -3643,7 +4448,7 @@ async function uploadIcon(id) {
   const f = $('#icon-file')?.files[0];
   if (!f) return toast('请选择 PNG 文件', false);
   const fd = new FormData(); fd.append('file', f);
-  try { await api(`/instances/${id}/icon`, { method: 'POST', body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
+  try { await xhrUpload({ path: `/instances/${id}/icon`, body: fd }); toast('图标已上传'); refresh(); } catch (e) { toast(e.message, false); }
 }
 async function downloadFile(id, path) {
   try { await downloadUrl(`/api/instances/${id}/files/download?path=${encodeURIComponent(path)}`, path.split('/').pop()); }
