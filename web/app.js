@@ -275,9 +275,25 @@ function renderTaskCenter() {
   }).join('');
 }
 
-function setTopbarTitle(text) {
+function setTopbarTitle(text, opts) {
   const el = document.getElementById('topbar-title');
-  if (el) el.textContent = text || '';
+  if (!el) return;
+  if (opts && opts.breadcrumb) {
+    el.replaceChildren();
+    const isAdm = opts.role === 'admin' || (typeof currentUser !== 'undefined' && currentUser?.role === 'admin');
+    const a = document.createElement('a');
+    a.href = isAdm ? '#/instances' : '#/my-instances';
+    a.textContent = isAdm ? '实例管理' : '我的实例';
+    const sep = document.createElement('span');
+    sep.className = 'crumb-sep';
+    sep.textContent = ' / ';
+    const cur = document.createElement('span');
+    cur.className = 'crumb-current';
+    cur.textContent = text || '';
+    el.append(a, sep, cur);
+  } else {
+    el.textContent = text || '';
+  }
 }
 
 function navigate(hash) {
@@ -400,6 +416,7 @@ async function refreshApprovalCount() {
 function initGlobalUi() {
   document.addEventListener('click', e => {
     const t = e.target;
+    if (t && t.closest && t.closest('#nav a')) closeDrawer();
     if (!t || !t.closest || !t.closest('.account-box')) closeAccountMenu();
     if (!t || !t.closest || (!t.closest('.task-panel') && !t.closest('#task-btn'))) closeTaskCenter();
   });
@@ -602,12 +619,12 @@ function dlgShow(html, onOpen) {
 function appAlert(msg, title = '提示') {
   return dlgShow(`<h3 style="margin:0 0 10px">${esc(title)}</h3>
     <div style="white-space:pre-wrap">${esc(msg)}</div>
-    <div class="row right" style="margin-top:14px"><button class="btn primary" data-dlg="ok">确定</button></div>`);
+    <div class="row right modal-footer"><button class="btn primary" data-dlg="ok">确定</button></div>`);
 }
 function appConfirm(msg, { title = '确认操作', okText = '确定', danger = false } = {}) {
   return dlgShow(`<h3 style="margin:0 0 10px">${esc(title)}</h3>
     <div style="white-space:pre-wrap">${esc(msg)}</div>
-    <div class="row right" style="margin-top:14px">
+    <div class="row right modal-footer">
       <button class="btn ghost" data-dlg="no">取消</button>
       <button class="btn ${danger ? 'danger' : 'primary'}" data-dlg="yes">${esc(okText)}</button></div>`)
     .then(v => v === 'yes');
@@ -618,7 +635,7 @@ function appPrompt(msg, def = '', { title = '输入', placeholder = '' } = {}) {
     root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:400px"><h3 style="margin:0 0 10px">${esc(title)}</h3>
       <div style="margin-bottom:8px">${esc(msg)}</div>
       <input id="dlg-input" value="${esc(def)}" placeholder="${esc(placeholder)}" style="width:100%">
-      <div class="row right" style="margin-top:14px">
+      <div class="row right modal-footer">
         <button class="btn ghost" data-dlg="no">取消</button>
         <button class="btn primary" data-dlg="yes">确定</button></div></div></div>`;
     const input = root.querySelector('#dlg-input');
@@ -895,9 +912,9 @@ async function route() {
     }
   } catch (e) {
     if (t !== routeToken) return;
+    clearTimers();
     if (e.status === 403 || e.status === 404) {
-      clearTimers();
-      $('#main').innerHTML = `<div class="empty">${esc(e.status === 403 ? '没有访问权限' : '实例不存在或未授权')}</div>`;
+      showInstanceError(e);
     } else {
       $('#main').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
     }
@@ -921,7 +938,7 @@ async function renderDashboard(t = ++routeToken) {
       const topSizes = Object.entries(s.sizes || {}).map(([id, bytes]) => ({ name: nameOf[id] || id, bytes }))
         .sort((a, b) => b.bytes - a.bytes).slice(0, 5);
       const sizeList = topSizes.length
-        ? topSizes.map(t => `<div class="row between" style="padding:3px 0"><span class="muted small">${esc(t.name)}</span><span class="small">${fmtSize(t.bytes)}</span></div>`).join('')
+        ? topSizes.map(t => `<div class="row between" style="padding:3px 0"><span class="muted small instance-size-name">${esc(t.name)}</span><span class="small">${fmtSize(t.bytes)}</span></div>`).join('')
         : '<div class="muted small">暂无实例</div>';
       $('#dash').innerHTML = `
         <div class="grid stats-grid">
@@ -951,7 +968,7 @@ async function renderDashboard(t = ++routeToken) {
               ${i.eula_accepted ? '' : `<span class="pill st-warn">需同意 EULA</span>`}
             </div>
           </div>`;
-        }).join('') || '<div class="empty">还没有实例，去 <a href="#/instances">实例管理</a> 创建或导入</div>'}</div>`;
+        }).join('') || '<div class="empty empty-state"><div class="empty-icon">📊</div><p>还没有实例</p><p class="muted small">前往实例管理创建空白实例或导入整合包</p><p style="margin-top:12px"><a class="btn small primary" href="#/instances">前往实例管理</a></p></div>'}</div>`;
     } catch (e) {
       if (stopViewOnAccessError(e, t)) return;
       if (t === routeToken) $('#dash').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
@@ -990,7 +1007,7 @@ async function renderInstances(t = ++routeToken) {
             <button class="btn small" onclick="cloneInstance('${i.id}','${esc(i.name)}')">克隆</button>
             <button class="btn small danger" onclick="delInstance('${i.id}','${esc(i.name)}')">删除</button>
           </td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无实例。点击右上角「导入整合包」或「新建空白实例」开始。</div>';
+        : '<div class="empty empty-state"><div class="empty-icon">🗂</div><p>暂无实例</p><p class="muted small">点击下方按钮或右上角「导入整合包」「新建空白实例」开始创建</p><div class="row" style="justify-content:center;margin-top:14px;gap:10px"><button class="btn primary" onclick="showImportModal()">📦 导入整合包</button><button class="btn" onclick="showCreateModal()">＋ 新建空白实例</button></div></div>';
     } catch (e) {
       if (stopViewOnAccessError(e, t)) return;
       if (t === routeToken) $('#inst-list').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
@@ -1405,10 +1422,16 @@ function instanceRuntimeText(s) {
 async function renderInstance(id, tab, t = ++routeToken) {
   let s;
   try { s = await api(`/instances/${id}`); }
-  catch (e) { if (t === routeToken) $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    if (t === routeToken) {
+      if (e.status === 403 || e.status === 404) showInstanceError(e);
+      else $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
+    return;
+  }
   if (t !== routeToken) return;
   currentInstanceInfo = s;
-  setTopbarTitle(s.name);
+  setTopbarTitle(s.name, { breadcrumb: true, role: 'admin' });
   const main = $('#main');
   if (main.dataset.instanceId === String(id) && main.dataset.viewRole === 'admin' && $('#tab-body')) {
     $$('#main > .detail-tabs .tab').forEach(a => a.classList.toggle('active', a.getAttribute('href') === `#/instance/${id}/${tab}`));
@@ -1516,14 +1539,14 @@ function renderAccountsTable() {
   if (!el || !accountsData) return;
   const names = Object.fromEntries(accountsData.instances.map(i => [i.id, i.name]));
   const list = accountsData.accounts;
-  el.innerHTML = list.length ? `<div class="table-wrap"><table class="table">
+  el.innerHTML = list.length ? `<div class="table-wrap acct-table-wrap"><table class="table acct-table">
     <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>授权实例</th><th>操作</th></tr></thead>
     <tbody>${list.map(a => `<tr>
-      <td><b>${esc(a.username)}</b></td>
-      <td>${a.role === 'admin' ? '管理员' : '普通用户'}</td>
-      <td>${a.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">禁用</span>'}</td>
-      <td class="muted small">${a.role === 'admin' ? '全部实例' : ((a.instance_ids || []).map(x => esc(names[x] || x)).join('、') || '未分配')}</td>
-      <td><div class="row">
+      <td class="acct-col-user"><span class="acct-card-head"><b class="acct-username">${esc(a.username)}</b><span class="acct-card-status">${a.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">禁用</span>'}</span></span></td>
+      <td class="acct-col-role"><span class="acct-label">角色</span><span class="acct-val">${a.role === 'admin' ? '管理员' : '普通用户'}</span></td>
+      <td class="acct-col-status"><span class="acct-label">状态</span><span class="acct-val">${a.enabled ? '<span class="pill st-running">启用</span>' : '<span class="pill st-stopped">禁用</span>'}</span></td>
+      <td class="acct-col-inst"><span class="acct-label">授权实例</span><span class="acct-val muted small">${a.role === 'admin' ? '全部实例' : ((a.instance_ids || []).map(x => esc(names[x] || x)).join('、') || '未分配')}</span></td>
+      <td class="acct-col-actions"><div class="row acct-actions">
         <button class="btn small" onclick="showEditAccount('${a.id}')">授权 / 角色</button>
         <button class="btn small" onclick="showResetPassword('${a.id}','${esc(a.username)}')">重置密码</button>
         <button class="btn small ${a.enabled ? 'warn' : 'primary'}" onclick="toggleAccount('${a.id}',${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
@@ -1655,9 +1678,21 @@ function userRuntimeText(s) {
 
 function showInstanceError(e) {
   const main = $('#main');
-  if (e.status === 403) main.innerHTML = '<div class="empty">没有访问权限</div>';
-  else if (e.status === 404) main.innerHTML = '<div class="empty">实例不存在或未授权</div>';
-  else main.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  if (!main) return;
+  document.body.classList.remove('detail-view');
+  main.classList.remove('detail-layout');
+  const user = currentUser;
+  const isAdmin = !!(user && user.role === 'admin');
+  const backHref = isAdmin ? '#/instances' : (user ? '#/my-instances' : '#/login');
+  const backText = isAdmin ? '返回实例列表' : (user ? '返回我的实例' : '返回登录');
+  setTopbarTitle(isAdmin ? '实例管理' : (user ? '我的实例' : '登录'));
+  if (e.status === 403) {
+    main.innerHTML = `<div class="empty"><p>没有访问权限</p><p class="muted small">如需访问请联系管理员</p><p style="margin-top:12px"><a href="${backHref}" class="btn small">${backText}</a></p></div>`;
+  } else if (e.status === 404) {
+    main.innerHTML = `<div class="empty"><p>实例不存在或未授权</p><p class="muted small">如需访问请联系管理员</p><p style="margin-top:12px"><a href="${backHref}" class="btn small">${backText}</a></p></div>`;
+  } else {
+    main.innerHTML = `<div class="empty"><p>加载失败: ${esc(e.message || '未知错误')}</p><p style="margin-top:12px"><a href="${backHref}" class="btn small">${backText}</a></p></div>`;
+  }
 }
 
 async function renderMyInstances(t = ++routeToken) {
@@ -1673,7 +1708,7 @@ async function renderMyInstances(t = ++routeToken) {
           <div class="muted">${i.status === 'running' || i.status === 'starting' ? `运行 ${fmtUptime(i.uptime_secs)} · ${i.players || 0} 名玩家在线` : '未运行'}</div>
           <div class="row actions"><a class="btn small primary" href="#/instance/${i.id}/announcement">进入</a></div>
         </div>`).join('')}</div>`
-        : '<div class="empty">管理员尚未分配实例</div>';
+        : '<div class="empty empty-state"><div class="empty-icon">📂</div><p>管理员尚未分配实例</p><p class="muted small">当前账户暂无可查看的实例，如需开通访问请联系管理员</p></div>';
     } catch (e) {
       if (t !== routeToken) return;
       if (stopViewOnAccessError(e, t)) return;
@@ -1690,7 +1725,7 @@ async function renderUserInstance(id, tab, t = ++routeToken) {
   try { s = await api(`/instances/${id}`); }
   catch (e) { if (t === routeToken) showInstanceError(e); return; }
   if (t !== routeToken) return;
-  setTopbarTitle(s.name);
+  setTopbarTitle(s.name, { breadcrumb: true, role: 'user' });
   const main = $('#main');
   const reuse = main.dataset.instanceId === String(id) && main.dataset.viewRole === 'user' && $('#tab-body');
   if (reuse) {
@@ -1922,7 +1957,7 @@ function showModpackUpdate(id) {
       <div class="muted small" id="mu-status">解析中…</div>
     </div>
     <div id="mu-preview"></div>
-    <div class="row right" style="margin-top:12px" id="mu-actions">
+    <div class="row right modal-footer" id="mu-actions">
       <button class="btn ghost" onclick="closeModal()">取消</button>
       <button class="btn primary" id="mu-go" onclick="parseModpackPreview()">① 解析预览</button>
     </div>`);
@@ -2001,7 +2036,7 @@ function askModpackBackup() {
     root.innerHTML = `<div class="modal-backdrop" style="z-index:200"><div class="modal" style="max-width:420px">
       <h3 style="margin:0 0 10px">更新前备份</h3>
       <div>更新整合包前是否先备份实例？<div class="muted small" style="margin-top:6px">备份为完整 tar.gz，保存在「备份」页，可随时恢复回滚。</div></div>
-      <div class="row right" style="margin-top:14px">
+      <div class="row right modal-footer">
         <button class="btn ghost" data-dlg="cancel">取消更新</button>
         <button class="btn" data-dlg="no">直接更新</button>
         <button class="btn primary" data-dlg="yes">备份并更新</button></div></div></div>`;
@@ -2096,11 +2131,20 @@ function consoleTabComplete(id) {
   // 第一个词：补全命令；之后：补全在线玩家名
   let pool = null, prefix = '';
   if (parts.length === 1) {
-    pool = TAB_COMMANDS.filter(c => !c.endsWith(' ')).concat(['help']);
+    pool = [...new Set([...TAB_COMMANDS, 'help'])];
     prefix = last;
-  } else if (parts.length >= 2 && ['op', 'deop', 'kick', 'ban', 'pardon', 'whitelist'].includes(parts[0])) {
+  } else if (parts.length >= 2) {
     pool = [...new Set([...(usersData?.online || []), ...(currentInstanceInfo?.player_names || [])])];
     prefix = last;
+    if (pool.length === 0 && typeof rawFetch === 'function' && id) {
+      rawFetch(`/api/instances/${id}/users`).then(r => r.json()).then(d => {
+        const p = (d.online || []).filter(n => n.toLowerCase().startsWith(last));
+        if (p.length) {
+          parts[parts.length - 1] = p[0];
+          input.value = parts.join(' ');
+        }
+      }).catch(() => {});
+    }
   }
   if (!pool) return;
   const hit = pool.find(c => c.toLowerCase().startsWith(prefix) && prefix);
@@ -2602,7 +2646,7 @@ async function viewCrash(id, name) {
   try {
     const d = await api(`/instances/${id}/crashes/file?name=${encodeURIComponent(name)}`);
     showModal(`<h2>${esc(name)}</h2><pre class="job-log" style="max-height:440px">${esc(d.content)}</pre>
-      <div class="row right" style="margin-top:10px"><button class="btn" onclick="closeModal()">关闭</button></div>`, 'wide');
+      <div class="row right modal-footer"><button class="btn" onclick="closeModal()">关闭</button></div>`, 'wide');
   } catch (e) { toast(e.message, false); }
 }
 
@@ -2728,7 +2772,7 @@ function deleteModDialog(file, deps) {
       <div class="banner warn" style="padding:8px 12px;margin-bottom:8px">以下 ${deps.length} 个已安装模组（直接或间接）依赖此模组，删除后它们将无法正常工作：</div>
       <div style="max-height:180px;overflow:auto;margin-bottom:10px">${deps.map(d => `<div class="mono small" style="padding:2px 0">• ${esc(d)}</div>`).join('')}</div>
       <label class="check"><input type="checkbox" id="dlg-dep" checked> 同时删除以上依赖模组</label>
-      <div class="row right" style="margin-top:14px">
+      <div class="row right modal-footer">
         <button class="btn ghost" data-dlg="no">取消</button>
         <button class="btn danger" data-dlg="yes">删除</button></div></div></div>`;
     const cb = root.querySelector('#dlg-dep');
@@ -2804,7 +2848,7 @@ function showModDownload(id) {
     ${modDL.loader ? `<div class="muted small" style="margin:-4px 0 8px">已按实例的加载器（<b>${esc(modDL.loader)}</b>）与游戏版本（<b>${esc(modDL.game || '未记录')}</b>）预置过滤条件，可自行调整。</div>` : ''}
     <div id="md-results" class="empty" style="padding:18px">输入关键词搜索</div>
     <div id="md-queue" style="margin-top:12px"></div>
-    <div class="row right" style="margin-top:12px">
+    <div class="row right modal-footer">
       <button class="btn warn" id="md-restart" style="display:none" onclick="closeModal();instRestart('${id}')">↻ 重启服务器生效</button>
       <button class="btn ghost" onclick="closeModal()">关闭</button>
     </div>`, 'wide');
@@ -3685,7 +3729,7 @@ async function renderTabSettings(id, el) {
   const s = await api(`/instances/${id}`);
   const { jars } = await api(`/instances/${id}/jars`);
   el.innerHTML = `<h2>实例设置</h2>
-    <div class="form card">
+    <div class="form card settings-form">
       <label class="full">实例名称<input id="f-name" value="${esc(s.name)}"></label>
       <label>主程序 JAR（相对实例目录）
         <div class="row">
@@ -3869,7 +3913,7 @@ async function renderPanelSettings(t = ++routeToken) {
   const hostsRaw = c.turnstile_allowed_hostnames;
   const hosts = Array.isArray(hostsRaw) ? hostsRaw.join(', ') : (hostsRaw || '');
   $('#main').innerHTML = `<h1>面板设置</h1>
-    <div class="form card">
+    <div class="form card settings-form">
       <label>监听地址<input id="ps-listen" value="${esc(c.listen)}" placeholder="127.0.0.1:8080">
         <div class="muted small">格式 IP:端口；127.0.0.1 仅本机访问，0.0.0.0 对局域网开放。修改后需重启面板生效。</div></label>
       <label>CurseForge API Key<input id="ps-cfkey" value="" placeholder="${c.curseforge_api_key_set ? '已设置（留空保持不变）' : '留空则模组下载仅支持 Modrinth'}">
@@ -4502,22 +4546,8 @@ function consoleKeydown(e, id) {
   }
   if (e.key === 'Tab') {
     e.preventDefault();
-    const text = input.value;
-    const parts = text.split(' ');
-    const last = parts[parts.length - 1].toLowerCase();
-    if (parts.length === 1) {
-      const cmds = ['list', 'say ', 'op ', 'deop ', 'kick ', 'ban ', 'ban-ip ', 'pardon ', 'pardon-ip ', 'whitelist ', 'stop', 'save-all', 'tps', 'difficulty ', 'gamemode ', 'time set ', 'weather '];
-      const hit = cmds.find(c => c.startsWith(last) && last);
-      if (hit !== undefined) input.value = hit;
-      return;
-    }
-    // 玩家名补全（在线玩家）
-    rawFetch('/api/instances/' + id + '/users')
-      .then(r => r.json())
-      .then(d => {
-        const pool = (d.online || []).map(p => p).filter(n => n.toLowerCase().startsWith(last));
-        if (pool.length) { parts[parts.length - 1] = pool[0]; input.value = parts.join(' '); }
-      }).catch(() => {});
+    consoleTabComplete(id);
+    return;
   }
 }
 

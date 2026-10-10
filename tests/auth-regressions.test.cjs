@@ -88,13 +88,14 @@ for (const name of ['renderDashboard', 'renderInstances', 'renderMyInstances', '
   for (const status of [401, 403, 404]) {
     test(`${name} stops polling after ${status}`, async () => {
       let scheduled = 0, cleared = 0;
-      const main = { innerHTML: '', dataset: { instanceId: 'a', viewRole: 'user' } };
+      const main = { innerHTML: '', dataset: { instanceId: 'a', viewRole: 'user' }, classList: { remove() {} } };
       const el = { innerHTML: '' };
       let ctx;
       ctx = run([name, 'stopViewOnAccessError', 'invalidateView', 'showInstanceError'], {
         currentInstanceInfo: { id: 'a' },
         $: () => main,
-        document: { getElementById: () => el },
+        document: { getElementById: () => el, body: { classList: { remove() {} } } },
+        currentUser: { role: 'user' },
         esc: value => String(value),
         clearTimers: () => cleared++, every: () => scheduled++,
         api: async () => {
@@ -205,11 +206,12 @@ test('console completion reads the current online player snapshot', () => {
   assert.equal(input.value, 'kick Alex');
 });
 test('administrator instance polling stops and clears cached identity after access is revoked', async () => {
-  const main = { innerHTML: '', dataset: {}, classList: { add() {} } };
+  const main = { innerHTML: '', dataset: {}, classList: { add() {}, remove() {} } };
   const elements = { '#main': main };
   let scheduled = 0, requests = 0;
   const ctx = run(['renderInstance', 'stopViewOnAccessError', 'invalidateView', 'showInstanceError'], {
     currentInstanceInfo: null, ADMIN_TABS: [['console', '控制台']],
+    currentUser: { role: 'admin' }, document: { body: { classList: { remove() {} } } },
     $: selector => elements[selector] ||= {}, $$: () => [],
     esc: value => String(value), statusPill: () => '', instanceRuntimeText: () => '', actionButtons: () => '',
     renderTabConsole() {}, clearTimers() {}, every: () => scheduled++,
